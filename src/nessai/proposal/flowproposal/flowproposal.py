@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import math
 import warnings
 
 import numpy as np
@@ -25,6 +26,21 @@ from .truncation import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _clip_weights(weights: np.ndarray) -> np.ndarray:
+    """Clip the largest ``ceil(sqrt(N))`` weights to their mean."""
+    weights = weights.copy()
+    num_clip = math.ceil(math.sqrt(len(weights)))
+    if not num_clip:
+        return weights
+    if num_clip >= len(weights):
+        clip_idx = np.arange(len(weights))
+    else:
+        clip_idx = np.argpartition(-weights, num_clip - 1)[:num_clip]
+    weights[clip_idx] = weights[clip_idx].mean()
+    weights /= weights.mean()
+    return weights
 
 
 class FlowProposal(BaseFlowProposal):
@@ -149,6 +165,7 @@ class FlowProposal(BaseFlowProposal):
         truncation_method=None,
         truncation_methods=None,
         truncation_kwargs=None,
+        clip_population_weights=False,
         **kwargs,
     ):
         super().__init__(model, poolsize=poolsize, **kwargs)
@@ -164,6 +181,7 @@ class FlowProposal(BaseFlowProposal):
             latent_temperature_validate=latent_temperature_validate,
             latent_temperature_validation_size=latent_temperature_validation_size,
             latent_temperature_warmup=latent_temperature_warmup,
+            clip_population_weights=clip_population_weights,
         )
 
         self._truncation_scheme = TruncationScheme()
@@ -289,6 +307,7 @@ class FlowProposal(BaseFlowProposal):
         latent_temperature_validate=True,
         latent_temperature_validation_size=None,
         latent_temperature_warmup=2,
+        clip_population_weights=False,
     ) -> None:
         """Configure settings related to population."""
         if drawsize is None:
@@ -324,6 +343,17 @@ class FlowProposal(BaseFlowProposal):
         )
         self.latent_temperature_warmup = int(latent_temperature_warmup)
         self.latent_temperature_history = []
+        self.clip_population_weights = clip_population_weights
+
+    def _get_population_log_weights(self, log_weights) -> np.ndarray:
+        """Return log-weights used in the rejection step during population."""
+        log_weights = np.asarray(log_weights, dtype=float)
+        log_weights = log_weights - np.nanmax(log_weights)
+        if not self.clip_population_weights:
+            return log_weights
+
+        weights = _clip_weights(np.exp(log_weights))
+        return np.log(weights) - np.log(weights.max())
 
     def configure_truncation(
         self,
@@ -476,7 +506,6 @@ class FlowProposal(BaseFlowProposal):
         log_n_expected = -np.inf
         n_proposed = 0
         log_weights = np.empty(0)
-        log_constant = -np.inf
         n_accepted = 0
         accept = None
 
@@ -533,8 +562,10 @@ class FlowProposal(BaseFlowProposal):
             if self.accumulate_weights:
                 samples = np.concatenate([samples, x])
                 log_weights = np.concatenate([log_weights, log_w])
-                log_constant = max(np.nanmax(log_w), log_constant)
-                log_n_expected = logsumexp(log_weights - log_constant)
+                log_weights_rejection = self._get_population_log_weights(
+                    log_weights
+                )
+                log_n_expected = logsumexp(log_weights_rejection)
 
                 logger.debug(
                     "Drawn %s - n expected: %s / %s",
@@ -545,13 +576,13 @@ class FlowProposal(BaseFlowProposal):
 
                 if log_n_expected >= log_n:
                     log_u = np.log(self.rng.random(len(log_weights)))
-                    accept = (log_weights - log_constant) > log_u
+                    accept = log_weights_rejection > log_u
                     n_accepted = np.sum(accept)
                 if n_proposed > max_samples:
                     logger.warning("Reached max samples (%s)", max_samples)
                     break
             else:
-                log_w -= log_w.max()
+                log_w = self._get_population_log_weights(log_w)
                 log_u = np.log(self.rng.random(len(log_w)))
                 accept = log_w > log_u
                 n_accept_batch = accept.sum()
@@ -565,8 +596,11 @@ class FlowProposal(BaseFlowProposal):
 
         if self.accumulate_weights:
             if accept is None or len(accept) != len(samples):
+                log_weights_rejection = self._get_population_log_weights(
+                    log_weights
+                )
                 log_u = np.log(self.rng.random(len(log_weights)))
-                accept = (log_weights - log_constant) > log_u
+                accept = log_weights_rejection > log_u
             logger.debug("Total number of samples: %s", samples.size)
             n_accepted = np.sum(accept)
             self.x = samples[accept][:n_samples]
