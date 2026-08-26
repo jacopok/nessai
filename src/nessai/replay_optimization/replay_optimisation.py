@@ -1071,22 +1071,32 @@ def main():
         load_if_exists=True,
         sampler=_make_sampler(),
     )
+    n_trials = args.n_trials
     if not study.trials:
         # Put the status quo on the Pareto front so every result has a
-        # reference point.  Done here, before any worker starts, so it is
-        # enqueued exactly once.
+        # reference point.  Enqueued and run here, synchronously, before any
+        # worker starts: Optuna pops a WAITING trial from storage with a
+        # read-then-write that isn't atomic across processes on the sqlite
+        # backend, so if this were left for the worker pool below, more than
+        # one worker could see it as waiting and run it concurrently.
         study.enqueue_trial(baseline_params())
+        study.optimize(
+            make_objective(run, proposal_class),
+            n_trials=1,
+            catch=(RuntimeError, ValueError),
+        )
+        n_trials = max(n_trials - 1, 0)
 
     n_jobs = (os.cpu_count() or 1) if args.n_jobs == -1 else args.n_jobs
     if n_jobs <= 1:
         study.optimize(
             make_objective(run, proposal_class),
-            n_trials=args.n_trials,
+            n_trials=n_trials,
             catch=(RuntimeError, ValueError),
         )
     else:
-        counts = [args.n_trials // n_jobs] * n_jobs
-        for i in range(args.n_trials % n_jobs):
+        counts = [n_trials // n_jobs] * n_jobs
+        for i in range(n_trials % n_jobs):
             counts[i] += 1
         ctx = get_context("spawn")
         processes = [
@@ -1107,7 +1117,7 @@ def main():
         logger.info(
             "Starting %d worker processes for %d trials",
             len(processes),
-            args.n_trials,
+            n_trials,
         )
         for p in processes:
             p.start()
