@@ -151,6 +151,25 @@ def _make_storage() -> optuna.storages.RDBStorage:
         STORAGE, engine_kwargs={"connect_args": {"timeout": 30}}
     )
 
+
+def _make_sampler() -> optuna.samplers.BaseSampler:
+    """Multi-objective TPE, tuned for a small, parallel, mixed-type budget.
+
+    NSGA-II is population-based (default population size 50) and only starts
+    to pay off after thousands of trials; at ``N_TRIALS`` order 100 it barely
+    completes a couple of generations.  TPE is Optuna's documented default
+    for this regime and handles the conditional search space natively:
+    ``group=True`` is exactly for spaces where some parameters (e.g.
+    ``num_bins``) only appear for certain values of another (``ftype``).
+    ``constant_liar=True`` matters because several worker processes draw
+    trials concurrently against the same storage; without it, they cannot see
+    each other's in-flight trials and tend to sample redundantly nearby.
+    """
+    return optuna.samplers.TPESampler(
+        seed=SEED, multivariate=True, group=True, constant_liar=True
+    )
+
+
 # Checkpoints are spaced uniformly in iteration, i.e. uniformly in log prior
 # volume.  The first FIRST_CHECKPOINT_FRACTION of the run is skipped: early on
 # the sampler is still using the uninformed proposal.
@@ -434,6 +453,26 @@ def _proposal_kwargs_from_config(config: dict) -> dict:
     return kwargs
 
 
+def _apply_proposal_overrides(proposal_kwargs: dict, overrides: dict) -> dict:
+    """Overlay Optuna-suggested proposal/truncation settings onto the
+    archived run's fixed ``proposal_kwargs`` (see :func:`suggest_configs`).
+
+    ``overrides["latent_radius"]`` is merged, not substituted wholesale, so
+    that archived-config keys this module never searches over (``max_radius``,
+    ``min_radius``, ``compute_radius_with_all``) survive untouched.
+    """
+    kwargs = dict(proposal_kwargs)
+    kwargs["latent_temperature"] = overrides["latent_temperature"]
+    kwargs["truncation_methods"] = ["latent_radius"]
+    kwargs["truncation_kwargs"] = {
+        "latent_radius": {
+            **kwargs.get("truncation_kwargs", {}).get("latent_radius", {}),
+            **overrides["latent_radius"],
+        }
+    }
+    return kwargs
+
+
 def resolve_reparameterisations(
     run_config: dict, proposal_class, names: list
 ) -> dict | None:
@@ -568,6 +607,7 @@ def evaluate_checkpoint(
     proposal_class,
     rng: np.random.Generator,
     output: str,
+    proposal_overrides: dict | None = None,
 ) -> dict:
     """Train a flow on the live set at ``iteration`` and score it."""
     indices = run.live_indices(iteration)
@@ -586,6 +626,11 @@ def evaluate_checkpoint(
     x_heldout = run.live_points(heldout_idx, model)
     worst_point = run.live_points(worst, model)
 
+    proposal_kwargs = (
+        run.proposal_kwargs
+        if proposal_overrides is None
+        else _apply_proposal_overrides(run.proposal_kwargs, proposal_overrides)
+    )
     proposal = proposal_class(
         model,
         flow_config=dict(flow_config),
@@ -593,7 +638,7 @@ def evaluate_checkpoint(
         output=output,
         plot=False,
         rng=rng,
-        **run.proposal_kwargs,
+        **proposal_kwargs,
     )
     proposal.initialise()
 
@@ -657,6 +702,7 @@ def evaluate_config(
     proposal_class,
     seed: int,
     trial: optuna.Trial | None = None,
+    proposal_overrides: dict | None = None,
 ) -> dict:
     """Score a configuration across every checkpoint of the run."""
     rng = np.random.default_rng(seed)
@@ -672,6 +718,7 @@ def evaluate_config(
                 proposal_class,
                 rng,
                 os.path.join(output, f"it_{iteration}"),
+                proposal_overrides=proposal_overrides,
             )
             results.append(result)
             logger.info(
@@ -722,8 +769,10 @@ def evaluate_config(
 # --------------------------------------------------------------------------
 
 
-def suggest_configs(trial: optuna.Trial) -> tuple[dict, dict]:
-    """Sample the flow architecture and the training settings."""
+def suggest_configs(trial: optuna.Trial) -> tuple[dict, dict, dict]:
+    """Sample the flow architecture, the training settings, and the
+    proposal/truncation settings that control the latent ball the flow's
+    support is measured against (see :func:`_apply_proposal_overrides`)."""
     ftype = trial.suggest_categorical("ftype", ["realnvp", "nsf"])
     flow_config = dict(
         ftype=ftype,
@@ -773,7 +822,62 @@ def suggest_configs(trial: optuna.Trial) -> tuple[dict, dict]:
         training_config["noise_type"] = "adaptive"
         training_config["noise_scale"] = noise_scale
 
-    return flow_config, training_config
+    # Rescales the latent draws the proposal samples from (see
+    # FlowProposal.sample_latent_distribution); temperature=1 is a no-op.
+    latent_temperature = trial.suggest_float(
+        "latent_temperature", 0.5, 2.0, log=True
+    )
+
+    # LatentRadiusTruncation.configure() makes volume_fraction and
+    # fuzz/expansion_fraction mutually exclusive: under constant_volume_mode
+    # the radius comes from volume_fraction and fuzz is forced back to 1.0;
+    # otherwise expansion_fraction, whenever it is set, silently overwrites
+    # fuzz.  So exactly one of the three is ever a live lever -- branch on
+    # which, rather than suggesting all three and letting two of them be
+    # ignored.
+    constant_volume_mode = trial.suggest_categorical(
+        "constant_volume_mode", [True, False]
+    )
+    if constant_volume_mode:
+        # Fraction of the flow's latent mass kept inside the ball -- the
+        # direct control on the fidelity/cost tradeoff these two objectives
+        # measure (see the module docstring).
+        latent_radius_config = dict(
+            constant_volume_mode=True,
+            fixed_radius=False,
+            volume_fraction=trial.suggest_float(
+                "volume_fraction", 0.8, 0.999
+            ),
+            fuzz=1.0,
+            expansion_fraction=None,
+        )
+    else:
+        use_expansion_fraction = trial.suggest_categorical(
+            "use_expansion_fraction", [True, False]
+        )
+        if use_expansion_fraction:
+            latent_radius_config = dict(
+                constant_volume_mode=False,
+                fixed_radius=False,
+                fuzz=1.0,
+                expansion_fraction=trial.suggest_float(
+                    "expansion_fraction", 0.5, 8.0, log=True
+                ),
+            )
+        else:
+            latent_radius_config = dict(
+                constant_volume_mode=False,
+                fixed_radius=False,
+                fuzz=trial.suggest_float("fuzz", 0.5, 2.0),
+                expansion_fraction=None,
+            )
+
+    proposal_overrides = dict(
+        latent_temperature=latent_temperature,
+        latent_radius=latent_radius_config,
+    )
+
+    return flow_config, training_config, proposal_overrides
 
 
 def baseline_params() -> dict:
@@ -793,6 +897,9 @@ def baseline_params() -> dict:
         optimiser="adamw",
         weight_decay=1e-6,
         noise_scale=1e-3,
+        latent_temperature=1.0,
+        constant_volume_mode=True,
+        volume_fraction=FALLBACK_PROPOSAL_KWARGS["volume_fraction"],
     )
 
 
@@ -803,7 +910,9 @@ def baseline_params() -> dict:
 
 def make_objective(run: ArchivedRun, proposal_class):
     def objective(trial: optuna.Trial):
-        flow_config, training_config = suggest_configs(trial)
+        flow_config, training_config, proposal_overrides = suggest_configs(
+            trial
+        )
         logger.info("Trial %s: %s", trial.number, trial.params)
         seed = SEED + trial.number
         # A fresh model per trial, rather than one shared across trials, so
@@ -817,6 +926,7 @@ def make_objective(run: ArchivedRun, proposal_class):
             proposal_class,
             seed=seed,
             trial=trial,
+            proposal_overrides=proposal_overrides,
         )
         for key, value in summary.items():
             trial.set_user_attr(key, value)
@@ -866,7 +976,7 @@ def _run_worker(
     study = optuna.load_study(
         study_name=STUDY_NAME,
         storage=_make_storage(),
-        sampler=optuna.samplers.NSGAIISampler(seed=SEED),
+        sampler=_make_sampler(),
     )
     study.optimize(
         make_objective(run, proposal_class),
@@ -951,7 +1061,7 @@ def main():
         storage=_make_storage(),
         directions=["minimize", "minimize"],
         load_if_exists=True,
-        sampler=optuna.samplers.NSGAIISampler(seed=SEED),
+        sampler=_make_sampler(),
     )
     if not study.trials:
         # Put the status quo on the Pareto front so every result has a
