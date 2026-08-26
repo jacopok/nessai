@@ -73,10 +73,11 @@ Caveats
 
 Usage
 -----
-    python replay_optimisation.py                 # run the study
-    python replay_optimisation.py --baseline      # score the archived config only
-    python replay_optimisation.py --n-trials 200
-    python replay_optimisation.py --n-jobs 16      # run 16 trials concurrently
+    python replay_optimisation.py --result run_result.json
+    python replay_optimisation.py --result run_result.json --config config.json
+    python replay_optimisation.py --result run_result.json --baseline
+    python replay_optimisation.py --result run_result.json --n-trials 200
+    python replay_optimisation.py --result run_result.json --n-jobs 16
 
 Inspect with ``optuna-dashboard sqlite:///nessai_replay.sqlite3``.
 
@@ -121,19 +122,10 @@ from nessai.utils.threading import configure_threads
 logger = logging.getLogger("replay_optimisation")
 
 # --------------------------------------------------------------------------
-# Configuration -- everything specific to the run being replayed lives here.
+# Configuration -- the run being replayed is passed in via ``--result`` (and,
+# optionally, ``--config`` for the sampler's ``config.json``); everything
+# else generic to the optimisation lives here.
 # --------------------------------------------------------------------------
-
-RESULT_PATH = Path(
-    "/home/jacopo/Documents/lgwa-parameter-estimation/src/"
-    "lgwa_parameter_estimation/saved_runs/gw250114_maxl_full_bandwith_nessai/"
-    "gw250114_maxl_full_bandwith_nessai_result.json"
-)
-# Directory containing the sampler's ``config.json``.  Used to reproduce the
-# proposal settings exactly.  Set to None to fall back on FALLBACK_* below.
-NESSAI_OUTDIR = RESULT_PATH.parent / (
-    "gw250114_maxl_full_bandwith_nessai_nessai"
-)
 
 STUDY_NAME = "nessai-replay"
 STORAGE = "sqlite:///nessai_replay.sqlite3"
@@ -350,19 +342,19 @@ class ArchivedRun:
         return np.linspace(start, self.n_iterations, n).astype(int)
 
 
-def _read_run_config(outdir: Path | None) -> dict:
-    if outdir is None:
+def _read_run_config(config_path: Path | None) -> dict:
+    if config_path is None:
         return {}
-    path = Path(outdir) / "config.json"
-    if not path.exists():
-        logger.warning("No config.json at %s, using fallbacks", path)
+    config_path = Path(config_path)
+    if not config_path.exists():
+        logger.warning("No config.json at %s, using fallbacks", config_path)
         return {}
-    with open(path) as f:
+    with open(config_path) as f:
         return json.load(f)
 
 
 def load_archived_run(
-    result_path: Path = RESULT_PATH, outdir: Path | None = NESSAI_OUTDIR
+    result_path: Path, config_path: Path | None = None
 ) -> ArchivedRun:
     """Load the nested samples and the sampler settings from a bilby result."""
     import bilby
@@ -394,7 +386,7 @@ def load_archived_run(
     n_iterations = int(birth.max())
     nlive = n_samples - n_iterations
 
-    config = _read_run_config(outdir)
+    config = _read_run_config(config_path)
     if config.get("nlive") is not None and config["nlive"] != nlive:
         logger.warning(
             "nlive from config.json (%s) disagrees with the nested samples "
@@ -947,6 +939,7 @@ def make_objective(run: ArchivedRun, proposal_class):
 
 def _run_worker(
     result_path: Path,
+    config_path: Path | None,
     n_checkpoints: int,
     n_trials: int,
     pytorch_threads: int,
@@ -970,7 +963,7 @@ def _run_worker(
     configure_threads(pytorch_threads=pytorch_threads)
 
     N_CHECKPOINTS = n_checkpoints
-    run = load_archived_run(result_path)
+    run = load_archived_run(result_path, config_path)
     proposal_class = get_proposal_class()
 
     study = optuna.load_study(
@@ -998,7 +991,22 @@ def main():
     parser.add_argument(
         "--n-checkpoints", type=int, default=N_CHECKPOINTS
     )
-    parser.add_argument("--result", type=Path, default=RESULT_PATH)
+    parser.add_argument(
+        "--result",
+        type=Path,
+        required=True,
+        help="Path to the bilby result JSON file of the run to replay.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the sampler's config.json, used to reproduce the "
+            "proposal settings exactly. Falls back to FALLBACK_* settings "
+            "in this script if omitted."
+        ),
+    )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument(
         "--n-jobs",
@@ -1035,7 +1043,7 @@ def main():
 
     N_CHECKPOINTS = args.n_checkpoints
 
-    run = load_archived_run(args.result)
+    run = load_archived_run(args.result, args.config)
     proposal_class = get_proposal_class()
     logger.info("Using %s", proposal_class.__name__)
 
@@ -1086,6 +1094,7 @@ def main():
                 target=_run_worker,
                 args=(
                     args.result,
+                    args.config,
                     args.n_checkpoints,
                     n,
                     args.pytorch_threads,
