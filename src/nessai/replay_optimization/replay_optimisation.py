@@ -129,7 +129,7 @@ logger = logging.getLogger("replay_optimisation")
 
 STUDY_NAME = "nessai-replay"
 STORAGE = "sqlite:///nessai_replay.sqlite3"
-N_TRIALS = 100
+N_TRIALS = 2000
 
 
 def _make_storage() -> optuna.storages.RDBStorage:
