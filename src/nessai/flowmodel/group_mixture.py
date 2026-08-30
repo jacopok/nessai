@@ -23,12 +23,13 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         log p(x) = LogSumExp_g [ log p_base(g^-1 * x) + log pi_g ]
     where pi_g are learnable constant mixture weights (logits) for each group element.
     """
-    def __init__(self, base_flow, num_features, group_action_fn, group_size, param_names=None):
+    def __init__(self, base_flow, num_features, group_action_fn, group_size, param_names=None, fold_fn=None):
         super().__init__()
         self.base_flow = base_flow
         self.num_features = num_features
         self.group_size = group_size
         self.group_action_fn = group_action_fn
+        self.fold_fn = fold_fn
         self.param_names = param_names or [f"p_{i}" for i in range(num_features)]
 
         # Learnable global constant logits vector (shape: [group_size])
@@ -37,6 +38,20 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     def _apply_group_action(self, z_flat: torch.Tensor, modes_flat: torch.Tensor, inverse: bool) -> torch.Tensor:
         point_dict = {name: z_flat[:, i] for i, name in enumerate(self.param_names)}
         mapped_dict = self.group_action_fn(point_dict, modes_flat, inverse=inverse)
+        return torch.stack([mapped_dict[name] for name in self.param_names], dim=-1)
+
+    def _apply_fold(self, z_flat: torch.Tensor) -> torch.Tensor:
+        """Fold coordinates into the fundamental domain of the group.
+
+        The base flow only ever models a single orbit representative, so
+        any point that has had a group element undone is folded back into
+        the fundamental cell before being passed to ``base_flow``. This is
+        what makes the mixture logits identifiable.
+        """
+        if self.fold_fn is None:
+            return z_flat
+        point_dict = {name: z_flat[:, i] for i, name in enumerate(self.param_names)}
+        mapped_dict = self.fold_fn(point_dict)
         return torch.stack([mapped_dict[name] for name in self.param_names], dim=-1)
 
     def log_prob(self, x, context=None):
@@ -50,7 +65,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         modes_flat = modes.view(self.group_size * batch_size)
 
         # Evaluate g^-1 * x in base flow
-        z_prime_flat = self._apply_group_action(x_flat, modes_flat, inverse=True)
+        z_prime_flat = self._apply_fold(self._apply_group_action(x_flat, modes_flat, inverse=True))
         base_lp_flat = self.base_flow.log_prob(z_prime_flat, context=context)
 
         # Expand constant logits across batch
@@ -91,14 +106,14 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         x_flat = x_expanded.view(self.group_size * batch_size, -1)
         modes_flat = modes.view(self.group_size * batch_size)
 
-        z_prime_flat = self._apply_group_action(x_flat, modes_flat, inverse=True)
+        z_prime_flat = self._apply_fold(self._apply_group_action(x_flat, modes_flat, inverse=True))
         base_lp_flat = self.base_flow.log_prob(z_prime_flat, context=context)
         log_pi = torch.log_softmax(self.logits, dim=-1)
         log_pi_expanded = log_pi.unsqueeze(1).repeat(1, batch_size).view(-1)
 
         branch_log_probs = (base_lp_flat + log_pi_expanded).view(self.group_size, batch_size)
         best_modes = branch_log_probs.argmax(dim=0)
-        return self._apply_group_action(x, best_modes, inverse=True)
+        return self._apply_fold(self._apply_group_action(x, best_modes, inverse=True))
 
     def forward(self, x, context=None):
         x_prime = self._map_to_canonical(x, context=context)
@@ -159,6 +174,7 @@ class GroupMixtureFlowModel(FlowModel):
     group_action_fn = None
     group_size = None
     param_names = None
+    fold_fn = None
 
     def initialise(self):
         """Initialise the model and optimiser.
@@ -187,6 +203,40 @@ class GroupMixtureFlowModel(FlowModel):
         self._optimiser = self.get_optimiser()
         self.initialised = True
 
+    def get_optimiser(self, optimiser=None, **kwargs):
+        """Build the optimiser but keep the mixture logits out of weight decay.
+
+        AdamW's weight decay would otherwise pull ``logits`` towards zero,
+        i.e. the mixture towards a uniform distribution over group
+        elements, which is rarely what the data supports.
+        """
+        optimiser = optimiser or self.optimiser
+        default_kwargs = {
+            "adam": {"weight_decay": 1e-6},
+            "adamw": {},
+            "sgd": {},
+        }[optimiser.lower()]
+        default_kwargs["lr"] = self.training_config["lr"]
+        default_kwargs.update(self.optimiser_kwargs)
+        default_kwargs.update(kwargs)
+
+        optim_cls = {
+            "adam": torch.optim.Adam,
+            "adamw": torch.optim.AdamW,
+            "sgd": torch.optim.SGD,
+        }[optimiser.lower()]
+
+        logit_params = {id(self.model.logits)}
+        decay = [p for p in self.model.parameters() if id(p) not in logit_params]
+        no_decay = [self.model.logits]
+        return optim_cls(
+            [
+                {"params": decay},
+                {"params": no_decay, "weight_decay": 0.0},
+            ],
+            **default_kwargs,
+        )
+
     def get_model(self, config):
         # Work on a shallow copy to prevent modifying configuration dictionaries in-place
         config_clean = config.copy()
@@ -196,6 +246,7 @@ class GroupMixtureFlowModel(FlowModel):
         group_action_fn = config_clean.pop("group_action_fn", getattr(self, "group_action_fn", None))
         group_size = config_clean.pop("group_size", getattr(self, "group_size", None))
         param_names = config_clean.pop("param_names", getattr(self, "param_names", None))
+        fold_fn = config_clean.pop("fold_fn", getattr(self, "fold_fn", None))
 
         if group_action_fn is None or group_size is None:
             raise ValueError("GroupMixtureFlowModel requires `group_action_fn` and `group_size`.")
@@ -211,11 +262,12 @@ class GroupMixtureFlowModel(FlowModel):
             num_features=num_features,
             group_action_fn=group_action_fn,
             group_size=group_size,
-            param_names=param_names
+            param_names=param_names,
+            fold_fn=fold_fn,
         )
 
 
-def make_group_mixture_flow(group_action_fn, group_size, param_names):
+def make_group_mixture_flow(group_action_fn, group_size, param_names, fold_fn=None):
     """
     Factory constructing a customized GroupMixtureFlowModel class bound to specific group properties.
     """
@@ -225,4 +277,6 @@ def make_group_mixture_flow(group_action_fn, group_size, param_names):
     CustomGroupMixtureFlowModel.group_action_fn = staticmethod(group_action_fn)
     CustomGroupMixtureFlowModel.group_size = group_size
     CustomGroupMixtureFlowModel.param_names = param_names
+    if fold_fn is not None:
+        CustomGroupMixtureFlowModel.fold_fn = staticmethod(fold_fn)
     return CustomGroupMixtureFlowModel

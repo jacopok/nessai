@@ -9,8 +9,10 @@ from nessai.flowsampler import FlowSampler
 from nessai.proposal import FlowProposal
 
 from nessai.flowmodel.group_mixture import make_group_mixture_flow
+import logging
+logging.basicConfig(level=logging.INFO)
 
-N_PERIODS = 10
+N_PERIODS = 5
 
 # =====================================================================
 # 1. Group Action & Flow Definition
@@ -23,11 +25,17 @@ def shift_periodic_2d_group_action(point_dict: dict, modes_flat: torch.Tensor, i
     x_mapped = x - shift if inverse else x + shift
     return {'x': x_mapped, 'y': y}
 
+def fold_parameter_space(point_dict: dict) -> dict:
+    x = point_dict['x']
+    y = point_dict['y']
+
+    return {'x': x % 1, 'y': y}
 
 RealNVPGroupFlow = make_group_mixture_flow(
     group_action_fn=shift_periodic_2d_group_action,
     group_size=N_PERIODS,
-    param_names=['x', 'y']
+    param_names=['x', 'y'],
+    fold_fn=fold_parameter_space,
 )
 
 
