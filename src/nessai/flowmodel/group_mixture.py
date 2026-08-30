@@ -1,13 +1,21 @@
 """
+nessai/flowmodel/group_mixture.py
 Discrete Group Mixture Flow extension for nessai using Python Mixins.
 """
+
+import logging
 
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
+from nessai.flowmodel import FlowModel
+from nessai.flows.base import BaseFlow
+from nessai.flows.utils import configure_model
+
+logger = logging.getLogger(__name__)
 
 
-class DiscreteGroupMixtureFlowWrapper(nn.Module):
+class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     """
     PyTorch wrapper that applies discrete group transformations to a base normalizing flow.
 
@@ -65,27 +73,99 @@ class DiscreteGroupMixtureFlowWrapper(nn.Module):
         exact_log_prob = self.log_prob(x, context=context)
         return x, exact_log_prob
 
+    # -- Remaining BaseFlow abstract methods -----------------------------
+    # These operate on the underlying base flow directly since the group
+    # mixture only changes how the overall density/sampling is computed
+    # (via log_prob/sample_and_log_prob above).
 
-class DiscreteGroupMixtureMixin:
+    def forward(self, x, context=None):
+        return self.base_flow.forward(x, context=context)
+
+    def inverse(self, z, context=None):
+        return self.base_flow.inverse(z, context=context)
+
+    def sample(self, n, context=None):
+        x, _ = self.sample_and_log_prob(n, context=context)
+        return x
+
+    def sample_latent_distribution(self, n, context=None):
+        return self.base_flow.sample_latent_distribution(n, context=context)
+
+    def base_distribution_log_prob(self, z, context=None):
+        return self.base_flow.base_distribution_log_prob(z, context=context)
+
+    def forward_and_log_prob(self, x, context=None):
+        z, _ = self.forward(x, context=context)
+        return z, self.log_prob(x, context=context)
+
+    def freeze_transform(self):
+        self.base_flow.freeze_transform()
+
+    def unfreeze_transform(self):
+        self.base_flow.unfreeze_transform()
+
+    def finalise(self):
+        self.base_flow.finalise()
+
+    def end_iteration(self):
+        self.base_flow.end_iteration()
+
+
+class GroupMixtureFlowModel(FlowModel):
     """
-    Mixin class for nessai FlowModel architectures.
-    Intercepts get_model() to wrap any built-in base flow with group mixture logic.
+    Custom FlowModel inheriting directly from nessai.flowmodel.FlowModel.
+    Sanitizes model_config before building PyTorch flow models via configure_model.
     """
     group_action_fn = None
     group_size = None
     param_names = None
 
-    def get_model(self, config, **kwargs):
-        base_flow = super().get_model(config, **kwargs)
+    def initialise(self):
+        """Initialise the model and optimiser.
 
-        group_action_fn = getattr(self, 'group_action_fn', config.get('group_action_fn'))
-        group_size = getattr(self, 'group_size', config.get('group_size'))
-        param_names = getattr(self, 'param_names', config.get('param_names'))
-        num_features = config.get('n_inputs')
+        Overrides :meth:`~nessai.flowmodel.base.FlowModel.initialise` to
+        build the model via :meth:`get_model` instead of calling
+        :func:`~nessai.flows.utils.configure_model` directly, since the
+        latter does not know how to handle the group-mixture-specific
+        configuration keys.
+        """
+        self.update_mask()
+        self.model = self.get_model(self.flow_config)
+        logger.debug("Flow model:")
+        logger.debug(self.model)
+        self.device = torch.device(
+            self.training_config.get("device_tag", "cpu")
+        )
+        self.model.device = self.device
+        logger.debug(f"Training device: {self.device}")
+        self.inference_device = torch.device(
+            self.flow_config.get("inference_device_tag", self.device)
+            or self.device
+        )
+        logger.debug(f"Inference device: {self.inference_device}")
+
+        self._optimiser = self.get_optimiser()
+        self.initialised = True
+
+    def get_model(self, config):
+        # Work on a shallow copy to prevent modifying configuration dictionaries in-place
+        config_clean = config.copy()
+
+        # Remove keys that PyTorch flow constructors (e.g. RealNVP) do not expect
+        config_clean.pop("model", None)
+        group_action_fn = config_clean.pop("group_action_fn", getattr(self, "group_action_fn", None))
+        group_size = config_clean.pop("group_size", getattr(self, "group_size", None))
+        param_names = config_clean.pop("param_names", getattr(self, "param_names", None))
 
         if group_action_fn is None or group_size is None:
-            raise ValueError("DiscreteGroupMixtureMixin requires `group_action_fn` and `group_size`.")
+            raise ValueError("GroupMixtureFlowModel requires `group_action_fn` and `group_size`.")
 
+        # Construct standard underlying flow (RealNVP / NSF / MAF)
+        base_flow = configure_model(config_clean)
+
+        num_features = config_clean.get("n_inputs")
+
+        # Wrap standard PyTorch flow into DiscreteGroupMixtureFlowWrapper
         return DiscreteGroupMixtureFlowWrapper(
             base_flow=base_flow,
             num_features=num_features,
@@ -95,15 +175,14 @@ class DiscreteGroupMixtureMixin:
         )
 
 
-def make_group_mixture_flow(base_flow_class, group_action_fn, group_size, param_names):
+def make_group_mixture_flow(group_action_fn, group_size, param_names):
     """
-    Factory creating a dynamic Mixin FlowModel class combining DiscreteGroupMixtureMixin
-    with any existing nessai flow architecture (e.g., ResNetFlowModel, StandardFlowModel).
+    Factory constructing a customized GroupMixtureFlowModel class bound to specific group properties.
     """
-    class GroupMixtureFlowClass(DiscreteGroupMixtureMixin, base_flow_class):
+    class CustomGroupMixtureFlowModel(GroupMixtureFlowModel):
         pass
 
-    GroupMixtureFlowClass.group_action_fn = staticmethod(group_action_fn)
-    GroupMixtureFlowClass.group_size = group_size
-    GroupMixtureFlowClass.param_names = param_names
-    return GroupMixtureFlowClass
+    CustomGroupMixtureFlowModel.group_action_fn = staticmethod(group_action_fn)
+    CustomGroupMixtureFlowModel.group_size = group_size
+    CustomGroupMixtureFlowModel.param_names = param_names
+    return CustomGroupMixtureFlowModel
