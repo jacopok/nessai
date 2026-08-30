@@ -40,41 +40,53 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         mapped_dict = self.group_action_fn(point_dict, modes_flat, inverse=inverse)
         return torch.stack([mapped_dict[name] for name in self.param_names], dim=-1)
 
-    def _apply_fold(self, z_flat: torch.Tensor) -> torch.Tensor:
-        """Fold coordinates into the fundamental domain of the group.
-
-        The base flow only ever models a single orbit representative, so
-        any point that has had a group element undone is folded back into
-        the fundamental cell before being passed to ``base_flow``. This is
-        what makes the mixture logits identifiable.
-        """
+    def _fold(self, z_flat: torch.Tensor) -> torch.Tensor:
         if self.fold_fn is None:
             return z_flat
         point_dict = {name: z_flat[:, i] for i, name in enumerate(self.param_names)}
         mapped_dict = self.fold_fn(point_dict)
         return torch.stack([mapped_dict[name] for name in self.param_names], dim=-1)
 
-    def log_prob(self, x, context=None):
-        batch_size = x.shape[0]
+    def _branch_log_probs(self, x, context=None):
+        """Return ``base_lp(g^-1 x) + log pi_g`` for every group element.
 
-        # Expand inputs across all |G| group modes
+        Shape ``[group_size, batch_size]``. A branch whose pre-image
+        ``g^-1 x`` does not lie in the fundamental domain is set to
+        ``-inf``: for a group that tiles the space exactly one branch per
+        point survives, so ``logsumexp`` collapses to that branch and the
+        mixture logit for it receives a responsibility-weighted gradient.
+        The base flow is only ever evaluated on in-domain points, so it
+        stays specialised to a single orbit representative.
+        """
+        batch_size = x.shape[0]
         x_expanded = x.unsqueeze(0).repeat(self.group_size, 1, 1)
         modes = torch.arange(self.group_size, device=x.device).unsqueeze(1).repeat(1, batch_size)
 
         x_flat = x_expanded.view(self.group_size * batch_size, -1)
         modes_flat = modes.view(self.group_size * batch_size)
 
-        # Evaluate g^-1 * x in base flow
-        z_prime_flat = self._apply_fold(self._apply_group_action(x_flat, modes_flat, inverse=True))
-        base_lp_flat = self.base_flow.log_prob(z_prime_flat, context=context)
+        preimage_flat = self._apply_group_action(x_flat, modes_flat, inverse=True)
+        folded_flat = self._fold(preimage_flat)
+        # Fold before the base flow only for numerical safety (keeps far
+        # out-of-domain branches finite); those branches are masked below.
+        base_lp_flat = self.base_flow.log_prob(folded_flat, context=context)
 
-        # Expand constant logits across batch
         log_pi = torch.log_softmax(self.logits, dim=-1)
         log_pi_expanded = log_pi.unsqueeze(1).repeat(1, batch_size).view(-1)
 
-        # LogSumExp over discrete branches
-        branch_log_probs = (base_lp_flat + log_pi_expanded).view(self.group_size, batch_size).T
-        return torch.logsumexp(branch_log_probs, dim=-1)
+        branch = (base_lp_flat + log_pi_expanded).view(self.group_size, batch_size)
+
+        if self.fold_fn is not None:
+            in_domain = torch.isclose(
+                folded_flat, preimage_flat, atol=1e-4
+            ).all(dim=-1).view(self.group_size, batch_size)
+            # Guard against a point that no branch claims (domain gaps).
+            in_domain = in_domain | (~in_domain.any(dim=0, keepdim=True))
+            branch = branch.masked_fill(~in_domain, float("-inf"))
+        return branch
+
+    def log_prob(self, x, context=None):
+        return torch.logsumexp(self._branch_log_probs(x, context=context), dim=0)
 
     def sample_and_log_prob(self, num_samples, context=None):
         z_prime, _ = self.base_flow.sample_and_log_prob(num_samples, context=context)
@@ -99,21 +111,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         (mixture-weighted) branch log-probability for each point, then
         applies the inverse group action for that element.
         """
-        batch_size = x.shape[0]
-        x_expanded = x.unsqueeze(0).repeat(self.group_size, 1, 1)
-        modes = torch.arange(self.group_size, device=x.device).unsqueeze(1).repeat(1, batch_size)
-
-        x_flat = x_expanded.view(self.group_size * batch_size, -1)
-        modes_flat = modes.view(self.group_size * batch_size)
-
-        z_prime_flat = self._apply_fold(self._apply_group_action(x_flat, modes_flat, inverse=True))
-        base_lp_flat = self.base_flow.log_prob(z_prime_flat, context=context)
-        log_pi = torch.log_softmax(self.logits, dim=-1)
-        log_pi_expanded = log_pi.unsqueeze(1).repeat(1, batch_size).view(-1)
-
-        branch_log_probs = (base_lp_flat + log_pi_expanded).view(self.group_size, batch_size)
-        best_modes = branch_log_probs.argmax(dim=0)
-        return self._apply_fold(self._apply_group_action(x, best_modes, inverse=True))
+        best_modes = self._branch_log_probs(x, context=context).argmax(dim=0)
+        return self._fold(self._apply_group_action(x, best_modes, inverse=True))
 
     def forward(self, x, context=None):
         x_prime = self._map_to_canonical(x, context=context)
