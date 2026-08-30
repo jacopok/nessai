@@ -74,15 +74,55 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         return x, exact_log_prob
 
     # -- Remaining BaseFlow abstract methods -----------------------------
-    # These operate on the underlying base flow directly since the group
-    # mixture only changes how the overall density/sampling is computed
-    # (via log_prob/sample_and_log_prob above).
+
+    def _map_to_canonical(self, x: torch.Tensor, context=None) -> torch.Tensor:
+        """Find the most probable group element for each point and undo it.
+
+        Used by ``forward``/``forward_and_log_prob``, e.g. to map a real
+        data point into the latent space (for the truncation radius, or
+        training diagnostics). Picks the group element that maximises the
+        (mixture-weighted) branch log-probability for each point, then
+        applies the inverse group action for that element.
+        """
+        batch_size = x.shape[0]
+        x_expanded = x.unsqueeze(0).repeat(self.group_size, 1, 1)
+        modes = torch.arange(self.group_size, device=x.device).unsqueeze(1).repeat(1, batch_size)
+
+        x_flat = x_expanded.view(self.group_size * batch_size, -1)
+        modes_flat = modes.view(self.group_size * batch_size)
+
+        z_prime_flat = self._apply_group_action(x_flat, modes_flat, inverse=True)
+        base_lp_flat = self.base_flow.log_prob(z_prime_flat, context=context)
+        log_pi = torch.log_softmax(self.logits, dim=-1)
+        log_pi_expanded = log_pi.unsqueeze(1).repeat(1, batch_size).view(-1)
+
+        branch_log_probs = (base_lp_flat + log_pi_expanded).view(self.group_size, batch_size)
+        best_modes = branch_log_probs.argmax(dim=0)
+        return self._apply_group_action(x, best_modes, inverse=True)
 
     def forward(self, x, context=None):
-        return self.base_flow.forward(x, context=context)
+        x_prime = self._map_to_canonical(x, context=context)
+        return self.base_flow.forward(x_prime, context=context)
 
     def inverse(self, z, context=None):
-        return self.base_flow.inverse(z, context=context)
+        # Sample which group element each point belongs to (matching the
+        # mixture weights used in log_prob/sample_and_log_prob) and map the
+        # base flow's output through the forward group action. `log_j` is
+        # set so that `latent_log_prob(z) - log_j == self.log_prob(x)`,
+        # which is the quantity FlowProposal.backward_pass relies on to
+        # obtain the correct (mixture) proposal density for `x` -- it is
+        # not a literal Jacobian since the group action is assumed to be
+        # measure-preserving (e.g. a translation).
+        batch_size = z.shape[0]
+        dist = Categorical(logits=self.logits)
+        modes = dist.sample((batch_size,))
+
+        x_prime, _ = self.base_flow.inverse(z, context=context)
+        x = self._apply_group_action(x_prime, modes, inverse=False)
+
+        latent_log_prob = self.base_flow.base_distribution_log_prob(z, context=context)
+        log_j = latent_log_prob - self.log_prob(x, context=context)
+        return x, log_j
 
     def sample(self, n, context=None):
         x, _ = self.sample_and_log_prob(n, context=context)
