@@ -151,3 +151,10 @@ group_flow_inspection/
 group_mixture_truncation_experiment/
 
 outdir_synthetic_gaussian/*
+
+# Replay-optimization scratch: archived runs, Optuna studies, checkpoints,
+# plots and per-config dumps produced by replay_optimisation.py and friends.
+src/nessai/replay_optimization/*
+/nessai_replay*.sqlite3
+/flow_config.json
+/training_config.json
