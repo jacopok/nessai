@@ -475,6 +475,64 @@ def test_prime_space_action_escape_hatch(base_flow):
     assert torch.allclose(log_q, w.log_prob(x), atol=1e-4)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "The wrapper assumes the group action is a clean bijection on the "
+        "whole prime space. An action that is measure preserving only on a "
+        "box and saturates outside it (e.g. nessai_gw's ETTriangleGroupAction, "
+        "which does asin(clamp(sin_dec, -1, 1))) makes sample_and_log_prob "
+        "and log_prob disagree once the canonical draw leaves the box."
+    ),
+)
+def test_sample_and_log_prob_consistent_with_saturating_action(base_flow):
+    """log q from the generator must match log q recomputed by log_prob.
+
+    ``clamped_shift`` is an integer shift of ``x`` that is exactly measure
+    preserving for ``|x| <= 1`` but clamps ``x`` into ``[-1, 1]`` first, so it
+    is not injective outside that box -- the minimal stand-in for a group
+    action defined via ``clamp`` / ``asin`` / ``atan2`` on physical angles.
+    With the base standardisation active the canonical draw routinely lands
+    outside the box, and the two log-density paths then diverge.
+    """
+
+    def clamped_shift(point_dict, modes, inverse=False):
+        shift = modes.to(point_dict["x"].dtype)
+        x = point_dict["x"].clamp(-1.0, 1.0)
+        x = x - shift if inverse else x + shift
+        return {"x": x, "y": point_dict["y"]}
+
+    def fundamental_domain(point_dict):
+        return (point_dict["x"] >= 0.0) & (point_dict["x"] < 1.0)
+
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=clamped_shift,
+        group_size=3,
+        param_names=["x", "y"],
+        in_fundamental_domain=fundamental_domain,
+    )
+    w.eval()
+
+    rng = np.random.default_rng(1)
+    data = np.concatenate(
+        [
+            np.stack([rng.uniform(0.0, 1.0, 300) + k, rng.normal(0.0, 1.0, 300)], axis=1)
+            for k in range(3)
+        ]
+    )
+    x_train = torch.tensor(data, dtype=torch.float32)
+    w.update_mixture_weights(x_train)
+    w.update_base_standardisation(x_train)
+
+    torch.manual_seed(0)
+    x, log_q = w.sample_and_log_prob(4000)
+    finite = torch.isfinite(log_q)
+    assert finite.sum() > 2000
+    assert torch.allclose(log_q[finite], w.log_prob(x)[finite], atol=1e-3)
+
+
 @pytest.mark.slow_integration_test
 def test_sampling_with_group_mixture_flow(tmp_path):
     """Sample a periodic multimodal target with the group-mixture proposal."""
