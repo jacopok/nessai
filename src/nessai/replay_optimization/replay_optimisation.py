@@ -748,46 +748,42 @@ def run_looks_like_gw(run: ArchivedRun) -> bool:
 # prior and ``Sine`` theta_jn prior are uniform in ``sin_dec`` /
 # ``cos_theta_jn``, so it is a clean relabelling.
 #
-# The ET group action is only well defined on the physical box (``sin_dec`` in
-# [-1, 1], ``psi`` in [0, pi], ...) and the group-mixture wrapper needs an
-# *exact* prime<->physical round trip for every point the flow proposes.  So
-# the five acted parameters get a bounded ``logit`` map: rescale to [0, 1] on
-# the known prior bounds, then ``logit`` -> unbounded prime.  The inverse is
-# ``sigmoid`` -> the *open* interval (0, 1) -> back inside the box, for any
-# finite prime, with no clamping.  A tiny ``eps`` keeps a training point that
-# sits exactly on a bound (a sky mode at the pole) finite on the forward pass.
-# The remaining parameters are z-scored; the mixin carries the non-affine
-# Jacobian exactly with its ``ReparamBridge``.
+# A bounded ``logit`` map for the five acted parameters was tried first (see
+# git history): rescale to [0, 1] on the known prior bounds, then ``logit``
+# to an unbounded prime, exactly invertible via ``sigmoid``. It made every
+# proposed point land strictly inside the physical box the ET action needs,
+# but it also made the flow's importance weights collapse (ESS ~1): the
+# posterior for ``sin_dec`` / ``cos_theta_jn`` has real, non-vanishing
+# density right up to +-1 (a face-on/face-off or polar sky mode is a normal
+# part of the octomodal posterior, not a rare edge case), and ``logit``'s
+# derivative diverges there -- an ordinary, moderately-probable physical
+# point lands far in the *prime*-space tail the base flow is trained on, so
+# it gets a wildly underestimated density and hence a wildly overestimated
+# weight. 83% of the 200 largest weights came from within 0.02 of a
+# ``sin_dec`` / ``cos_theta_jn`` edge, vs. 3.7% of all proposed points.
+#
+# So every parameter is z-scored instead: affine, so the mixin's fast
+# ``AffineBridge`` applies (no ``ReparamBridge`` round trip, no conjugation
+# Jacobian to carry) and, critically, no artificial density singularity at
+# the physical edges. The trade-off is that z-scoring is unbounded, so the
+# flow can occasionally propose a point just outside the physical box (e.g.
+# ``sin_dec`` slightly past +-1); ``ETTriangleGroupAction`` clamps such
+# inputs internally rather than raising, and the group-mixture wrapper's
+# non-injective-action fallback (see ``DiscreteGroupMixtureFlowWrapper``)
+# keeps ``sample_and_log_prob`` / ``log_prob`` consistent for those points
+# regardless, so this is an ordinary (harmless) rejection-sampling cost, not
+# a correctness problem.
 
 
 ET_GROUP_ACTED_PARAMETERS = ("ra", "sin_dec", "cos_theta_jn", "psi", "phase")
-
-#: Forward logit clamps to ``[GROUP_LOGIT_EPS, 1 - GROUP_LOGIT_EPS]`` so a
-#: sample on a prior edge maps to a finite prime.
-GROUP_LOGIT_EPS = 1e-9
 
 
 def _group_reparameterisations(names) -> dict:
     """Reparameterisations for the ``--group`` replay (see the note above).
 
-    The acted parameters get a bounded, exactly-invertible ``logit`` map; the
-    rest are z-scored.
+    Every parameter is z-scored, so the mixin installs the affine bridge.
     """
-    from functools import partial
-
-    from nessai.utils.rescaling import logit, sigmoid
-
-    bounded = {
-        "reparameterisation": "logit",
-        "post_rescaling": (partial(logit, eps=GROUP_LOGIT_EPS), sigmoid),
-    }
-    reparams = {}
-    for name in names:
-        if name in ET_GROUP_ACTED_PARAMETERS:
-            reparams[name] = dict(bounded)
-        else:
-            reparams[name] = {"reparameterisation": "zscore"}
-    return reparams
+    return {name: {"reparameterisation": "zscore"} for name in names}
 
 # Physical angle -> measure-preserving coordinate used by the ET group action.
 _GROUP_COORD_RENAME = {"dec": "sin_dec", "theta_jn": "cos_theta_jn"}
@@ -1049,12 +1045,9 @@ def evaluate_checkpoint(
     else:
         proposal_kwargs = run.proposal_kwargs
     if use_group:
-        # The ET group action is only well defined on the physical box
-        # (``sin_dec`` in [-1, 1], ``psi`` in [0, pi], ...); the flow will
-        # happily propose canonical points outside it.  ``map_to_unit_hypercube``
-        # + a ``logit`` fallback makes the prime->physical map land *strictly*
-        # in bounds, so the action always sees valid input.  The mixin's
-        # ReparamBridge carries the (non-affine) logit+CDF Jacobian exactly.
+        # ``_group_reparameterisations`` z-scores every parameter (see its
+        # docstring for why); ``map_to_unit_hypercube``'s CDF-based prior
+        # isn't used by that path, so it is dropped here.
         proposal_kwargs = {
             k: v
             for k, v in proposal_kwargs.items()
