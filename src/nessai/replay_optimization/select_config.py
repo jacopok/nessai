@@ -4,7 +4,8 @@
 Selection rule, in decreasing order of importance:
 
 1. **Likelihood efficiency.**  Fewest likelihood calls per nested-sampling
-   iteration (objective 2).
+   iteration (objective 2 is the base-10 log of this; it is converted back to
+   a raw call count here).
 2. **Small flow.**  Fewest trainable parameters.
 3. **Small KS statistic** (objective 1), subject to the hard constraint that
    the insertion-index KS test must *pass*: ``ks_p_value >= --p-threshold``.
@@ -71,9 +72,10 @@ def main() -> None:
         study_name=args.study_name, storage=args.storage
     )
 
-    calls = lambda t: t.values[1]
+    # Objective 2 is stored as log10(likelihood calls / iteration).
+    calls = lambda t: 10.0 ** t.values[1]
     n_params = lambda t: t.user_attrs["n_flow_parameters"]
-    ks = lambda t: t.values[0]
+    ks = lambda t: t.user_attrs["ks_statistic"]
 
     candidates = [
         t
@@ -123,22 +125,36 @@ def main() -> None:
         )
 
     if args.output is not None:
-        flow_config, training_config, proposal_overrides = suggest_configs(
+        import nessai
+
+        flow_config, training_config, overrides = suggest_configs(
             optuna.trial.FixedTrial(winner.params)
         )
+        # Expand the replay's compact ``proposal_overrides`` into the kwargs a
+        # real FlowProposal / sampler actually takes -- mirrors
+        # replay_optimisation._apply_proposal_overrides.
+        proposal_kwargs = {
+            "latent_temperature": overrides["latent_temperature"],
+            "truncation_methods": ["latent_radius"],
+            "truncation_kwargs": {"latent_radius": overrides["latent_radius"]},
+        }
         fmt = lambda d: pprint.pformat(d, indent=1, sort_dicts=False, width=88)
         header = (
             f'"""Hyperparameters selected by select_config.py from the '
-            f'replay-optimisation\nPareto front (trial {winner.number}).\n\n'
+            f"replay-optimisation Pareto front (trial {winner.number}).\n\n"
             f"KS statistic {ks(winner):.4f} (p = {a['ks_p_value']:.3f}), "
-            f"{calls(winner):,.0f} likelihood calls/iteration,\n"
-            f"{n_params(winner):,} trainable flow parameters.\n\"\"\"\n"
+            f"{calls(winner):,.0f} likelihood calls/iteration, "
+            f"{n_params(winner):,} trainable flow parameters.\n\n"
+            f"Tuned against nessai {nessai.__version__}; the proposal settings "
+            f"below (latent_temperature alongside constant_volume_mode) are "
+            f"only mutually consistent on that version -- run production on the "
+            f"same nessai, or re-tune.\n\"\"\"\n"
         )
         args.output.write_text(
             f"{header}\n"
             f"flow_config = {fmt(flow_config)}\n\n"
             f"training_config = {fmt(training_config)}\n\n"
-            f"proposal_overrides = {fmt(proposal_overrides)}\n"
+            f"proposal_kwargs = {fmt(proposal_kwargs)}\n"
         )
         print(f"\nWrote {args.output}")
 

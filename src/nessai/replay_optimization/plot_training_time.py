@@ -2,7 +2,7 @@
 """Plot how flow *training time* relates to the two replay objectives.
 
 Companion to ``plot_pareto_front.py``.  That figure shows the
-fidelity/cost trade-off (KS statistic of the insertion indices vs
+fidelity/cost trade-off (KS-test p-value of the insertion indices vs
 likelihood calls per iteration); this one asks a separate question: does a
 configuration that scores well on either objective also cost more to
 *train*?
@@ -10,8 +10,8 @@ configuration that scores well on either objective also cost more to
 Two panels share a common y-axis (mean wall-clock time to train one
 checkpoint flow, averaged over the run's checkpoints):
 
-    left   training time vs KS statistic         (objective 1)
-    right  training time vs likelihood calls/it  (objective 2)
+    left   training time vs KS statistic         (fidelity)
+    right  training time vs likelihood calls/it  (objective 2, cost)
 
 Every point is colored by the flow's trainable-parameter count, which is
 the obvious confounder: bigger flows are slower to train regardless of how
@@ -172,8 +172,9 @@ def main() -> None:
     trials, study = _load_completed_trials(args.study_name, args.storage)
 
     numbers = np.array([t.number for t in trials])
-    ks = np.array([t.values[0] for t in trials])
-    calls = np.array([t.values[1] for t in trials])
+    ks = np.array([t.user_attrs["ks_statistic"] for t in trials])
+    # Objective 2 is stored as log10(likelihood calls / iteration).
+    calls = np.array([10.0 ** t.values[1] for t in trials])
     n_checkpoints = np.array(
         [t.user_attrs["n_checkpoints"] for t in trials]
     )

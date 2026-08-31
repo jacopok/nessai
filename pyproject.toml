@@ -78,7 +78,14 @@ nflows = [
 ]
 replay = [
     "optuna-dashboard>=0.20.0",
+    "nessai-gw",
+    "scikit-learn",
 ]
+
+[tool.uv.sources]
+# Local checkout of nessai-gw so the replay-optimisation work (the MoG proposal
+# lives there) is picked up editable.  Drop this entry to use the PyPI release.
+nessai-gw = { path = "../nessai-gw", editable = true }
 
 [tool.setuptools_scm]
 version_scheme = "release-branch-semver"

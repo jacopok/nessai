@@ -99,8 +99,12 @@ likelihood_calls = exp(log(m(S)) - log(X_i) - log(f))
 ```
 
 then averaged across checkpoints (checkpoints are spaced uniformly in log
-prior volume, so the mean is the right estimator of the total). Lower is
-better.
+prior volume, so the mean is the right estimator of the total). The value
+optimised is the **base-10 log** of that mean — likelihood calls per iteration
+span several orders of magnitude across the front, so `log10` makes the
+objective (and the Optuna dashboard) far easier to read. Lower is better.
+Downstream scripts (`select_config.py`, `plot_pareto_front.py`,
+`plot_training_time.py`) convert `10 ** values[1]` back to a raw call count.
 
 ## Why the two objectives trade off against each other
 
