@@ -77,6 +77,17 @@ class ReparamBridge(CoordinateBridge):
     prime->physical. The reparameterisation ``log_J`` for prime->physical is
     exactly ``L``; the physical->prime pass returns ``-L`` (up to numerical
     error), so both directions are reconciled here.
+
+    The *physical* side is carried in ``physical_dtype`` (float64 by default),
+    not in the flow's ``dtype``. Physical parameters are not standardised, so
+    they can be huge next to the spread the posterior actually resolves -- a
+    GW ``geocent_time`` is a GPS time of order ``1.2e9`` with a prior only
+    ``0.2`` s wide, and the float32 spacing there is ``128`` s. Storing the
+    physical point in float32 would snap every sample onto the same value and
+    the prime->physical->prime round trip would destroy that coordinate, so
+    ``sample_and_log_prob`` and :meth:`log_prob` would then score different
+    points. Only the prime coordinates the flow itself sees are cast to
+    ``dtype``.
     """
 
     def __init__(
@@ -87,12 +98,14 @@ class ReparamBridge(CoordinateBridge):
         inverse_rescale_fn,
         dtype,
         device,
+        physical_dtype=torch.float64,
     ):
         self.prime_names = list(prime_names)
         self.physical_names = list(physical_names)
         self.rescale_fn = rescale_fn
         self.inverse_rescale_fn = inverse_rescale_fn
         self.dtype = dtype
+        self.physical_dtype = physical_dtype
         self.device = device
         self.dimension_changing = len(self.prime_names) != len(
             self.physical_names
@@ -104,9 +117,11 @@ class ReparamBridge(CoordinateBridge):
             out[name] = array[:, i]
         return out
 
-    def _to_tensor(self, array):
+    def _to_tensor(self, array, dtype=None):
         return torch.as_tensor(
-            array, dtype=self.dtype, device=self.device
+            array,
+            dtype=self.dtype if dtype is None else dtype,
+            device=self.device,
         )
 
     def to_physical(self, prime):
@@ -123,9 +138,10 @@ class ReparamBridge(CoordinateBridge):
                 n for n in self.prime_names if n not in self.physical_names
             ]
             aux = self._to_tensor(
-                live_points_to_array(phys_struct, aux_names, copy=True)
+                live_points_to_array(phys_struct, aux_names, copy=True),
+                dtype=self.physical_dtype,
             )
-        return self._to_tensor(phys), L, aux
+        return self._to_tensor(phys, dtype=self.physical_dtype), L, aux
 
     def to_prime(self, physical, aux=None):
         phys_np = physical.detach().cpu().numpy().astype(float)
