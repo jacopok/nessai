@@ -4,6 +4,7 @@ Implementation of Real Non Volume Preserving flows.
 """
 
 import logging
+from functools import partial
 
 import numpy as np
 import torch
@@ -15,6 +16,38 @@ from .base import NFlow
 from .utils import create_linear_transform, create_pre_transform
 
 logger = logging.getLogger(__name__)
+
+
+class BoundedShiftAffineCouplingTransform(transforms.AffineCouplingTransform):
+    """Affine coupling transform with a bounded translation term.
+
+    ``glasflow``'s ``AffineCouplingTransform`` already bounds the per-layer
+    scale (``DEFAULT_SCALE_ACTIVATION`` caps it at ``~1.001``), but the shift
+    is the network's raw, unconstrained output. Trained on in-distribution
+    data, the coupling networks are unconstrained far in the tails of the
+    base distribution and can extrapolate to an arbitrarily large shift for a
+    rare, extreme latent draw. The forward and inverse transforms then differ
+    by adding and subtracting that huge shift, and in float32 that
+    catastrophically cancels: ``x = u * scale + shift`` and
+    ``u' = (x - shift) / scale`` no longer agree to within the ``O(1)``
+    precision the flow needs, so ``sample_and_log_prob`` and ``log_prob``
+    disagree by many orders of magnitude for those rare draws.
+
+    Bounding the shift with ``tanh`` keeps every layer's translation (and
+    hence the composed transform) within a known range, so this
+    inputs-far-outside-training-support case no longer loses precision. The
+    log-determinant is unaffected -- it only depends on ``scale`` -- so the
+    bound does not need to be threaded into the Jacobian.
+    """
+
+    def __init__(self, *args, shift_bound, **kwargs):
+        self.shift_bound = float(shift_bound)
+        super().__init__(*args, **kwargs)
+
+    def _scale_and_shift(self, transform_params):
+        scale, shift = super()._scale_and_shift(transform_params)
+        shift = self.shift_bound * torch.tanh(shift / self.shift_bound)
+        return scale, shift
 
 
 class RealNVP(NFlow):
@@ -69,6 +102,18 @@ class RealNVP(NFlow):
     actnorm : bool
         Include activation normalisation as described in arXiv:1807.03039.
         Batch norm between layers must be disabled if using this option.
+    shift_bound : float, optional
+        If specified, bound each affine coupling layer's translation term to
+        ``(-shift_bound, shift_bound)`` with a ``tanh`` squash (see
+        :class:`BoundedShiftAffineCouplingTransform`). Off (unbounded shift,
+        matching plain ``glasflow``) by default. Set this when the flow will
+        be evaluated on latent draws far outside the training data's support
+        (e.g. a discrete group-mixture wrapper that samples every branch's
+        base flow on the same base distribution) and precision loss in
+        ``sample_and_log_prob`` vs. ``log_prob`` for those rare draws matters;
+        it has no effect on the log-Jacobian and does not otherwise change
+        the flow's density away from the tails it targets. Ignored when
+        ``use_volume_preserving`` is set (no shift-only transform is used).
     kwargs :
         Keyword arguments are passed to the coupling class.
     """
@@ -92,6 +137,7 @@ class RealNVP(NFlow):
         pre_transform_kwargs=None,
         actnorm=False,
         distribution=None,
+        shift_bound=None,
         **kwargs,
     ):
         if features <= 1:
@@ -108,6 +154,11 @@ class RealNVP(NFlow):
 
         if use_volume_preserving:
             coupling_constructor = transforms.AdditiveCouplingTransform
+        elif shift_bound is not None:
+            coupling_constructor = partial(
+                BoundedShiftAffineCouplingTransform,
+                shift_bound=shift_bound,
+            )
         else:
             coupling_constructor = transforms.AffineCouplingTransform
 
