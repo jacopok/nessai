@@ -224,6 +224,17 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         self._min_std_count = 16
         self._canon_ema = 0.3
         self._weight_empty_patience = 3
+        # Floor for the per-element canonical std. The canonical coordinates
+        # live in the flow's ~unit-scaled prime frame, so a per-element std
+        # far below 1 means that dimension carries almost no information for
+        # that mode (e.g. a parameter the run effectively fixes). Rescaling it
+        # to O(1) anyway divides by a near-zero number: ``_canon_log_det``
+        # blows up and ``sample_and_log_prob`` (which draws that dim with
+        # width ``_canon_std``) stops agreeing with ``log_prob`` (which sees
+        # the true, much narrower spread). Flooring keeps both paths finite
+        # and consistent; the residual sub-floor variance is modelled by the
+        # base flow instead.
+        self._min_canon_std = 1e-2
 
     @property
     def uses_prime_space_action(self):
@@ -292,8 +303,14 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         """Apply the conjugated action to prime points.
 
         Returns ``(mapped_prime [N, d], conj_logdet [N])`` where
-        ``conj_logdet = L(z_in) - L(z_out)`` is the log-determinant of the
-        prime-space map (zero on the affine path).
+        ``conj_logdet`` is the log-determinant of the prime-space map. On the
+        affine path with a measure-preserving physical action it is zero.
+
+        The physical action is assumed measure preserving by default. An action
+        that is *not* (e.g. one written in the raw angles ``dec`` / ``theta_jn``
+        rather than ``sin_dec`` / ``cos_theta_jn``) may instead return
+        ``(point_dict, log_det)``, where ``log_det [N]`` is the log-determinant
+        of the physical map it applied; it is threaded into ``conj_logdet``.
         """
         if self.uses_prime_space_action:
             point_dict = {
@@ -316,14 +333,21 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         point_dict = {
             name: phys[:, i] for i, name in enumerate(self.physical_names)
         }
-        mapped_dict = self.group_action_fn(
-            point_dict, modes_flat, inverse=inverse
-        )
+        out = self.group_action_fn(point_dict, modes_flat, inverse=inverse)
+        if isinstance(out, tuple):
+            mapped_dict, phys_logdet = out
+        else:
+            mapped_dict, phys_logdet = out, None
         phys_out = torch.stack(
             [mapped_dict[name] for name in self.physical_names], dim=-1
         )
         z_out, L_out = self._bridge.to_prime(phys_out, aux=aux)
-        return z_out, L_in - L_out
+        conj_logdet = L_in - L_out
+        if phys_logdet is not None:
+            conj_logdet = conj_logdet + torch.as_tensor(
+                phys_logdet, dtype=conj_logdet.dtype, device=conj_logdet.device
+            )
+        return z_out, conj_logdet
 
     @property
     def physical_names(self):
@@ -389,14 +413,14 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         assigned, pre, claimed = self._assign_branch(x)
         canon = pre[assigned, torch.arange(b, device=x.device)]
         gmean = canon.mean(dim=0)
-        gstd = canon.std(dim=0).clamp_min(1e-6)
+        gstd = canon.std(dim=0).clamp_min(self._min_canon_std)
         beta = self._canon_ema
         for k in range(self.group_size):
             sel = claimed & (assigned == k)
             if int(sel.sum()) >= self._min_std_count:
                 c = canon[sel]
                 mk = c.mean(dim=0)
-                sk = c.std(dim=0).clamp_min(1e-6)
+                sk = c.std(dim=0).clamp_min(self._min_canon_std)
                 if self._canon_seen[k]:
                     self._canon_mean[k].mul_(1 - beta).add_(beta * mk)
                     self._canon_std[k].mul_(1 - beta).add_(beta * sk)
@@ -687,7 +711,9 @@ def make_group_mixture_flow(
     ----------
     group_action_fn : callable
         ``(point_dict, modes, inverse=False) -> point_dict`` applying the
-        group action, in the *physical* parameter space.
+        group action, in the *physical* parameter space. A non-measure-
+        preserving action may instead return ``(point_dict, log_det)`` with
+        ``log_det`` the log-determinant of the physical map it applied.
     group_size : int
         Number of discrete group elements.
     param_names : list of str

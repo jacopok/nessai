@@ -408,6 +408,43 @@ def test_conj_logdet_matches_numeric_jacobian(base_flow):
     assert torch.allclose(delta.double(), logdet_numeric, atol=2e-2)
 
 
+def test_physical_action_returning_log_det(base_flow):
+    """A non-measure-preserving physical action supplies its own log-det.
+
+    Mode 1 is the involution ``x -> 1 / x`` (log-det ``-2 log|x|``, so *not*
+    measure preserving). The action returns the log-determinant of the map it
+    applied; both ``_apply_group_action`` and the
+    ``sample_and_log_prob`` / ``log_prob`` round trip must account for it.
+    """
+
+    def invert_action(d, m, inverse=False):
+        flip = (m == 1).to(d["x"].dtype)
+        x_out = torch.where(m == 1, 1.0 / d["x"], d["x"])
+        log_det = flip * (-2.0 * torch.log(d["x"].abs()))
+        return {"x": x_out, "y": d["y"]}, log_det
+
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=invert_action,
+        group_size=2,
+        param_names=["x", "y"],
+        # |x| < 1 is the representative; its orbit partner 1/x has |1/x| > 1.
+        in_fundamental_domain=lambda d: d["x"].abs() < 1.0,
+    )
+    w.eval()
+
+    z = torch.randn(32, 2)
+    modes = torch.ones(32, dtype=torch.long)
+    _, delta = w._apply_group_action(z, modes, inverse=True)
+    assert torch.allclose(delta, -2.0 * z[:, 0].abs().log(), atol=1e-5)
+
+    x, log_q = w.sample_and_log_prob(256)
+    finite = torch.isfinite(log_q)
+    assert finite.sum() > 128
+    assert torch.allclose(log_q[finite], w.log_prob(x)[finite], atol=1e-4)
+
+
 def test_prime_space_action_escape_hatch(base_flow):
     """Dimension-agnostic path: action + domain given directly in prime coords."""
 
