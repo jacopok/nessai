@@ -23,6 +23,7 @@ For questions or other support, please either use our `gitter room <https://app.
    parallelisation
    gravitational-wave-inference
    discrete-parameters
+   group-mixture-proposal
    plugins
    further-details
    faqs
