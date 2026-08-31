@@ -68,22 +68,41 @@ flow's internal ``prime`` coordinates.
 Requirements and assumptions
 ----------------------------
 
-* **The group action is measure-preserving.** The action is assumed to have
-  unit Jacobian (permutations, translations, reflections, rotations). Scaling
-  actions are not supported.
+* **The group action is measure-preserving in physical space.** The action is
+  assumed to have unit Jacobian in the physical parameters (permutations,
+  translations, reflections, rotations). Scaling actions are not supported.
+  The prime-space conjugate carries the reparameterisation's Jacobian, which
+  the proposal accounts for exactly.
 
 * **The symmetry must be exact in the prior.** The prior density must be
   constant over each orbit (e.g. a uniform prior whose bounds respect the
   symmetry). If the prior is not symmetric the mixture weights will absorb
   the prior asymmetry as well as the likelihood's.
 
-* **An affine reparameterisation.** Because the user callables are in
-  physical coordinates, the proposal must reconcile them with the flow's
-  ``prime`` coordinates. :class:`~nessai.flowmodel.group_mixture.GroupFlowProposalMixin`
-  does this automatically, but only for an affine reparameterisation
-  (``null``, ``scale``, ``zscore``/z-score, shift). A non-affine
-  reparameterisation raises ``RuntimeError``. If your flow coordinates
-  already equal the physical ones you can skip the mixin.
+* **The reparameterisation.** Because the user callables are in physical
+  coordinates, the proposal reconciles them with the flow's ``prime``
+  coordinates via
+  :class:`~nessai.flowmodel.group_mixture.GroupFlowProposalMixin`:
+
+  * *Affine* reparameterisations (``null``, ``scale``, ``zscore``/z-score,
+    shift) get an :class:`~nessai.flowmodel.group_mixture.AffineBridge` -
+    exact and free; the conjugation Jacobian is identically zero.
+  * *Non-affine* same-dimension reparameterisations (``logit``, ``log``,
+    ``probit``, ``z-score-logit``, ...) get a
+    :class:`~nessai.flowmodel.group_mixture.ReparamBridge`, which round-trips
+    each batch through ``rescale`` / ``inverse_rescale`` in NumPy and carries
+    the exact per-sample Jacobian. This adds a small host-side cost per
+    training step.
+  * *Dimension-changing / augmented* reparameterisations (``Angle``,
+    ``AnglePair``, rotations) cannot be round-tripped automatically. Pass
+    ``prime_space_action`` (and ``prime_space_in_domain``) to
+    :func:`~nessai.flowmodel.group_mixture.make_group_mixture_flow` to define
+    the action directly in prime coordinates instead; the bridge is then
+    bypassed. ``prime_space_action`` may return ``(point_dict, log_det)`` if
+    the prime-space map is not measure-preserving.
+
+  If your flow coordinates already equal the physical ones you can skip the
+  mixin.
 
 * **The fundamental domain should tile the space.** Overlap double-counts
   points; gaps leave points unclaimed (they fall back to the full,

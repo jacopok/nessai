@@ -17,6 +17,135 @@ from .base import FlowModel
 logger = logging.getLogger(__name__)
 
 
+class CoordinateBridge:
+    """Map between the flow's ``prime`` coords and the user's ``physical`` coords.
+
+    The group-mixture flow applies the *conjugated* action ``g_hat = T^-1 . g
+    . T`` in prime space, where ``T`` is the prime->physical map
+    (``physical = T(prime)``). ``L(prime) = log|det dphysical/dprime|`` at a
+    prime point; the log-determinant of the conjugated map ``prime_in ->
+    prime_out`` is then ``L(prime_in) - L(prime_out)`` (the physical action
+    ``g`` is assumed measure preserving).
+
+    Subclasses implement :meth:`to_physical` / :meth:`to_prime`. For an affine
+    ``T`` (:class:`AffineBridge`) ``L`` is constant and every conjugation
+    log-determinant vanishes; the general :class:`ReparamBridge` round-trips
+    through a nessai reparameterisation in numpy and carries the exact ``L``.
+    """
+
+    is_affine = False
+    #: prime-space dimension differs from physical (augmented reparams)
+    dimension_changing = False
+
+    def to_physical(self, prime):
+        """``prime [N, d_prime] -> (physical [N, d_phys], L [N], aux)``."""
+        raise NotImplementedError
+
+    def to_prime(self, physical, aux=None):
+        """``physical [N, d_phys] -> (prime [N, d_prime], L [N])``."""
+        raise NotImplementedError
+
+
+class AffineBridge(CoordinateBridge):
+    """Diagonal affine map ``physical = prime * scale + shift``."""
+
+    is_affine = True
+
+    def __init__(self, scale, shift):
+        self.scale = scale
+        self.shift = shift
+        self._logdet = torch.log(scale.abs()).sum()
+
+    def to_physical(self, prime):
+        phys = prime * self.scale + self.shift
+        L = self._logdet.expand(prime.shape[0])
+        return phys, L, None
+
+    def to_prime(self, physical, aux=None):
+        prime = (physical - self.shift) / self.scale
+        L = self._logdet.expand(physical.shape[0])
+        return prime, L
+
+
+class ReparamBridge(CoordinateBridge):
+    """General bridge round-tripping through a nessai reparameterisation.
+
+    ``forward_fn`` / ``inverse_fn`` are numpy callables taking a structured
+    livepoint array and returning ``(structured_array, log_J)`` where ``log_J``
+    is the reparameterisation's exact per-sample log-Jacobian for that
+    direction. ``rescale`` maps physical->prime, ``inverse_rescale`` maps
+    prime->physical. The reparameterisation ``log_J`` for prime->physical is
+    exactly ``L``; the physical->prime pass returns ``-L`` (up to numerical
+    error), so both directions are reconciled here.
+    """
+
+    def __init__(
+        self,
+        prime_names,
+        physical_names,
+        rescale_fn,
+        inverse_rescale_fn,
+        dtype,
+        device,
+    ):
+        self.prime_names = list(prime_names)
+        self.physical_names = list(physical_names)
+        self.rescale_fn = rescale_fn
+        self.inverse_rescale_fn = inverse_rescale_fn
+        self.dtype = dtype
+        self.device = device
+        self.dimension_changing = len(self.prime_names) != len(
+            self.physical_names
+        )
+
+    def _structured(self, array, names):
+        out = empty_structured_array(len(array), names=list(names))
+        for i, name in enumerate(names):
+            out[name] = array[:, i]
+        return out
+
+    def _to_tensor(self, array):
+        return torch.as_tensor(
+            array, dtype=self.dtype, device=self.device
+        )
+
+    def to_physical(self, prime):
+        prime_np = prime.detach().cpu().numpy().astype(float)
+        struct = self._structured(prime_np, self.prime_names)
+        phys_struct, log_j = self.inverse_rescale_fn(struct)
+        phys = live_points_to_array(
+            phys_struct, self.physical_names, copy=True
+        )
+        L = self._to_tensor(np.asarray(log_j, dtype=float))
+        aux = None
+        if self.dimension_changing:
+            aux_names = [
+                n for n in self.prime_names if n not in self.physical_names
+            ]
+            aux = self._to_tensor(
+                live_points_to_array(phys_struct, aux_names, copy=True)
+            )
+        return self._to_tensor(phys), L, aux
+
+    def to_prime(self, physical, aux=None):
+        phys_np = physical.detach().cpu().numpy().astype(float)
+        struct = self._structured(phys_np, self.physical_names)
+        prime_struct, log_j = self.rescale_fn(struct)
+        prime = live_points_to_array(
+            prime_struct, self.prime_names, copy=True
+        )
+        # rescale returns log|det dprime/dphysical| = -L.
+        L = -self._to_tensor(np.asarray(log_j, dtype=float))
+        prime_t = self._to_tensor(prime)
+        if self.dimension_changing and aux is not None:
+            aux_names = [
+                n for n in self.prime_names if n not in self.physical_names
+            ]
+            idx = [self.prime_names.index(n) for n in aux_names]
+            prime_t[:, idx] = aux.to(prime_t)
+        return prime_t, L
+
+
 class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     """Wrap a base flow with a discrete group-mixture transformation.
 
@@ -25,6 +154,14 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     fundamental-domain mask assigns each point to exactly one group element,
     so the maximum-likelihood weights are the assigned-point fractions, set
     in closed form by :meth:`update_mixture_weights`.
+
+    The group action and fundamental-domain predicate are written by the user
+    in *physical* coordinates. A :class:`CoordinateBridge` (installed by the
+    proposal via :meth:`set_coordinate_bridge`) maps between physical and the
+    flow's *prime* coordinates and supplies the conjugation log-Jacobian, so
+    non-affine reparameterisations are handled exactly. Alternatively the user
+    can pass ``prime_space_action`` / ``prime_space_in_domain`` to work
+    directly in prime coordinates and bypass the bridge entirely.
     """
 
     def __init__(
@@ -35,6 +172,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         group_size,
         param_names=None,
         in_fundamental_domain=None,
+        prime_space_action=None,
+        prime_space_in_domain=None,
     ):
         super().__init__()
         self.base_flow = base_flow
@@ -42,14 +181,19 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         self.group_size = group_size
         self.group_action_fn = group_action_fn
         self.in_fundamental_domain = in_fundamental_domain
+        self.prime_space_action = prime_space_action
+        self.prime_space_in_domain = prime_space_in_domain
         self.param_names = param_names or [
             f"p_{i}" for i in range(num_features)
         ]
 
-        # Affine prime->physical map ``physical = prime * scale + shift``,
-        # filled each round by ``GroupFlowProposalMixin`` from the proposal's
-        # reparameterisation. The user's ``group_action_fn`` /
-        # ``in_fundamental_domain`` are written in physical coordinates.
+        # Coordinate bridge; defaults to the identity affine map so the
+        # wrapper is usable without a proposal (e.g. in unit tests).
+        self._bridge = AffineBridge(
+            torch.ones(num_features), torch.zeros(num_features)
+        )
+        # Affine scale/shift kept as buffers for backward compatibility and
+        # for the analytic canonical-buffer re-expression on the affine path.
         self.register_buffer("_prime_scale", torch.ones(num_features))
         self.register_buffer("_prime_shift", torch.zeros(num_features))
 
@@ -81,6 +225,34 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         self._canon_ema = 0.3
         self._weight_empty_patience = 3
 
+    @property
+    def uses_prime_space_action(self):
+        return self.prime_space_action is not None
+
+    def set_coordinate_bridge(self, bridge):
+        """Install a :class:`CoordinateBridge`.
+
+        The canonical standardisation buffers live in prime coordinates. An
+        affine frame change re-expresses them analytically; a non-affine
+        change cannot, so the buffers are kept and left for
+        :meth:`update_base_standardisation` to re-adapt (a large shift resets
+        ``_canon_seen`` so modes re-bootstrap).
+        """
+        old = self._bridge
+        if isinstance(bridge, AffineBridge):
+            self.set_affine_maps(bridge.scale, bridge.shift)
+            return
+        if isinstance(old, AffineBridge) and bool(self._canon_seen.any()):
+            # Leaving the affine fast path: probe the frame shift on the
+            # stored canonical means and reset modes that moved a lot.
+            with torch.no_grad():
+                phys_old, _, _ = old.to_physical(self._canon_mean)
+                prime_new, _ = bridge.to_prime(phys_old)
+                shift = (prime_new - self._canon_mean).abs()
+                moved = (shift > 2.0 * self._canon_std).any(dim=-1)
+                self._canon_seen[moved] = False
+        self._bridge = bridge
+
     def set_affine_maps(self, scale, shift):
         """Set the prime->physical affine map.
 
@@ -97,12 +269,15 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             self._canon_std.mul_(ratio.abs())
         self._prime_scale.copy_(scale)
         self._prime_shift.copy_(shift)
+        self._bridge = AffineBridge(scale.clone(), shift.clone())
 
     def _to_physical(self, z):
-        return z * self._prime_scale + self._prime_shift
+        phys, _, _ = self._bridge.to_physical(z)
+        return phys
 
     def _to_prime(self, x):
-        return (x - self._prime_shift) / self._prime_scale
+        prime, _ = self._bridge.to_prime(x)
+        return prime
 
     def _standardise(self, canon, modes):
         return (canon - self._canon_mean[modes]) / self._canon_std[modes]
@@ -113,14 +288,73 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     def _canon_log_det(self, modes):
         return -torch.log(self._canon_std[modes]).sum(-1)
 
+    def _apply_group_action(self, z_flat, modes_flat, inverse):
+        """Apply the conjugated action to prime points.
+
+        Returns ``(mapped_prime [N, d], conj_logdet [N])`` where
+        ``conj_logdet = L(z_in) - L(z_out)`` is the log-determinant of the
+        prime-space map (zero on the affine path).
+        """
+        if self.uses_prime_space_action:
+            point_dict = {
+                name: z_flat[:, i]
+                for i, name in enumerate(self.param_names)
+            }
+            out = self.prime_space_action(
+                point_dict, modes_flat, inverse=inverse
+            )
+            if isinstance(out, tuple):
+                mapped_dict, logdet = out
+            else:
+                mapped_dict, logdet = out, z_flat.new_zeros(z_flat.shape[0])
+            mapped = torch.stack(
+                [mapped_dict[name] for name in self.param_names], dim=-1
+            )
+            return mapped, logdet
+
+        phys, L_in, aux = self._bridge.to_physical(z_flat)
+        point_dict = {
+            name: phys[:, i] for i, name in enumerate(self.physical_names)
+        }
+        mapped_dict = self.group_action_fn(
+            point_dict, modes_flat, inverse=inverse
+        )
+        phys_out = torch.stack(
+            [mapped_dict[name] for name in self.physical_names], dim=-1
+        )
+        z_out, L_out = self._bridge.to_prime(phys_out, aux=aux)
+        return z_out, L_in - L_out
+
+    @property
+    def physical_names(self):
+        # For a dimension-changing bridge the physical names are the user's
+        # ``param_names``; prime names carry extra auxiliaries.
+        return self.param_names
+
+    def _in_domain(self, z_flat):
+        """Boolean mask: which rows of ``z_flat`` lie in the fundamental domain."""
+        if self.uses_prime_space_action:
+            point_dict = {
+                name: z_flat[:, i]
+                for i, name in enumerate(self.param_names)
+            }
+            return self.prime_space_in_domain(point_dict).to(torch.bool)
+        phys, _, _ = self._bridge.to_physical(z_flat)
+        point_dict = {
+            name: phys[:, i] for i, name in enumerate(self.physical_names)
+        }
+        return self.in_fundamental_domain(point_dict).to(torch.bool)
+
     def _preimages(self, x):
-        """All group pre-images ``g_k^-1 . x`` in prime coords: ``[K, B, d]``."""
+        """All group pre-images ``g_k^-1 . x`` in prime coords.
+
+        Returns ``(pre [K, B, d], conj_logdet [K, B])``.
+        """
         k, b = self.group_size, x.shape[0]
         x_rep = x.unsqueeze(0).expand(k, b, -1).reshape(k * b, -1)
         modes = torch.arange(k, device=x.device).repeat_interleave(b)
-        return self._apply_group_action(x_rep, modes, inverse=True).view(
-            k, b, -1
-        )
+        pre, logdet = self._apply_group_action(x_rep, modes, inverse=True)
+        return pre.view(k, b, -1), logdet.view(k, b)
 
     def _assign_branch(self, x):
         """Geometric branch assignment (no base-flow evaluation).
@@ -129,8 +363,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         ``assigned`` is the group element whose inverse maps ``x`` into the
         fundamental domain (0 for points no element claims).
         """
-        pre = self._preimages(x)
-        if self.in_fundamental_domain is None:
+        pre, _ = self._preimages(x)
+        if self.in_fundamental_domain is None and not self.uses_prime_space_action:
             return (
                 torch.zeros(x.shape[0], dtype=torch.long, device=x.device),
                 pre,
@@ -200,49 +434,29 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         )
         self.weights.copy_(smoothed / smoothed.sum())
 
-    def _apply_group_action(
-        self, z_flat: torch.Tensor, modes_flat: torch.Tensor, inverse: bool
-    ) -> torch.Tensor:
-        phys = self._to_physical(z_flat)
-        point_dict = {
-            name: phys[:, i] for i, name in enumerate(self.param_names)
-        }
-        mapped_dict = self.group_action_fn(
-            point_dict, modes_flat, inverse=inverse
-        )
-        out = torch.stack(
-            [mapped_dict[name] for name in self.param_names], dim=-1
-        )
-        return self._to_prime(out)
-
-    def _in_domain(self, z_flat: torch.Tensor) -> torch.Tensor:
-        """Boolean mask: which rows of ``z_flat`` lie in the fundamental domain."""
-        phys = self._to_physical(z_flat)
-        point_dict = {
-            name: phys[:, i] for i, name in enumerate(self.param_names)
-        }
-        return self.in_fundamental_domain(point_dict).to(torch.bool)
-
     def _branch_log_probs(self, x, context=None):
         """Return ``base_lp(g_k^-1 x) + log pi_k`` for every group element: ``[K, B]``.
 
         Branches whose pre-image is outside the fundamental domain are
         ``-inf`` and the base flow is not evaluated for them, so for a group
         that tiles the space this costs a single base-flow call on ``B``
-        canonical points rather than ``K * B``.
+        canonical points rather than ``K * B``. Each branch carries the
+        conjugation log-Jacobian ``conj_logdet`` (zero on the affine path).
         """
         k, b = self.group_size, x.shape[0]
-        pre = self._preimages(x)
+        pre, conj_logdet = self._preimages(x)
         log_pi = torch.log(self.weights).unsqueeze(1).expand(k, b)
         flat_pre = pre.reshape(k * b, -1)
         flat_modes = torch.arange(k, device=x.device).repeat_interleave(b)
+        flat_conj = conj_logdet.reshape(k * b)
 
-        if self.in_fundamental_domain is None:
+        if self.in_fundamental_domain is None and not self.uses_prime_space_action:
             base_lp = (
                 self.base_flow.log_prob(
                     self._standardise(flat_pre, flat_modes), context=context
                 )
                 + self._canon_log_det(flat_modes)
+                + flat_conj
             ).view(k, b)
             return base_lp + log_pi
 
@@ -252,10 +466,17 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         idx = eval_mask.reshape(-1).nonzero(as_tuple=True)[0]
         base_lp = flat_pre.new_full((k * b,), -float("inf"))
         if idx.numel():
-            base_lp[idx] = self.base_flow.log_prob(
-                self._standardise(flat_pre[idx], flat_modes[idx]),
-                context=context,
-            ) + self._canon_log_det(flat_modes[idx])
+            good = torch.isfinite(flat_pre[idx]).all(dim=-1)
+            gi = idx[good]
+            if gi.numel():
+                base_lp[gi] = (
+                    self.base_flow.log_prob(
+                        self._standardise(flat_pre[gi], flat_modes[gi]),
+                        context=context,
+                    )
+                    + self._canon_log_det(flat_modes[gi])
+                    + flat_conj[gi]
+                )
         return base_lp.view(k, b) + log_pi
 
     def log_prob(self, x, context=None):
@@ -264,17 +485,20 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         )
 
     def _mixture_log_prob_from_canonical(
-        self, canon, modes, x, log_q0_canon, context=None
+        self, canon, modes, x, log_q0_canon, conj_logdet, context=None
     ):
         """log q(x) for x generated as ``g_modes . canon``.
 
         For a group that tiles the space and ``canon`` inside the fundamental
         domain only branch ``modes`` contributes, so ``log q(x) = log pi_modes
-        + log q0(canon)`` with no extra base-flow evaluation. Points whose
-        ``canon`` leaked out of the domain fall back to the full mixture.
+        + log q0(canon) + conj_logdet`` with no extra base-flow evaluation.
+        ``conj_logdet`` here is ``L(x) - L(canon)``. Points whose ``canon``
+        leaked out of the domain fall back to the full mixture.
         """
-        log_q = torch.log(self.weights[modes]) + log_q0_canon
-        if self.in_fundamental_domain is not None:
+        log_q = (
+            torch.log(self.weights[modes]) + log_q0_canon + conj_logdet
+        )
+        if self.in_fundamental_domain is not None or self.uses_prime_space_action:
             bad = ~self._in_domain(canon)
             if bool(bad.any()):
                 log_q = log_q.clone()
@@ -287,9 +511,16 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         )
         modes = Categorical(probs=self.weights).sample((num_samples,))
         canon = self._destandardise(u, modes)
-        x = self._apply_group_action(canon, modes, inverse=False)
+        x, fwd_logdet = self._apply_group_action(
+            canon, modes, inverse=False
+        )
         log_q = self._mixture_log_prob_from_canonical(
-            canon, modes, x, log_q0_u + self._canon_log_det(modes), context
+            canon,
+            modes,
+            x,
+            log_q0_u + self._canon_log_det(modes),
+            -fwd_logdet,
+            context,
         )
         return x, log_q
 
@@ -311,19 +542,23 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         # ``log_j`` is set so that
         # ``latent_log_prob(z) - log_j == self.log_prob(x)``, the quantity
         # ``FlowProposal.backward_pass`` relies on. It is not a literal
-        # Jacobian: the group action is assumed measure-preserving.
+        # Jacobian: the *physical* group action is assumed measure
+        # preserving, and the prime-space conjugation Jacobian is carried in
+        # ``fwd_logdet``.
         modes = Categorical(probs=self.weights).sample((z.shape[0],))
 
         u, inv_log_j = self.base_flow.inverse(z, context=context)
         canon = self._destandardise(u, modes)
-        x = self._apply_group_action(canon, modes, inverse=False)
+        x, fwd_logdet = self._apply_group_action(
+            canon, modes, inverse=False
+        )
 
         latent_log_prob = self.base_flow.base_distribution_log_prob(
             z, context=context
         )
         log_q0_canon = latent_log_prob - inv_log_j + self._canon_log_det(modes)
         log_q = self._mixture_log_prob_from_canonical(
-            canon, modes, x, log_q0_canon, context
+            canon, modes, x, log_q0_canon, -fwd_logdet, context
         )
         log_j = latent_log_prob - log_q
         return x, log_j
@@ -366,6 +601,8 @@ class GroupMixtureFlowModel(FlowModel):
     group_size = None
     param_names = None
     in_fundamental_domain = None
+    prime_space_action = None
+    prime_space_in_domain = None
 
     def initialise(self):
         """Initialise the model and optimiser via :meth:`get_model`."""
@@ -406,6 +643,14 @@ class GroupMixtureFlowModel(FlowModel):
             "in_fundamental_domain",
             getattr(self, "in_fundamental_domain", None),
         )
+        prime_space_action = config_clean.pop(
+            "prime_space_action",
+            getattr(self, "prime_space_action", None),
+        )
+        prime_space_in_domain = config_clean.pop(
+            "prime_space_in_domain",
+            getattr(self, "prime_space_in_domain", None),
+        )
 
         if group_action_fn is None or group_size is None:
             raise ValueError(
@@ -423,11 +668,18 @@ class GroupMixtureFlowModel(FlowModel):
             group_size=group_size,
             param_names=param_names,
             in_fundamental_domain=in_fundamental_domain,
+            prime_space_action=prime_space_action,
+            prime_space_in_domain=prime_space_in_domain,
         )
 
 
 def make_group_mixture_flow(
-    group_action_fn, group_size, param_names, in_fundamental_domain=None
+    group_action_fn,
+    group_size,
+    param_names,
+    in_fundamental_domain=None,
+    prime_space_action=None,
+    prime_space_in_domain=None,
 ):
     """Factory constructing a ``GroupMixtureFlowModel`` bound to a specific group.
 
@@ -435,23 +687,38 @@ def make_group_mixture_flow(
     ----------
     group_action_fn : callable
         ``(point_dict, modes, inverse=False) -> point_dict`` applying the
-        group action, in the flow's input coordinates.
+        group action, in the *physical* parameter space.
     group_size : int
         Number of discrete group elements.
     param_names : list of str
-        Ordered parameter names.
+        Ordered physical parameter names.
     in_fundamental_domain : callable, optional
         ``(point_dict) -> bool tensor`` marking whether each point is the
         canonical orbit representative, defined in the physical parameter
         space. If omitted the mixture weights are not identifiable (the
         base flow can absorb the whole distribution).
+    prime_space_action : callable, optional
+        ``(point_dict, modes, inverse=False) -> point_dict`` or
+        ``-> (point_dict, log_det)`` applying the action directly in the
+        flow's *prime* coordinates. When given, the coordinate bridge is
+        bypassed and ``group_action_fn`` / ``in_fundamental_domain`` are
+        ignored. ``log_det`` is the log-Jacobian of the prime-space map
+        (default 0 for a measure-preserving action such as a rotation);
+        use this for augmented / dimension-changing reparameterisations
+        (``Angle``, ``AnglePair``) where the automatic bridge cannot round
+        trip.
+    prime_space_in_domain : callable, optional
+        Fundamental-domain predicate in prime coordinates; required with
+        ``prime_space_action``.
 
     Notes
     -----
     ``group_action_fn`` and ``in_fundamental_domain`` are defined in the
     physical parameter space, so the proposal class must use
-    :class:`GroupFlowProposalMixin` unless the flow coordinates already
-    equal the physical ones.
+    :class:`GroupFlowProposalMixin`. For an affine reparameterisation this
+    is exact and free; for a non-affine one the mixin installs a
+    :class:`ReparamBridge` that round-trips through the reparameterisation
+    in numpy each batch and carries the exact conjugation Jacobian.
     """
 
     class CustomGroupMixtureFlowModel(GroupMixtureFlowModel):
@@ -464,6 +731,14 @@ def make_group_mixture_flow(
         CustomGroupMixtureFlowModel.in_fundamental_domain = staticmethod(
             in_fundamental_domain
         )
+    if prime_space_action is not None:
+        CustomGroupMixtureFlowModel.prime_space_action = staticmethod(
+            prime_space_action
+        )
+    if prime_space_in_domain is not None:
+        CustomGroupMixtureFlowModel.prime_space_in_domain = staticmethod(
+            prime_space_in_domain
+        )
     return CustomGroupMixtureFlowModel
 
 
@@ -472,9 +747,11 @@ class GroupFlowProposalMixin:
 
     Keeps the group-mixture flow's ``group_action_fn`` /
     ``in_fundamental_domain`` in the physical parameter space by wiring the
-    proposal's reparameterisation into the flow as prime<->physical
-    coordinate maps. The maps are refreshed whenever the reparameterisation
-    updates (e.g. data-driven z-score bounds).
+    proposal's reparameterisation into the flow as a
+    :class:`CoordinateBridge`. The bridge is refreshed whenever the
+    reparameterisation updates (e.g. data-driven z-score bounds). An affine
+    reparameterisation gets a free :class:`AffineBridge`; anything else gets
+    a :class:`ReparamBridge`.
     """
 
     def _structured(self, array, names):
@@ -484,36 +761,61 @@ class GroupFlowProposalMixin:
         return out
 
     def _refresh_group_affine_map(self):
-        """Recover the affine prime->physical map and hand it to the flow.
+        """Backwards-compatible alias for :meth:`_refresh_group_coordinate_bridge`."""
+        self._refresh_group_coordinate_bridge()
 
-        For an affine reparameterisation ``physical = prime * scale +
-        shift``; ``scale`` and ``shift`` are recovered by probing
-        ``inverse_rescale``. A non-affine reparameterisation raises.
+    def _refresh_group_coordinate_bridge(self):
+        """Recover the prime<->physical map and hand it to the flow.
+
+        For an affine reparameterisation ``physical = prime * scale + shift``;
+        ``scale`` and ``shift`` are recovered by probing ``inverse_rescale``
+        and an :class:`AffineBridge` installed. A non-affine (or
+        dimension-changing) reparameterisation gets a :class:`ReparamBridge`
+        that round-trips through ``rescale`` / ``inverse_rescale``.
         """
         flow_model = getattr(self.flow, "model", None)
-        if flow_model is None or not hasattr(flow_model, "set_affine_maps"):
+        if flow_model is None or not hasattr(
+            flow_model, "set_coordinate_bridge"
+        ):
+            return
+        if getattr(flow_model, "uses_prime_space_action", False):
             return
         prime = list(self.prime_parameters)
         physical = list(self.parameters)
-        d = len(prime)
-
-        def probe(value):
-            arr = np.full((1, d), value, dtype=float)
-            x, _ = self.inverse_rescale(self._structured(arr, prime))
-            return np.array([x[name][0] for name in physical])
-
-        p0, p1, phalf = probe(0.0), probe(1.0), probe(0.5)
-        scale = p1 - p0
-        shift = p0
-        if not np.allclose(phalf, shift + 0.5 * scale, rtol=1e-4, atol=1e-6):
-            raise RuntimeError(
-                "GroupFlowProposalMixin requires an affine reparameterisation "
-                "(null, scale-and-shift or z-score); got a non-affine one."
-            )
         dtype = flow_model.weights.dtype
-        flow_model.set_affine_maps(
-            torch.as_tensor(scale, dtype=dtype),
-            torch.as_tensor(shift, dtype=dtype),
+        device = flow_model.weights.device
+
+        if len(prime) == len(physical):
+            d = len(prime)
+
+            def probe(value):
+                arr = np.full((1, d), value, dtype=float)
+                x, _ = self.inverse_rescale(self._structured(arr, prime))
+                return np.array([x[name][0] for name in physical])
+
+            p0, p1, phalf = probe(0.0), probe(1.0), probe(0.5)
+            scale = p1 - p0
+            shift = p0
+            if np.allclose(
+                phalf, shift + 0.5 * scale, rtol=1e-4, atol=1e-6
+            ):
+                flow_model.set_coordinate_bridge(
+                    AffineBridge(
+                        torch.as_tensor(scale, dtype=dtype),
+                        torch.as_tensor(shift, dtype=dtype),
+                    )
+                )
+                return
+
+        flow_model.set_coordinate_bridge(
+            ReparamBridge(
+                prime_names=prime,
+                physical_names=physical,
+                rescale_fn=lambda s: self.rescale(s),
+                inverse_rescale_fn=lambda s: self.inverse_rescale(s),
+                dtype=dtype,
+                device=device,
+            )
         )
 
     def _training_data_as_prime_tensor(self, x):
@@ -526,7 +828,7 @@ class GroupFlowProposalMixin:
 
     def check_state(self, x):
         super().check_state(x)
-        self._refresh_group_affine_map()
+        self._refresh_group_coordinate_bridge()
         model = getattr(self.flow, "model", None)
         if model is None or not hasattr(model, "update_mixture_weights"):
             return

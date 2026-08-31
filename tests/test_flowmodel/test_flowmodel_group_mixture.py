@@ -9,12 +9,15 @@ import pytest
 import torch
 
 from nessai.flowmodel.group_mixture import (
+    AffineBridge,
     DiscreteGroupMixtureFlowWrapper,
     GroupFlowProposalMixin,
     GroupMixtureFlowModel,
+    ReparamBridge,
     make_group_mixture_flow,
 )
 from nessai.flows.utils import configure_model
+from nessai.livepoint import empty_structured_array
 from nessai.flowsampler import FlowSampler
 from nessai.model import Model
 from nessai.proposal import FlowProposal
@@ -248,6 +251,193 @@ def test_inverse_log_j_matches_log_prob(wrapper):
     )
 
 
+def _struct(array, names):
+    out = empty_structured_array(len(array), names=list(names))
+    for i, name in enumerate(names):
+        out[name] = array[:, i]
+    return out
+
+
+def _logit_reparam(prime_names, physical_names):
+    """A non-affine (logit) prime<->physical map on ``x``; ``y`` affine.
+
+    physical x in (0, 1), prime x = logit(physical x). ``y`` unchanged.
+    """
+
+    def _sig(v):
+        return 1.0 / (1.0 + np.exp(-v))
+
+    def inverse_rescale(struct):  # prime -> physical
+        px, py = struct[prime_names[0]], struct[prime_names[1]]
+        sx = _sig(px)
+        out = _struct(np.stack([sx, py], axis=1), physical_names)
+        log_j = np.log(sx) + np.log1p(-sx)  # log|dphys/dprime|
+        return out, log_j
+
+    def rescale(struct):  # physical -> prime
+        x, y = struct[physical_names[0]], struct[physical_names[1]]
+        x = np.clip(x, 1e-9, 1 - 1e-9)
+        px = np.log(x) - np.log1p(-x)
+        out = _struct(np.stack([px, y], axis=1), prime_names)
+        log_j = -(np.log(x) + np.log1p(-x))  # log|dprime/dphys|
+        return out, log_j
+
+    return rescale, inverse_rescale
+
+
+def _logit_bridge():
+    rescale, inverse_rescale = _logit_reparam(["x", "y"], ["x", "y"])
+    return ReparamBridge(
+        prime_names=["x", "y"],
+        physical_names=["x", "y"],
+        rescale_fn=rescale,
+        inverse_rescale_fn=inverse_rescale,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+
+def test_reparam_bridge_matches_analytic_logdet():
+    bridge = _logit_bridge()
+    prime = torch.tensor([[0.3, 1.0], [-1.2, -0.4], [2.0, 0.1]])
+    phys, L, aux = bridge.to_physical(prime)
+    assert aux is None
+    sx = torch.sigmoid(prime[:, 0])
+    assert torch.allclose(phys[:, 0], sx, atol=1e-5)
+    assert torch.allclose(L, torch.log(sx) + torch.log1p(-sx), atol=1e-5)
+    # Round trip is the identity (deterministic part) and L is consistent.
+    prime2, L2 = bridge.to_prime(phys)
+    assert torch.allclose(prime2, prime, atol=1e-4)
+    assert torch.allclose(L2, L, atol=1e-4)
+
+
+def test_reparam_bridge_reproduces_affine():
+    affine = AffineBridge(torch.tensor([2.0, 3.0]), torch.tensor([1.0, -1.0]))
+
+    def rescale(struct):
+        arr = np.stack([struct["x"], struct["y"]], axis=1)
+        prime = (arr - np.array([1.0, -1.0])) / np.array([2.0, 3.0])
+        return _struct(prime, ["x", "y"]), np.full(len(arr), -np.log(6.0))
+
+    def inverse_rescale(struct):
+        arr = np.stack([struct["x"], struct["y"]], axis=1)
+        phys = arr * np.array([2.0, 3.0]) + np.array([1.0, -1.0])
+        return _struct(phys, ["x", "y"]), np.full(len(arr), np.log(6.0))
+
+    bridge = ReparamBridge(
+        ["x", "y"], ["x", "y"], rescale, inverse_rescale,
+        torch.float32, torch.device("cpu"),
+    )
+    prime = torch.randn(8, 2)
+    p_a, L_a, _ = affine.to_physical(prime)
+    p_r, L_r, _ = bridge.to_physical(prime)
+    assert torch.allclose(p_a, p_r, atol=1e-4)
+    assert torch.allclose(L_a, L_r, atol=1e-4)
+
+
+def _nonlinear_wrapper(base_flow, group_size=1, **kw):
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=lambda d, m, inverse=False: d,
+        group_size=group_size,
+        param_names=["x", "y"],
+        in_fundamental_domain=lambda d: torch.ones_like(
+            d["x"], dtype=torch.bool
+        ),
+        **kw,
+    )
+    w.set_coordinate_bridge(_logit_bridge())
+    w.eval()
+    return w
+
+
+def test_conj_logdet_zero_for_identity_action(base_flow):
+    w = _nonlinear_wrapper(base_flow)
+    z = torch.randn(16, 2)
+    _, delta = w._apply_group_action(
+        z, torch.zeros(16, dtype=torch.long), inverse=True
+    )
+    assert torch.allclose(delta, torch.zeros(16), atol=1e-4)
+
+
+def test_nonlinear_bridge_sample_and_log_prob_consistent(base_flow):
+    w = _nonlinear_wrapper(base_flow)
+    x, log_q = w.sample_and_log_prob(64)
+    assert torch.isfinite(log_q).all()
+    assert torch.allclose(log_q, w.log_prob(x), atol=1e-4)
+
+
+def test_conj_logdet_matches_numeric_jacobian(base_flow):
+    """conj log-det of ``T^-1 . g . T`` vs a finite-difference Jacobian."""
+
+    def prime_shift_action(d, m, inverse=False):
+        s = 0.1 * m.to(d["x"].dtype)
+        return {"x": d["x"] - s if inverse else d["x"] + s, "y": d["y"]}
+
+    # Physical-space shift on the logit axis, via the bridge.
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=prime_shift_action,
+        group_size=2,
+        param_names=["x", "y"],
+        in_fundamental_domain=lambda d: torch.ones_like(
+            d["x"], dtype=torch.bool
+        ),
+    )
+    w.set_coordinate_bridge(_logit_bridge())
+    w.eval()
+
+    z = torch.tensor([[0.2, 0.5], [-0.25, 1.1]], dtype=torch.float32)
+    modes = torch.ones(2, dtype=torch.long)
+
+    def mapped(zz):
+        out, _ = w._apply_group_action(zz, modes, inverse=True)
+        return out.double()
+
+    eps = 1e-3
+    base = mapped(z)
+    _, delta = w._apply_group_action(z, modes, inverse=True)
+    jac = torch.zeros(2, 2, 2, dtype=torch.float64)
+    for j in range(2):
+        dz = z.clone()
+        dz[:, j] += eps
+        jac[:, :, j] = (mapped(dz) - base) / eps
+    logdet_numeric = torch.logdet(jac)
+    assert torch.allclose(delta.double(), logdet_numeric, atol=2e-2)
+
+
+def test_prime_space_action_escape_hatch(base_flow):
+    """Dimension-agnostic path: action + domain given directly in prime coords."""
+
+    def reflect(d, m, inverse=False):
+        sign = torch.where(m == 1, -1.0, 1.0).to(d["x"].dtype)
+        return {"x": d["x"] * sign, "y": d["y"]}, torch.zeros_like(d["x"])
+
+    def prime_in_domain(d):
+        return d["x"] >= 0.0
+
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=None,
+        group_size=2,
+        param_names=["x", "y"],
+        prime_space_action=reflect,
+        prime_space_in_domain=prime_in_domain,
+    )
+    w.eval()
+    pos = torch.tensor([[0.3, 0.1], [1.2, -0.5]])
+    neg = torch.tensor([[-0.3, 0.1], [-1.2, -0.5]])
+    assigned, _, claimed = w._assign_branch(torch.cat([pos, neg]))
+    assert claimed.all()
+    assert torch.equal(assigned, torch.tensor([0, 0, 1, 1]))
+    x, log_q = w.sample_and_log_prob(48)
+    assert torch.isfinite(log_q).all()
+    assert torch.allclose(log_q, w.log_prob(x), atol=1e-4)
+
+
 @pytest.mark.slow_integration_test
 def test_sampling_with_group_mixture_flow(tmp_path):
     """Sample a periodic multimodal target with the group-mixture proposal."""
@@ -265,5 +455,36 @@ def test_sampling_with_group_mixture_flow(tmp_path):
     fs.run(plot=False)
 
     weights = fs.ns._flow_proposal.flow.model.weights.detach().cpu().numpy()
+    assert np.isclose(weights.sum(), 1.0)
+    assert np.isfinite(fs.log_evidence)
+
+
+@pytest.mark.slow_integration_test
+def test_sampling_with_nonaffine_reparameterisation(tmp_path):
+    """Same target through a non-affine (logit) reparameterisation.
+
+    Exercises the ``ReparamBridge`` path end to end: the group action /
+    fundamental domain stay in physical coords while the flow sees logit
+    coords, and the conjugation Jacobian is carried each batch.
+    """
+    fs = FlowSampler(
+        PeriodicModel(),
+        output=tmp_path / "group_mixture_logit",
+        flow_proposal_class=PeriodicGroupFlowProposal,
+        flow_config={"model": "realnvp", "n_blocks": 2, "n_neurons": 8},
+        reparameterisations={"x": "logit", "y": "zscore"},
+        nlive=500,
+        maximum_uninformed=500,
+        plot=False,
+        resume=False,
+        seed=1234,
+    )
+    fs.run(plot=False)
+
+    model = fs.ns._flow_proposal.flow.model
+    from nessai.flowmodel.group_mixture import ReparamBridge
+
+    assert isinstance(model._bridge, ReparamBridge)
+    weights = model.weights.detach().cpu().numpy()
     assert np.isclose(weights.sum(), 1.0)
     assert np.isfinite(fs.log_evidence)
