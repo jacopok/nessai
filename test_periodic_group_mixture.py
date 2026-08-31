@@ -8,11 +8,14 @@ from nessai.model import Model
 from nessai.flowsampler import FlowSampler
 from nessai.proposal import FlowProposal
 
-from nessai.flowmodel.group_mixture import make_group_mixture_flow
+from nessai.flowmodel.group_mixture import (
+    make_group_mixture_flow,
+    GroupFlowProposalMixin,
+)
 import logging
 logging.basicConfig(level=logging.INFO)
 
-N_PERIODS = 5
+N_PERIODS = 10
 
 # =====================================================================
 # 1. Group Action & Flow Definition
@@ -25,22 +28,26 @@ def shift_periodic_2d_group_action(point_dict: dict, modes_flat: torch.Tensor, i
     x_mapped = x - shift if inverse else x + shift
     return {'x': x_mapped, 'y': y}
 
-def fold_parameter_space(point_dict: dict) -> dict:
+def in_fundamental_domain(point_dict: dict) -> torch.Tensor:
+    """Canonical representative: x in the first period [0, 1). Physical coords."""
     x = point_dict['x']
-    y = point_dict['y']
-
-    return {'x': x % 1, 'y': y}
+    return (x >= 0.0) & (x < 1.0)
 
 RealNVPGroupFlow = make_group_mixture_flow(
     group_action_fn=shift_periodic_2d_group_action,
     group_size=N_PERIODS,
     param_names=['x', 'y'],
-    fold_fn=fold_parameter_space,
+    in_fundamental_domain=in_fundamental_domain,
 )
 
 
-class GroupFlowProposal(FlowProposal):
-    """FlowProposal that uses the custom group-mixture flow model."""
+class GroupFlowProposal(GroupFlowProposalMixin, FlowProposal):
+    """FlowProposal that uses the custom group-mixture flow model.
+
+    The mixin applies the reparameterisation between physical and flow
+    coordinates, so the group action / fundamental-domain constraint above
+    are written directly in physical (x, y) units.
+    """
     _FlowModelClass = RealNVPGroupFlow
 
 
@@ -99,35 +106,35 @@ if __name__ == "__main__":
         'n_neurons': 64
     }
 
-    print("=== Sampling with regular FlowProposal (baseline) ===")
-    sampler_regular = FlowSampler(
-        Periodic2DModel(),
-        output="./outdir_2d_regular/",
-        flow_proposal_class=FlowProposal,
-        flow_config=flow_config_regular,
-        nlive=1000,
-        resume=False,
-        seed=42,
-    )
-    sampler_regular.run()
-
     print("=== Sampling with RealNVPGroupFlow (nessai.flowmodel.group_mixture) ===")
     sampler_group = FlowSampler(
         Periodic2DModel(),
         output="./outdir_2d_group/",
         flow_proposal_class=GroupFlowProposal,
         flow_config=flow_config_group,
-        nlive=1000,
+        nlive=2000,
         resume=False,
         seed=42,
     )
     sampler_group.run()
 
+    print("=== Sampling with regular FlowProposal (baseline) ===")
+    sampler_regular = FlowSampler(
+        Periodic2DModel(),
+        output="./outdir_2d_regular/",
+        flow_proposal_class=FlowProposal,
+        flow_config=flow_config_regular,
+        nlive=2000,
+        resume=False,
+        seed=42,
+    )
+    sampler_regular.run()
+
+
     # Extract wrapper module directly from trained proposal
     trained_wrapper = sampler_group.ns._flow_proposal.flow.model
 
-    with torch.no_grad():
-        learned_probs = torch.softmax(trained_wrapper.logits, dim=-1).cpu().numpy()
+    learned_probs = trained_wrapper.weights.detach().cpu().numpy()
 
     print("\n" + "=" * 65)
     print(" AMPLITUDE COMPARISON: Learned Logit Weights vs Ground Truth")
