@@ -475,16 +475,6 @@ def test_prime_space_action_escape_hatch(base_flow):
     assert torch.allclose(log_q, w.log_prob(x), atol=1e-4)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "The wrapper assumes the group action is a clean bijection on the "
-        "whole prime space. An action that is measure preserving only on a "
-        "box and saturates outside it (e.g. nessai_gw's ETTriangleGroupAction, "
-        "which does asin(clamp(sin_dec, -1, 1))) makes sample_and_log_prob "
-        "and log_prob disagree once the canonical draw leaves the box."
-    ),
-)
 def test_sample_and_log_prob_consistent_with_saturating_action(base_flow):
     """log q from the generator must match log q recomputed by log_prob.
 

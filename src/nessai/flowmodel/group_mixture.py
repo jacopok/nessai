@@ -509,42 +509,58 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         )
 
     def _mixture_log_prob_from_canonical(
-        self, canon, modes, x, log_q0_canon, conj_logdet, context=None
+        self, canon, modes, x, conj_logdet, context=None
     ):
         """log q(x) for x generated as ``g_modes . canon``.
 
         For a group that tiles the space and ``canon`` inside the fundamental
         domain only branch ``modes`` contributes, so ``log q(x) = log pi_modes
-        + log q0(canon) + conj_logdet`` with no extra base-flow evaluation.
-        ``conj_logdet`` here is ``L(x) - L(canon)``. Points whose ``canon``
-        leaked out of the domain fall back to the full mixture.
+        + log q0(canon) + log|det dcanon/du| + conj_logdet``. The base term is
+        recomputed here with :meth:`base_flow.log_prob` on the standardised
+        ``canon`` -- i.e. exactly branch ``modes`` of :meth:`_branch_log_probs`
+        -- rather than reusing the generator's log density at ``u``: the two
+        differ by the ``u -> canon -> standardise`` round-off, which a steep
+        base density amplifies past tolerance. ``conj_logdet`` is
+        ``L(x) - L(canon)``.
+
+        A point falls back to the full mixture :meth:`log_prob` when its
+        ``canon`` leaked out of the fundamental domain, or when the inverse
+        action of element ``modes`` does not map ``x`` back onto ``canon``: a
+        non-injective action (one that clamps / saturates outside a box, e.g.
+        an angle reparameterised through ``asin(clamp(...))``) breaks that
+        round trip even for ``canon`` inside the domain, and the single-branch
+        shortcut is then invalid.
         """
-        log_q = (
-            torch.log(self.weights[modes]) + log_q0_canon + conj_logdet
+        base_lp = self.base_flow.log_prob(
+            self._standardise(canon, modes), context=context
         )
+        log_q = (
+            torch.log(self.weights[modes])
+            + base_lp
+            + self._canon_log_det(modes)
+            + conj_logdet
+        )
+        bad = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
         if self.in_fundamental_domain is not None or self.uses_prime_space_action:
             bad = ~self._in_domain(canon)
-            if bool(bad.any()):
-                log_q = log_q.clone()
-                log_q[bad] = self.log_prob(x[bad], context=context)
+        pre_rt, _ = self._apply_group_action(x, modes, inverse=True)
+        bad = bad | ~torch.isclose(
+            pre_rt, canon, atol=1e-5, rtol=1e-5
+        ).all(dim=-1)
+        if bool(bad.any()):
+            log_q = log_q.clone()
+            log_q[bad] = self.log_prob(x[bad], context=context)
         return log_q
 
     def sample_and_log_prob(self, num_samples, context=None):
-        u, log_q0_u = self.base_flow.sample_and_log_prob(
-            num_samples, context=context
-        )
+        u = self.base_flow.sample(num_samples, context=context)
         modes = Categorical(probs=self.weights).sample((num_samples,))
         canon = self._destandardise(u, modes)
         x, fwd_logdet = self._apply_group_action(
             canon, modes, inverse=False
         )
         log_q = self._mixture_log_prob_from_canonical(
-            canon,
-            modes,
-            x,
-            log_q0_u + self._canon_log_det(modes),
-            -fwd_logdet,
-            context,
+            canon, modes, x, -fwd_logdet, context
         )
         return x, log_q
 
@@ -571,7 +587,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         # ``fwd_logdet``.
         modes = Categorical(probs=self.weights).sample((z.shape[0],))
 
-        u, inv_log_j = self.base_flow.inverse(z, context=context)
+        u, _ = self.base_flow.inverse(z, context=context)
         canon = self._destandardise(u, modes)
         x, fwd_logdet = self._apply_group_action(
             canon, modes, inverse=False
@@ -580,9 +596,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         latent_log_prob = self.base_flow.base_distribution_log_prob(
             z, context=context
         )
-        log_q0_canon = latent_log_prob - inv_log_j + self._canon_log_det(modes)
         log_q = self._mixture_log_prob_from_canonical(
-            canon, modes, x, log_q0_canon, -fwd_logdet, context
+            canon, modes, x, -fwd_logdet, context
         )
         log_j = latent_log_prob - log_q
         return x, log_j
