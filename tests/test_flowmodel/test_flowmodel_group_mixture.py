@@ -2,6 +2,7 @@
 Test the discrete group-mixture flow model.
 """
 
+import os
 from unittest.mock import create_autospec
 
 import numpy as np
@@ -521,6 +522,99 @@ def test_sample_and_log_prob_consistent_with_saturating_action(base_flow):
     finite = torch.isfinite(log_q)
     assert finite.sum() > 2000
     assert torch.allclose(log_q[finite], w.log_prob(x)[finite], atol=1e-3)
+
+
+@pytest.mark.slow_integration_test
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "DiscreteGroupMixtureFlowWrapper is still inconsistent for the real "
+        "8-element ET-triangle group once the physical<->prime map is the "
+        "double-logit + z-score ReparamBridge the replay harness installs and "
+        "the flow is trained to convergence: sample_and_log_prob and log_prob "
+        "disagree by ~0.3-1 nats per branch (occasional outliers of several "
+        "nats), and backward_pass then yields no surviving samples. The 1-D "
+        "shift and the identity-action bridge repros both pass; a hand-built "
+        "logit bridge with the real action also passes -- the trigger is the "
+        "full FlowProposal reparameterisation path."
+    ),
+)
+def test_et_triangle_group_replay_sample_log_prob_consistent(tmp_path):
+    """Reproduce the ``--group`` ESS collapse through the real replay path.
+
+    Builds a small ET-triangle ``FlowProposal`` exactly as
+    ``nessai/replay_optimization/replay_optimisation.py`` does -- an 8-element
+    group acting on ``(ra, sin_dec, cos_theta_jn, psi, phase)`` wired through
+    ``GroupFlowProposalMixin`` with the bounded-``logit`` reparameterisation on
+    the acted parameters and ``zscore`` on the rest -- trains it on the
+    octomodal BNS posterior extract, and checks that the trained flow's two
+    log-density paths agree.  Skipped unless the archived BNS run is present.
+    """
+    import importlib.util
+    import sys
+
+    pytest.importorskip("nessai_gw.group_mixture")
+    pytest.importorskip("bilby")
+
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    harness = os.path.join(
+        repo, "src", "nessai", "replay_optimization", "replay_optimisation.py"
+    )
+    bns = os.path.join(
+        repo, "src", "nessai", "replay_optimization", "BNS_result.json"
+    )
+    if not (os.path.exists(harness) and os.path.exists(bns)):
+        pytest.skip("replay_optimisation harness or BNS_result.json missing")
+
+    spec = importlib.util.spec_from_file_location("replay_optimisation", harness)
+    R = importlib.util.module_from_spec(spec)
+    sys.modules["replay_optimisation"] = R
+    spec.loader.exec_module(R)
+
+    run = R._to_group_frame(R.load_archived_run(bns, None))
+    proposal_class = R.make_group_proposal_class(run)
+    model = R.ReplayModel(run.priors, run.names)
+
+    rng = np.random.default_rng(R.SEED)
+    iteration = run.checkpoints(1)[-1]
+    proposal = None
+
+    orig = R._support_statistics
+
+    def _capture(p, r):
+        nonlocal proposal
+        proposal = p
+        return orig(p, r)
+
+    R._support_statistics = _capture
+    try:
+        R.evaluate_checkpoint(
+            run,
+            model,
+            iteration,
+            R.BASELINE_FLOW_CONFIG,
+            dict(R.BASELINE_TRAINING_CONFIG, max_epochs=R.MAX_EPOCHS),
+            proposal_class,
+            rng,
+            str(tmp_path / f"it_{iteration}"),
+            use_group=True,
+        )
+    except Exception:
+        pass
+    finally:
+        R._support_statistics = orig
+
+    assert proposal is not None, "the proposal was never trained"
+    flow = proposal.flow.model
+    flow.eval()
+    with torch.no_grad():
+        x, log_q = flow.sample_and_log_prob(4096)
+        log_q2 = flow.log_prob(x)
+    d = (log_q - log_q2).cpu().numpy()
+    finite = np.isfinite(d)
+    assert finite.sum() > 2048
+    assert np.std(d[finite]) < 1e-2
+    assert np.max(np.abs(d[finite])) < 0.5
 
 
 @pytest.mark.slow_integration_test
