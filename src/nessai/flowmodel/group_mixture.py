@@ -262,6 +262,11 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         # once when the floor actually binds.
         self._min_canon_std = min_canon_std
         self._warned_canon_clamp = False
+        # Fraction of the last batch that fell back from the single-branch
+        # shortcut to the full mixture ``log_prob`` in
+        # ``_mixture_log_prob_from_canonical`` (a non-injective group action
+        # in the sampling coordinates drives this up).
+        self._last_fallback_fraction = 0.0
 
     @property
     def uses_prime_space_action(self):
@@ -567,13 +572,20 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         base density amplifies past tolerance. ``conj_logdet`` is
         ``L(x) - L(canon)``.
 
-        A point falls back to the full mixture :meth:`log_prob` when its
-        ``canon`` leaked out of the fundamental domain, or when the inverse
-        action of element ``modes`` does not map ``x`` back onto ``canon``: a
-        non-injective action (one that clamps / saturates outside a box, e.g.
-        an angle reparameterised through ``asin(clamp(...))``) breaks that
-        round trip even for ``canon`` inside the domain, and the single-branch
-        shortcut is then invalid.
+        A point is corrected with the full mixture :meth:`log_prob` when its
+        ``canon`` leaked out of the fundamental domain (``q0`` has support
+        there -- a genuine multi-branch image whose density the single term
+        under-counts) or when the inverse action of element ``modes`` does not
+        map ``x`` back onto ``canon`` (a non-injective action -- one that
+        clamps / saturates outside a box, e.g. an angle reparameterised through
+        ``asin(clamp(...))``). The correction is *floored* at the single-branch
+        value: near a degenerate edge / corner of the fundamental domain
+        :meth:`_branch_log_probs` can place none of the eight orbit images
+        cleanly in-domain, evaluate all of them in ``q0``'s tail, and return a
+        spuriously tiny density. ``log pi_modes + log q0(canon) + ...`` is the
+        honest density of the generative draw (a valid lower bound whenever
+        branch ``modes`` round-trips), so ``sample_and_log_prob`` never emits a
+        density -- hence a rejection weight -- below it.
         """
         base_lp = self.base_flow.log_prob(
             self._standardise(canon, modes), context=context
@@ -591,9 +603,13 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         bad = bad | ~torch.isclose(
             pre_rt, canon, atol=1e-5, rtol=1e-5
         ).all(dim=-1)
+        if bad.numel():
+            self._last_fallback_fraction = float(bad.float().mean())
         if bool(bad.any()):
             log_q = log_q.clone()
-            log_q[bad] = self.log_prob(x[bad], context=context)
+            log_q[bad] = torch.maximum(
+                self.log_prob(x[bad], context=context), log_q[bad]
+            )
         return log_q
 
     def sample_and_log_prob(self, num_samples, context=None):
@@ -942,7 +958,25 @@ class GroupFlowProposalMixin:
     def _log_group_weight_entropy(self):
         flow_model = getattr(self.flow, "model", None)
         p = getattr(flow_model, "weights", None)
-        if p is None or not logger.isEnabledFor(logging.INFO):
+        if p is None:
+            return
+
+        frac = getattr(flow_model, "_last_fallback_fraction", None)
+        if frac is not None and frac > 0.1:
+            logger.warning(
+                "Group-mixture single-branch fallback fraction: %.3f "
+                "(>0.1: the group action is likely non-injective in the "
+                "sampling coordinates -- e.g. raw angles through asin/clamp -- "
+                "which inflates the importance-weight spread and depresses "
+                "the population acceptance).",
+                frac,
+            )
+        elif frac is not None:
+            logger.info(
+                "Group-mixture single-branch fallback fraction: %.3f", frac
+            )
+
+        if not logger.isEnabledFor(logging.INFO):
             return
         p = p.detach()
         entropy = float(-(p * torch.log2(p.clamp_min(1e-12))).sum())
