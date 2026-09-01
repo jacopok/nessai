@@ -190,6 +190,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         in_fundamental_domain=None,
         prime_space_action=None,
         prime_space_in_domain=None,
+        min_canon_std=1e-2,
     ):
         super().__init__()
         self.base_flow = base_flow
@@ -250,7 +251,17 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         # the true, much narrower spread). Flooring keeps both paths finite
         # and consistent; the residual sub-floor variance is modelled by the
         # base flow instead.
-        self._min_canon_std = 1e-2
+        #
+        # The default (1e-2) suits a ~unit-scaled prime frame. A run that
+        # z-scores a parameter far tighter than the prior resolves it (e.g. a
+        # GW ``geocent_time`` pinned to ~1e-4 s inside a 0.2 s prior) has a
+        # true prime spread orders of magnitude below the floor: the base flow
+        # is then asked to model a near-delta in that coordinate and
+        # ``sample_and_log_prob`` comes out over-dispersed there. Lower
+        # ``min_canon_std`` in that case; ``update_base_standardisation`` warns
+        # once when the floor actually binds.
+        self._min_canon_std = min_canon_std
+        self._warned_canon_clamp = False
 
     @property
     def uses_prime_space_action(self):
@@ -429,7 +440,24 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         assigned, pre, claimed = self._assign_branch(x)
         canon = pre[assigned, torch.arange(b, device=x.device)]
         gmean = canon.mean(dim=0)
-        gstd = canon.std(dim=0).clamp_min(self._min_canon_std)
+        raw_std = canon.std(dim=0)
+        gstd = raw_std.clamp_min(self._min_canon_std)
+        clamped = raw_std < self._min_canon_std
+        if bool(clamped.any()) and not self._warned_canon_clamp:
+            names = [
+                self.param_names[i]
+                for i in clamped.nonzero(as_tuple=True)[0].tolist()
+            ]
+            logger.warning(
+                "Group-mixture canonical std floored at %g for %s: the "
+                "posterior is far narrower than the prime frame there, so the "
+                "base flow must model a near-delta in that coordinate and "
+                "sample_and_log_prob may be over-dispersed. Lower "
+                "min_canon_std or use a tighter reparameterisation.",
+                self._min_canon_std,
+                names,
+            )
+            self._warned_canon_clamp = True
         beta = self._canon_ema
         for k in range(self.group_size):
             sel = claimed & (assigned == k)
@@ -658,6 +686,7 @@ class GroupMixtureFlowModel(FlowModel):
     in_fundamental_domain = None
     prime_space_action = None
     prime_space_in_domain = None
+    min_canon_std = 1e-2
 
     def initialise(self):
         """Initialise the model and optimiser via :meth:`get_model`."""
@@ -706,6 +735,9 @@ class GroupMixtureFlowModel(FlowModel):
             "prime_space_in_domain",
             getattr(self, "prime_space_in_domain", None),
         )
+        min_canon_std = config_clean.pop(
+            "min_canon_std", getattr(self, "min_canon_std", 1e-2)
+        )
 
         if group_action_fn is None or group_size is None:
             raise ValueError(
@@ -725,6 +757,7 @@ class GroupMixtureFlowModel(FlowModel):
             in_fundamental_domain=in_fundamental_domain,
             prime_space_action=prime_space_action,
             prime_space_in_domain=prime_space_in_domain,
+            min_canon_std=min_canon_std,
         )
 
 
@@ -735,6 +768,7 @@ def make_group_mixture_flow(
     in_fundamental_domain=None,
     prime_space_action=None,
     prime_space_in_domain=None,
+    min_canon_std=1e-2,
 ):
     """Factory constructing a ``GroupMixtureFlowModel`` bound to a specific group.
 
@@ -767,6 +801,13 @@ def make_group_mixture_flow(
     prime_space_in_domain : callable, optional
         Fundamental-domain predicate in prime coordinates; required with
         ``prime_space_action``.
+    min_canon_std : float, optional
+        Floor on the per-element canonical standardisation std (default
+        ``1e-2``, tuned for a ~unit-scaled prime frame). Lower it when a
+        parameter is z-scored far tighter than the prior resolves it (e.g. a
+        GW ``geocent_time``), otherwise the base flow is forced to model a
+        near-delta in that coordinate and ``sample_and_log_prob`` is
+        over-dispersed there; a one-off warning fires when the floor binds.
 
     Notes
     -----
@@ -784,6 +825,7 @@ def make_group_mixture_flow(
     CustomGroupMixtureFlowModel.group_action_fn = staticmethod(group_action_fn)
     CustomGroupMixtureFlowModel.group_size = group_size
     CustomGroupMixtureFlowModel.param_names = param_names
+    CustomGroupMixtureFlowModel.min_canon_std = min_canon_std
     if in_fundamental_domain is not None:
         CustomGroupMixtureFlowModel.in_fundamental_domain = staticmethod(
             in_fundamental_domain

@@ -526,6 +526,43 @@ def test_sample_and_log_prob_consistent_with_saturating_action(base_flow):
     assert torch.allclose(log_q[finite], w.log_prob(x)[finite], atol=1e-3)
 
 
+def test_min_canon_std_plumbed_through_factory():
+    cls = make_group_mixture_flow(
+        shift_group_action,
+        GROUP_SIZE,
+        PARAM_NAMES,
+        in_fundamental_domain,
+        min_canon_std=1e-5,
+    )
+    assert cls.min_canon_std == 1e-5
+
+
+def test_update_base_standardisation_warns_when_floor_binds(base_flow, caplog):
+    """A prime dim far narrower than the floor triggers a one-off warning."""
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=["x", "y"],
+        in_fundamental_domain=in_fundamental_domain,
+        min_canon_std=1e-2,
+    )
+    rng = np.random.default_rng(0)
+    # ``y`` is pinned ~1e-6 wide, well below the 1e-2 floor.
+    data = np.stack(
+        [rng.uniform(0.0, 1.0, 400), rng.normal(0.0, 1e-6, 400)], axis=1
+    )
+    x_train = torch.tensor(data, dtype=torch.float32)
+    with caplog.at_level("WARNING"):
+        w.update_base_standardisation(x_train)
+        w.update_base_standardisation(x_train)
+    hits = sum(
+        "canonical std floored" in r.getMessage() for r in caplog.records
+    )
+    assert hits == 1
+
+
 @pytest.mark.slow_integration_test
 def test_sampling_with_group_mixture_flow(tmp_path):
     """Sample a periodic multimodal target with the group-mixture proposal."""
