@@ -141,3 +141,7 @@ cython_debug/
 # Project specific
 outdir/
 autoapi/
+
+# Offline group-mixture flow inspection: copied flow states, resume pickles,
+# figures and ad-hoc analysis scripts used to debug the ET-triangle runs.
+group_flow_inspection/
