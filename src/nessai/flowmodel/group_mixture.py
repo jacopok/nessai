@@ -181,12 +181,14 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     directly in prime coordinates and bypass the bridge entirely.
 
     The base flow has full support, so a generative draw ``canon`` can land
-    outside the fundamental domain; :meth:`_mixture_log_prob_from_canonical`
-    then falls back from the exact single-branch density to the (leaky) full
-    mixture. Pass ``truncate_base_to_domain=True`` to instead reject those
-    draws in :meth:`sample_and_log_prob`, renormalising by the tracked base
-    mass ``Z`` inside the domain (``_log_domain_mass``); the single-branch
-    density is then exact and the importance weights lose the leakage bias.
+    outside the fundamental domain. By default (``truncate_base_to_domain``)
+    :meth:`sample_and_log_prob` rejects those draws and renormalises by the
+    tracked base mass ``Z`` inside the domain (``_log_domain_mass``), so the
+    single-branch density is exact and the importance weights carry no leakage
+    bias. Set ``truncate_base_to_domain=False`` to instead keep every draw and
+    score it with the leaky full-mixture fallback in
+    :meth:`_mixture_log_prob_from_canonical`. With no fundamental-domain
+    predicate truncation is unavailable and the fallback is always used.
     """
 
     def __init__(
@@ -200,7 +202,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         prime_space_action=None,
         prime_space_in_domain=None,
         min_canon_std=1e-2,
-        truncate_base_to_domain=False,
+        truncate_base_to_domain=True,
     ):
         super().__init__()
         self.base_flow = base_flow
@@ -211,12 +213,21 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         self.prime_space_action = prime_space_action
         self.prime_space_in_domain = prime_space_in_domain
         self.truncate_base_to_domain = truncate_base_to_domain
-        if truncate_base_to_domain and (
-            in_fundamental_domain is None and prime_space_in_domain is None
-        ):
-            raise ValueError(
-                "truncate_base_to_domain needs a fundamental-domain predicate "
-                "(`in_fundamental_domain` or `prime_space_in_domain`)."
+        # Truncation needs a fundamental-domain predicate; without one it is
+        # silently a no-op (the leaky single-branch shortcut is then the only
+        # option). ``_truncate`` is the effective switch used at runtime.
+        _has_predicate = (
+            prime_space_in_domain is not None
+            if prime_space_action is not None
+            else in_fundamental_domain is not None
+        )
+        self._truncate = bool(truncate_base_to_domain and _has_predicate)
+        if truncate_base_to_domain and not self._truncate:
+            logger.info(
+                "truncate_base_to_domain is set but no fundamental-domain "
+                "predicate was given; base-flow truncation is disabled and "
+                "sample_and_log_prob falls back to the leaky single-branch "
+                "shortcut."
             )
         self.param_names = param_names or [
             f"p_{i}" for i in range(num_features)
@@ -598,7 +609,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
 
     def log_prob(self, x, context=None):
         lp = self._raw_log_prob(x, context=context)
-        if self.truncate_base_to_domain:
+        if self._truncate:
             lp = lp - self._log_domain_mass
         return lp
 
@@ -636,20 +647,19 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         base density amplifies past tolerance. ``conj_logdet`` is
         ``L(x) - L(canon)``.
 
-        A point is corrected with the full mixture :meth:`log_prob` when its
-        ``canon`` leaked out of the fundamental domain (``q0`` has support
-        there -- a genuine multi-branch image whose density the single term
-        under-counts) or when the inverse action of element ``modes`` does not
-        map ``x`` back onto ``canon`` (a non-injective action -- one that
-        clamps / saturates outside a box, e.g. an angle reparameterised through
-        ``asin(clamp(...))``). The correction is *floored* at the single-branch
-        value: near a degenerate edge / corner of the fundamental domain
-        :meth:`_branch_log_probs` can place none of the eight orbit images
-        cleanly in-domain, evaluate all of them in ``q0``'s tail, and return a
-        spuriously tiny density. ``log pi_modes + log q0(canon) + ...`` is the
-        honest density of the generative draw (a valid lower bound whenever
-        branch ``modes`` round-trips), so ``sample_and_log_prob`` never emits a
-        density -- hence a rejection weight -- below it.
+        With ``truncate_base_to_domain`` (the default) a draw whose ``canon``
+        left the fundamental domain is not one the domain-restricted base flow
+        can make, so it gets ``-inf`` and is discarded downstream; the density
+        is renormalised by the tracked in-domain base mass ``log Z``. Without
+        truncation such a point is instead scored with the full mixture
+        :meth:`log_prob`, *floored* at the single-branch value (near a
+        degenerate edge :meth:`_branch_log_probs` can place none of the orbit
+        images cleanly in-domain and return a spuriously tiny density).
+
+        Independently of truncation, a point whose branch inverse does not map
+        ``x`` back onto ``canon`` (a non-injective action -- one that clamps /
+        saturates outside a box, e.g. an angle through ``asin(clamp(...))``) is
+        floored at the full-mixture density.
         """
         base_lp = self.base_flow.log_prob(
             self._standardise(canon, modes), context=context
@@ -669,6 +679,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         no_roundtrip = ~torch.isclose(
             pre_rt, canon, atol=1e-5, rtol=1e-5
         ).all(dim=-1)
+        rt_only = no_roundtrip & ~out_of_domain
         bad = out_of_domain | no_roundtrip
         if bad.numel():
             self._last_leakage_fraction = float(bad.float().mean())
@@ -678,22 +689,42 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             # Disjoint split: attribute an in-domain point to the round-trip
             # cause only where the domain cause does not already fire.
             self._last_leakage_fraction_roundtrip = float(
-                (no_roundtrip & ~out_of_domain).float().mean()
+                rt_only.float().mean()
             )
+
+        if self._truncate:
+            # Feed the domain-leak rate into the EMA estimate of log Z (both
+            # the sample_and_log_prob reject loop -- which passes
+            # ``apply_domain_mass=False`` and does its own update -- and the
+            # backward_pass/inverse path land here).
+            if apply_domain_mass and out_of_domain.numel():
+                self._update_domain_mass(
+                    int((~out_of_domain).sum()), out_of_domain.numel()
+                )
+            log_q = log_q.clone()
+            # Discard non-canonical proposals: an out-of-domain ``canon`` is
+            # not a draw the domain-restricted base flow can make, so it gets
+            # -inf and callers (backward_pass' finite-log_prob filter, the
+            # reject loop) drop it.
+            log_q[out_of_domain] = -float("inf")
+            if bool(rt_only.any()):
+                log_q[rt_only] = torch.maximum(
+                    self._raw_log_prob(x[rt_only], context=context),
+                    log_q[rt_only],
+                )
+            if apply_domain_mass:
+                log_q = log_q - self._log_domain_mass
+            return log_q
+
         if bool(bad.any()):
             log_q = log_q.clone()
             log_q[bad] = torch.maximum(
                 self._raw_log_prob(x[bad], context=context), log_q[bad]
             )
-        if self.truncate_base_to_domain and apply_domain_mass:
-            log_q = log_q - self._log_domain_mass
         return log_q
 
     def sample_and_log_prob(self, num_samples, context=None):
-        if self.truncate_base_to_domain and (
-            self.in_fundamental_domain is not None
-            or self.uses_prime_space_action
-        ):
+        if self._truncate:
             return self._sample_and_log_prob_truncated(num_samples, context)
         u = self.base_flow.sample(num_samples, context=context)
         modes = Categorical(probs=self.weights).sample((num_samples,))
@@ -851,7 +882,7 @@ class GroupMixtureFlowModel(FlowModel):
     prime_space_action = None
     prime_space_in_domain = None
     min_canon_std = 1e-2
-    truncate_base_to_domain = False
+    truncate_base_to_domain = True
 
     def initialise(self):
         """Initialise the model and optimiser via :meth:`get_model`."""
@@ -905,7 +936,7 @@ class GroupMixtureFlowModel(FlowModel):
         )
         truncate_base_to_domain = config_clean.pop(
             "truncate_base_to_domain",
-            getattr(self, "truncate_base_to_domain", False),
+            getattr(self, "truncate_base_to_domain", True),
         )
 
         if group_action_fn is None or group_size is None:
@@ -939,7 +970,7 @@ def make_group_mixture_flow(
     prime_space_action=None,
     prime_space_in_domain=None,
     min_canon_std=1e-2,
-    truncate_base_to_domain=False,
+    truncate_base_to_domain=True,
 ):
     """Factory constructing a ``GroupMixtureFlowModel`` bound to a specific group.
 
@@ -988,8 +1019,8 @@ def make_group_mixture_flow(
         the domain and renormalised by its mass there (tracked as an EMA of the
         rejection acceptance rate), which makes the single-branch density exact
         and removes the importance-weight bias from base-flow mass leaking into
-        neighbouring tiles. Requires a fundamental-domain predicate. Default
-        ``False``.
+        neighbouring tiles. Default ``True``; a no-op (with an info log) when
+        no fundamental-domain predicate is available.
 
     Notes
     -----

@@ -250,11 +250,13 @@ def test_inverse_log_j_matches_log_prob(wrapper):
     x, log_j = wrapper.inverse(z)
     latent_log_prob = wrapper.base_flow.base_distribution_log_prob(z)
     # latent_log_prob - log_j is the proposal density used by
-    # FlowProposal.backward_pass: the full-mixture density, floored at the
-    # single-branch generative value.
+    # FlowProposal.backward_pass. With truncation on (default) a draw whose
+    # canonical representative leaves the fundamental domain is discarded
+    # (-inf); the rest carry the single-branch generative density.
     log_q = latent_log_prob - log_j
-    assert torch.isfinite(log_q).all()
-    assert (log_q >= wrapper.log_prob(x) - 1e-4).all()
+    finite = torch.isfinite(log_q)
+    assert finite.any()
+    assert (log_q[finite] >= wrapper.log_prob(x)[finite] - 1e-4).all()
 
 
 def _struct(array, names):
@@ -520,6 +522,7 @@ def test_sample_and_log_prob_floored_at_single_branch(base_flow):
         group_size=3,
         param_names=["x", "y"],
         in_fundamental_domain=fundamental_domain,
+        truncate_base_to_domain=False,
     )
     w.eval()
 
@@ -559,17 +562,36 @@ def test_sample_and_log_prob_floored_at_single_branch(base_flow):
     assert (log_q <= honest + 1e-3).float().mean() > 0.5
 
 
-def test_truncate_base_to_domain_requires_predicate(base_flow):
-    """``truncate_base_to_domain`` is meaningless without a domain predicate."""
-    with pytest.raises(ValueError, match="fundamental-domain predicate"):
-        DiscreteGroupMixtureFlowWrapper(
+def test_truncate_base_to_domain_default_on(base_flow):
+    """Truncation is on by default when a domain predicate is available."""
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=PARAM_NAMES,
+        in_fundamental_domain=in_fundamental_domain,
+    )
+    assert w._truncate is True
+
+
+def test_truncate_base_to_domain_noop_without_predicate(base_flow, caplog):
+    """Without a domain predicate truncation silently disables itself."""
+    with caplog.at_level("INFO"):
+        w = DiscreteGroupMixtureFlowWrapper(
             base_flow=base_flow,
             num_features=2,
             group_action_fn=shift_group_action,
             group_size=GROUP_SIZE,
             param_names=PARAM_NAMES,
-            truncate_base_to_domain=True,
         )
+    assert w._truncate is False
+    assert any(
+        "truncation is disabled" in r.getMessage() for r in caplog.records
+    )
+    # sample_and_log_prob still works, via the leaky fallback path.
+    x, log_q = w.sample_and_log_prob(16)
+    assert torch.isfinite(log_q).all()
 
 
 def test_truncate_base_to_domain_normalises_and_is_consistent(base_flow):
@@ -643,6 +665,44 @@ def test_truncate_base_to_domain_shifts_log_prob_by_log_z(base_flow):
     rng = np.random.default_rng(0)
     x = points_in_element(0, 64, rng)
     assert torch.allclose(trunc.log_prob(x), plain.log_prob(x) + 1.1, atol=1e-5)
+
+
+def test_truncate_base_to_domain_discards_on_inverse_path(base_flow):
+    """The backward_pass / ``inverse`` path discards out-of-domain draws too.
+
+    ``FlowProposal.populate`` samples through ``inverse``, not
+    ``sample_and_log_prob``, so truncation has to bite there: an out-of-domain
+    canonical representative gets ``log_q = -inf`` (dropped by
+    ``backward_pass``'s finite-log_prob filter) and the leak rate still feeds
+    the ``log Z`` estimate.
+    """
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=PARAM_NAMES,
+        in_fundamental_domain=in_fundamental_domain,
+    )
+    w.eval()
+    torch.manual_seed(0)
+    z = torch.randn(4000, 2)
+    x, log_j = w.inverse(z)
+    latent = w.base_flow.base_distribution_log_prob(z)
+    log_q = latent - log_j
+
+    # A non-trivial slice is discarded, the rest are finite and match log_prob
+    # up to the single-branch/full-mixture gap.
+    frac_discarded = float((~torch.isfinite(log_q)).float().mean())
+    assert 0.05 < frac_discarded < 0.95
+    finite = torch.isfinite(log_q)
+    assert (log_q[finite] >= w.log_prob(x)[finite] - 1e-4).all()
+    # The leak rate fed the log Z estimate.
+    assert w._domain_mass_seen
+    assert w._log_domain_mass.item() < 0.0
+    assert w._log_domain_mass.exp().item() == pytest.approx(
+        1.0 - frac_discarded, abs=0.05
+    )
 
 
 def test_min_canon_std_plumbed_through_factory():
