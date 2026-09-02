@@ -792,3 +792,102 @@ def test_sampling_with_nonaffine_reparameterisation(tmp_path):
     weights = model.weights.detach().cpu().numpy()
     assert np.isclose(weights.sum(), 1.0)
     assert np.isfinite(fs.log_evidence)
+
+
+def _reflect_wrapper(base_flow, reflect_parameters):
+    def reflect(d, m, inverse=False):
+        sign = torch.where(m == 1, -1.0, 1.0).to(d["x"].dtype)
+        return {"x": d["x"] * sign, "y": d["y"]}, torch.zeros_like(d["x"])
+
+    return DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=None,
+        group_size=2,
+        param_names=["x", "y"],
+        prime_space_action=reflect,
+        prime_space_in_domain=lambda d: d["x"] >= 0.0,
+        reflect_parameters=reflect_parameters,
+    )
+
+
+def test_reflect_parameters_only_prime_space(base_flow, caplog):
+    """reflect_parameters is ignored (with a warning) off the prime-space path."""
+    with caplog.at_level("WARNING"):
+        w = DiscreteGroupMixtureFlowWrapper(
+            base_flow=base_flow,
+            num_features=2,
+            group_action_fn=shift_group_action,
+            group_size=GROUP_SIZE,
+            param_names=PARAM_NAMES,
+            in_fundamental_domain=in_fundamental_domain,
+            reflect_parameters=["x"],
+        )
+    assert w._sign_patterns is None
+    assert "only supported on the prime-space" in caplog.text
+
+
+def test_reflect_base_log_prob_normalised_over_domain(base_flow):
+    """sum_s q0(s.u) integrates to 1 over the x>=0 half-plane (fresh buffers,
+    identity standardisation)."""
+    w = _reflect_wrapper(base_flow, ["x"])
+    w.eval()
+    # grid over x in [0, 8], y in [-8, 8]
+    xs = torch.linspace(1e-3, 8.0, 400)
+    ys = torch.linspace(-8.0, 8.0, 400)
+    gx, gy = torch.meshgrid(xs, ys, indexing="ij")
+    canon = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1)
+    modes = torch.zeros(canon.shape[0], dtype=torch.long)
+    with torch.no_grad():
+        dens = torch.exp(
+            w._base_log_prob(canon, modes) + w._canon_log_det(modes)
+        )
+    integral = dens.sum() * (xs[1] - xs[0]) * (ys[1] - ys[0])
+    assert integral == pytest.approx(1.0, abs=0.03)
+
+    # matches an explicit two-term logsumexp
+    with torch.no_grad():
+        pt = torch.tensor([[0.4, -0.7]])
+        m = torch.zeros(1, dtype=torch.long)
+        manual = torch.logsumexp(
+            torch.stack([
+                base_flow.log_prob(torch.tensor([[0.4, -0.7]])),
+                base_flow.log_prob(torch.tensor([[-0.4, -0.7]])),
+            ]),
+            dim=0,
+        )
+        got = w._base_log_prob(pt, m)
+    assert float(got) == pytest.approx(float(manual), abs=1e-5)
+
+
+def test_reflect_standardisation_pinned_and_samples_in_domain(base_flow):
+    w = _reflect_wrapper(base_flow, ["x"])
+    w.eval()
+    rng = np.random.default_rng(0)
+    # half-normal-ish data hard against the x=0 wall
+    data = np.stack(
+        [np.abs(rng.normal(0.0, 0.6, 2000)), rng.normal(0.0, 1.0, 2000)],
+        axis=1,
+    )
+    x_train = torch.tensor(data, dtype=torch.float32)
+    w.update_mixture_weights(x_train)
+    w.update_base_standardisation(x_train)
+    # x is a reflect dim -> centre pinned to 0, scale to RMS about 0
+    assert w._canon_mean[:, 0].abs().max() == 0.0
+    assert (w._canon_std[:, 0] > 0).all()
+    # y untouched -> ordinary mean/std
+    assert w._canon_mean[0, 1].abs() < 0.2
+
+    torch.manual_seed(0)
+    xs, log_q = w.sample_and_log_prob(2000)
+    assert torch.isfinite(log_q).all()
+    # the mixture proposes across all tiles; only the canonical rep is folded
+    with torch.no_grad():
+        assigned, pre, claimed = w._assign_branch(xs)
+        canon = pre[assigned, torch.arange(xs.shape[0])]
+    assert (canon[claimed, 0] >= -1e-6).all()
+    honest = w.log_prob(xs)
+    assert torch.isfinite(honest).all()
+    assert (log_q >= honest - 1e-3).all()
+
+

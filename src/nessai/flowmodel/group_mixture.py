@@ -203,6 +203,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         prime_space_in_domain=None,
         min_canon_std=1e-2,
         truncate_base_to_domain=True,
+        reflect_parameters=None,
     ):
         super().__init__()
         self.base_flow = base_flow
@@ -232,6 +233,24 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         self.param_names = param_names or [
             f"p_{i}" for i in range(num_features)
         ]
+
+        # Boundary reflection: canonical coordinates that sit against a hard
+        # fundamental-domain wall at 0 (e.g. the ``x, y, z >= 0`` octant faces
+        # of a rotated sky decomposition). The base flow then models the
+        # sign-symmetric extension ``q0_sym(u) = sum_s q0(s . u)`` over the
+        # 2**m sign patterns of these dims, so it never has to represent the
+        # wall cliff; a generative draw is folded back with ``abs``.
+        self.reflect_parameters = list(reflect_parameters or [])
+        if self.reflect_parameters and prime_space_action is None:
+            logger.warning(
+                "reflect_parameters is only supported on the prime-space "
+                "action path; ignoring %s.",
+                self.reflect_parameters,
+            )
+            self.reflect_parameters = []
+        self._reflect_idx = torch.empty(0, dtype=torch.long)
+        self.register_buffer("_sign_patterns", None)
+        self._configure_reflection()
 
         # Coordinate bridge; defaults to the identity affine map so the
         # wrapper is usable without a proposal (e.g. in unit tests).
@@ -322,6 +341,35 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     def uses_prime_space_action(self):
         return self.prime_space_action is not None
 
+    def _configure_reflection(self):
+        """(Re)build the reflect-dim indices and sign patterns from
+        ``reflect_parameters`` against the current ``param_names``."""
+        idx = [
+            self.param_names.index(p)
+            for p in self.reflect_parameters
+            if p in self.param_names
+        ]
+        self._reflect_idx = torch.tensor(idx, dtype=torch.long)
+        if idx:
+            m = len(idx)
+            grid = torch.cartesian_prod(
+                *[torch.tensor([1.0, -1.0])] * m
+            ).reshape(2**m, m)
+            signs = torch.ones(2**m, self.num_features)
+            signs[:, self._reflect_idx] = grid
+            ref = self._sign_patterns
+            if isinstance(ref, torch.Tensor):
+                signs = signs.to(ref.device, ref.dtype)
+            self._sign_patterns = signs
+        else:
+            self._sign_patterns = None
+
+    def set_param_names(self, names):
+        """Rebind the prime-parameter names (e.g. once the proposal knows the
+        reparameterisation's true order) and refresh reflection indices."""
+        self.param_names = list(names)
+        self._configure_reflection()
+
     def set_coordinate_bridge(self, bridge):
         """Install a :class:`CoordinateBridge`.
 
@@ -380,6 +428,40 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
 
     def _canon_log_det(self, modes):
         return -torch.log(self._canon_std[modes]).sum(-1)
+
+    def _fold_reflect(self, canon):
+        """Fold canonical coords back to the positive side of each reflect wall.
+
+        ``update_base_standardisation`` pins ``_canon_mean = 0`` on the reflect
+        dims, so the wall at ``canon_i = 0`` is also the standardisation
+        centre; ``abs`` is the correct fold.
+        """
+        if self._sign_patterns is None:
+            return canon
+        canon = canon.clone()
+        idx = self._reflect_idx.to(canon.device)
+        canon[:, idx] = canon[:, idx].abs()
+        return canon
+
+    def _base_log_prob(self, canon, modes, context=None):
+        """``log q0`` of standardised ``canon``, symmetrised over reflect dims.
+
+        Without reflect dims this is just ``base_flow.log_prob`` of the
+        standardised point. With them it returns
+        ``logsumexp_s base_flow.log_prob(s . standardise(canon))`` over the
+        2**m sign patterns -- the density on the positive orthant whose
+        sign-symmetric extension is the base flow (unit-normalised, no extra
+        constant; the ``_canon_log_det`` term is added by the caller as usual).
+        """
+        u = self._standardise(canon, modes)
+        if self._sign_patterns is None:
+            return self.base_flow.log_prob(u, context=context)
+        p = self._sign_patterns.shape[0]
+        n, f = u.shape
+        signs = self._sign_patterns.to(u.dtype)
+        u_rep = (u.unsqueeze(0) * signs.unsqueeze(1)).reshape(p * n, f)
+        lp = self.base_flow.log_prob(u_rep, context=context).view(p, n)
+        return torch.logsumexp(lp, dim=0)
 
     def _apply_group_action(self, z_flat, modes_flat, inverse):
         """Apply the conjugated action to prime points.
@@ -494,9 +576,30 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         b = x.shape[0]
         assigned, pre, claimed = self._assign_branch(x)
         canon = pre[assigned, torch.arange(b, device=x.device)]
+
+        def _pin_reflect(mean, std, data):
+            # Reflect dims are symmetrised about their wall at 0, so the
+            # standardisation centre must be 0 and the scale the RMS about 0
+            # (the second moment of the folded data), not the one-sided
+            # mean/std.
+            if self._sign_patterns is None:
+                return mean, std
+            idx = self._reflect_idx.to(data.device)
+            rms = (
+                data[:, idx].pow(2).mean(dim=0).clamp_min(
+                    self._min_canon_std**2
+                ).sqrt()
+            )
+            mean = mean.clone()
+            std = std.clone()
+            mean[idx] = 0.0
+            std[idx] = rms
+            return mean, std
+
         gmean = canon.mean(dim=0)
         raw_std = canon.std(dim=0)
         gstd = raw_std.clamp_min(self._min_canon_std)
+        gmean, gstd = _pin_reflect(gmean, gstd, canon)
         clamped = raw_std < self._min_canon_std
         if bool(clamped.any()) and not self._warned_canon_clamp:
             names = [
@@ -520,6 +623,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 c = canon[sel]
                 mk = c.mean(dim=0)
                 sk = c.std(dim=0).clamp_min(self._min_canon_std)
+                mk, sk = _pin_reflect(mk, sk, c)
                 if self._canon_seen[k]:
                     self._canon_mean[k].mul_(1 - beta).add_(beta * mk)
                     self._canon_std[k].mul_(1 - beta).add_(beta * sk)
@@ -575,9 +679,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
 
         if self.in_fundamental_domain is None and not self.uses_prime_space_action:
             base_lp = (
-                self.base_flow.log_prob(
-                    self._standardise(flat_pre, flat_modes), context=context
-                )
+                self._base_log_prob(flat_pre, flat_modes, context=context)
                 + self._canon_log_det(flat_modes)
                 + flat_conj
             ).view(k, b)
@@ -593,9 +695,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             gi = idx[good]
             if gi.numel():
                 base_lp[gi] = (
-                    self.base_flow.log_prob(
-                        self._standardise(flat_pre[gi], flat_modes[gi]),
-                        context=context,
+                    self._base_log_prob(
+                        flat_pre[gi], flat_modes[gi], context=context
                     )
                     + self._canon_log_det(flat_modes[gi])
                     + flat_conj[gi]
@@ -661,9 +762,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         saturates outside a box, e.g. an angle through ``asin(clamp(...))``) is
         floored at the full-mixture density.
         """
-        base_lp = self.base_flow.log_prob(
-            self._standardise(canon, modes), context=context
-        )
+        base_lp = self._base_log_prob(canon, modes, context=context)
         log_q = (
             torch.log(self.weights[modes])
             + base_lp
@@ -728,7 +827,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             return self._sample_and_log_prob_truncated(num_samples, context)
         u = self.base_flow.sample(num_samples, context=context)
         modes = Categorical(probs=self.weights).sample((num_samples,))
-        canon = self._destandardise(u, modes)
+        canon = self._fold_reflect(self._destandardise(u, modes))
         x, fwd_logdet = self._apply_group_action(
             canon, modes, inverse=False
         )
@@ -763,7 +862,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             n_draw = int(math.ceil(need / z_guess * 1.3)) + 32
             u = self.base_flow.sample(n_draw, context=context)
             modes = Categorical(probs=self.weights).sample((n_draw,))
-            canon = self._destandardise(u, modes)
+            canon = self._fold_reflect(self._destandardise(u, modes))
             in_dom = self._in_domain(canon)
             n_drawn_tot += n_draw
             n_kept_tot += int(in_dom.sum())
@@ -827,7 +926,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         modes = Categorical(probs=self.weights).sample((z.shape[0],))
 
         u, _ = self.base_flow.inverse(z, context=context)
-        canon = self._destandardise(u, modes)
+        canon = self._fold_reflect(self._destandardise(u, modes))
         x, fwd_logdet = self._apply_group_action(
             canon, modes, inverse=False
         )
@@ -883,6 +982,7 @@ class GroupMixtureFlowModel(FlowModel):
     prime_space_in_domain = None
     min_canon_std = 1e-2
     truncate_base_to_domain = True
+    reflect_parameters = None
 
     def initialise(self):
         """Initialise the model and optimiser via :meth:`get_model`."""
@@ -938,6 +1038,9 @@ class GroupMixtureFlowModel(FlowModel):
             "truncate_base_to_domain",
             getattr(self, "truncate_base_to_domain", True),
         )
+        reflect_parameters = config_clean.pop(
+            "reflect_parameters", getattr(self, "reflect_parameters", None)
+        )
 
         if group_action_fn is None or group_size is None:
             raise ValueError(
@@ -959,6 +1062,7 @@ class GroupMixtureFlowModel(FlowModel):
             prime_space_in_domain=prime_space_in_domain,
             min_canon_std=min_canon_std,
             truncate_base_to_domain=truncate_base_to_domain,
+            reflect_parameters=reflect_parameters,
         )
 
 
@@ -971,6 +1075,7 @@ def make_group_mixture_flow(
     prime_space_in_domain=None,
     min_canon_std=1e-2,
     truncate_base_to_domain=True,
+    reflect_parameters=None,
 ):
     """Factory constructing a ``GroupMixtureFlowModel`` bound to a specific group.
 
@@ -1021,6 +1126,16 @@ def make_group_mixture_flow(
         and removes the importance-weight bias from base-flow mass leaking into
         neighbouring tiles. Default ``True``; a no-op (with an info log) when
         no fundamental-domain predicate is available.
+    reflect_parameters : list of str, optional
+        Prime-space coordinate names (a subset of ``param_names``) whose
+        fundamental domain is bounded by a hard wall at 0 -- e.g. the
+        ``x, y, z >= 0`` octant faces of a detector-frame sky decomposition.
+        The base flow then models the sign-symmetric extension
+        ``q0_sym(u) = sum_s q0(s . u)`` over the ``2**m`` sign patterns of
+        these dims (so it never has to represent the wall cliff), the
+        per-element standardisation of these dims is pinned to mean 0 / RMS
+        scale, and a generative draw is folded back with ``abs``. Only
+        supported on the ``prime_space_action`` path. Default: no reflection.
 
     Notes
     -----
@@ -1041,6 +1156,9 @@ def make_group_mixture_flow(
     CustomGroupMixtureFlowModel.min_canon_std = min_canon_std
     CustomGroupMixtureFlowModel.truncate_base_to_domain = (
         truncate_base_to_domain
+    )
+    CustomGroupMixtureFlowModel.reflect_parameters = (
+        list(reflect_parameters) if reflect_parameters else None
     )
     if in_fundamental_domain is not None:
         CustomGroupMixtureFlowModel.in_fundamental_domain = staticmethod(
