@@ -538,8 +538,15 @@ def test_sample_and_log_prob_floored_at_single_branch(base_flow):
     x, log_q = w.sample_and_log_prob(4000)
 
     # The non-injective action forces the single-branch shortcut to fall back
-    # for a sizeable fraction of the batch; that fraction is recorded.
-    assert 0.0 < w._last_fallback_fraction <= 1.0
+    # for a sizeable fraction of the batch; that fraction is recorded, split
+    # into its two disjoint causes.
+    assert 0.0 < w._last_leakage_fraction <= 1.0
+    assert w._last_leakage_fraction == pytest.approx(
+        w._last_leakage_fraction_domain + w._last_leakage_fraction_roundtrip
+    )
+    # ``canon`` routinely leaks past the domain here; the clamp is the
+    # identity inside it, so that leak is what drives the fallback.
+    assert w._last_leakage_fraction_domain > 0.0
 
     # Every draw keeps a finite log q, floored at the single-branch value so it
     # is never a downward spike below what log_prob gives.
@@ -550,6 +557,92 @@ def test_sample_and_log_prob_floored_at_single_branch(base_flow):
     # Where the full-mixture recompute is well behaved (the majority) the two
     # still agree; only the degenerate minority is lifted above it.
     assert (log_q <= honest + 1e-3).float().mean() > 0.5
+
+
+def test_truncate_base_to_domain_requires_predicate(base_flow):
+    """``truncate_base_to_domain`` is meaningless without a domain predicate."""
+    with pytest.raises(ValueError, match="fundamental-domain predicate"):
+        DiscreteGroupMixtureFlowWrapper(
+            base_flow=base_flow,
+            num_features=2,
+            group_action_fn=shift_group_action,
+            group_size=GROUP_SIZE,
+            param_names=PARAM_NAMES,
+            truncate_base_to_domain=True,
+        )
+
+
+def test_truncate_base_to_domain_normalises_and_is_consistent(base_flow):
+    """Rejecting out-of-domain draws makes the single-branch density exact.
+
+    The base flow is untrained (~unit normal) while the fundamental domain is
+    ``x in [0, 1)``, so a large fraction of canonical draws leak out. With
+    ``truncate_base_to_domain`` those are rejected, ``log Z`` is estimated from
+    the acceptance rate, and every surviving sample lands in the domain.
+    """
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=PARAM_NAMES,
+        in_fundamental_domain=in_fundamental_domain,
+        truncate_base_to_domain=True,
+    )
+    w.eval()
+
+    torch.manual_seed(0)
+    x, log_q = w.sample_and_log_prob(2000)
+
+    # Every returned sample's canonical representative is in the domain.
+    _, _, claimed = w._assign_branch(x)
+    assert claimed.all()
+    assert x.shape[0] == 2000
+
+    # log Z was estimated from the rejection rate; real leakage -> Z < 1.
+    assert w._domain_mass_seen
+    assert w._log_domain_mass.item() < -0.05
+
+    # The estimate matches the empirical base-flow mass in the domain.
+    torch.manual_seed(1)
+    u = w.base_flow.sample(20000)
+    modes = torch.zeros(20000, dtype=torch.long)
+    canon = w._destandardise(u, modes)
+    emp = w._in_domain(canon).float().mean().item()
+    assert w._log_domain_mass.exp().item() == pytest.approx(emp, abs=0.05)
+
+    # sample_and_log_prob agrees with log_prob on its own draws, and the
+    # -log Z offset is applied consistently to both paths.
+    lp = w.log_prob(x)
+    assert torch.std(log_q - lp).item() < 1e-3
+    assert torch.allclose(lp, w._raw_log_prob(x) - w._log_domain_mass)
+
+    # No residual leakage flagged inside the scored (already-filtered) batch.
+    assert w._last_leakage_fraction == 0.0
+
+
+def test_truncate_base_to_domain_shifts_log_prob_by_log_z(base_flow):
+    """``log_prob`` with truncation is the raw mixture density minus ``log Z``."""
+    common = dict(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=PARAM_NAMES,
+        in_fundamental_domain=in_fundamental_domain,
+    )
+    plain = DiscreteGroupMixtureFlowWrapper(**common)
+    trunc = DiscreteGroupMixtureFlowWrapper(
+        **common, truncate_base_to_domain=True
+    )
+    plain.eval()
+    trunc.eval()
+    trunc._log_domain_mass.fill_(-1.1)
+    trunc._domain_mass_seen = True
+
+    rng = np.random.default_rng(0)
+    x = points_in_element(0, 64, rng)
+    assert torch.allclose(trunc.log_prob(x), plain.log_prob(x) + 1.1, atol=1e-5)
 
 
 def test_min_canon_std_plumbed_through_factory():
