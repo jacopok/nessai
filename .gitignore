@@ -145,3 +145,7 @@ autoapi/
 # Offline group-mixture flow inspection: copied flow states, resume pickles,
 # figures and ad-hoc analysis scripts used to debug the ET-triangle runs.
 group_flow_inspection/
+
+# Group-mixture truncation experiment: analytic boundary-periodic study
+# (scripts, nested-sampling output, figures) validating truncate_base_to_domain.
+group_mixture_truncation_experiment/
