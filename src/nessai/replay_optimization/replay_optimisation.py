@@ -775,7 +775,20 @@ def run_looks_like_gw(run: ArchivedRun) -> bool:
 # a correctness problem.
 
 
-ET_GROUP_ACTED_PARAMETERS = ("ra", "sin_dec", "cos_theta_jn", "psi", "phase")
+# The parameters ``ETTriangleGroupAction`` acts on.  Kept in sync with
+# ``nessai_gw.group_mixture.ET_TRIANGLE_PARAMETERS`` (the quarter-turn sky
+# rotation also carries ``geocent_time`` along the change in the
+# geocenter-to-detector light-travel delay).  ``make_group_proposal_class``
+# takes the authoritative list straight off the action instance and only
+# falls back to this when checking coordinate availability.
+ET_GROUP_ACTED_PARAMETERS = (
+    "ra",
+    "sin_dec",
+    "cos_theta_jn",
+    "psi",
+    "phase",
+    "geocent_time",
+)
 
 
 def _group_reparameterisations(names) -> dict:
@@ -850,24 +863,26 @@ def _reference_time_from_run(run: ArchivedRun) -> float:
 class _PassthroughGroupAction:
     """Adapt an :class:`ETTriangleGroupAction` to the full parameter vector.
 
-    The ET group action is defined on ``(ra, sin_dec, cos_theta_jn, psi,
-    phase)`` (the run is put in that frame by ``_to_group_frame``); the flow
-    sees every sampled parameter.  This wrapper feeds the acted-on subset
-    through and leaves the rest (masses, spins, distance, time) untouched.
+    The ET group action is defined on ``acted`` (``action.parameters``, i.e.
+    ``(ra, sin_dec, cos_theta_jn, psi, phase, geocent_time)``; the run is put
+    in that frame by ``_to_group_frame``); the flow sees every sampled
+    parameter.  This wrapper feeds the acted-on subset through and leaves the
+    rest (masses, spins, distance) untouched.
     """
 
-    def __init__(self, action, names):
+    def __init__(self, action, names, acted):
         self._action = action
         self._names = list(names)
+        self._acted = list(acted)
 
     def __call__(self, point_dict, modes, inverse: bool = False) -> dict:
-        sub = {k: point_dict[k] for k in ET_GROUP_ACTED_PARAMETERS}
+        sub = {k: point_dict[k] for k in self._acted}
         mapped = self._action(sub, modes, inverse=inverse)
         return {n: mapped.get(n, point_dict[n]) for n in self._names}
 
     def in_fundamental_domain(self, point_dict):
         return self._action.in_fundamental_domain(
-            {k: point_dict[k] for k in ET_GROUP_ACTED_PARAMETERS}
+            {k: point_dict[k] for k in self._acted}
         )
 
 
@@ -879,7 +894,11 @@ def make_group_proposal_class(run: ArchivedRun):
         make_group_mixture_flow,
     )
 
-    missing = sorted(set(ET_GROUP_ACTED_PARAMETERS) - set(run.names))
+    action = ETTriangleGroupAction(
+        reference_time=_reference_time_from_run(run)
+    )
+    acted = list(getattr(action, "parameters", ET_GROUP_ACTED_PARAMETERS))
+    missing = sorted(set(acted) - set(run.names))
     if missing:
         raise RuntimeError(
             f"The run is missing {missing}, which the ET group action needs. "
@@ -887,10 +906,7 @@ def make_group_proposal_class(run: ArchivedRun):
             "BNS/BBH run with the standard extrinsic parameters."
         )
 
-    action = ETTriangleGroupAction(
-        reference_time=_reference_time_from_run(run)
-    )
-    passthrough = _PassthroughGroupAction(action, run.names)
+    passthrough = _PassthroughGroupAction(action, run.names, acted)
     flow_model_cls = make_group_mixture_flow(
         group_action_fn=passthrough,
         group_size=action.group_size,
