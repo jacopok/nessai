@@ -204,6 +204,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         min_canon_std=1e-2,
         truncate_base_to_domain=True,
         reflect_parameters=None,
+        canonical_transform=None,
     ):
         super().__init__()
         self.base_flow = base_flow
@@ -251,6 +252,28 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         self._reflect_idx = torch.empty(0, dtype=torch.long)
         self.register_buffer("_sign_patterns", None)
         self._configure_reflection()
+
+        # Optional fixed analytic bijection between the wrapper's *canonical*
+        # prime coordinates and the coordinates the base flow actually models
+        # (``t``). Dimension-preserving. Used to reshape a hard canonical
+        # geometry -- e.g. a uniform sky octant with a sharp prior edge -- into
+        # something closer to the base flow's Gaussian latent before the
+        # per-element standardisation is applied. Contract:
+        #   forward(canon) -> (t,    log|det dt/dcanon|)   [N, d], [N]
+        #   inverse(t)     -> (canon, log|det dcanon/dt|)  [N, d], [N]
+        # The transform sits *inside* the canonical fundamental domain, so the
+        # group action, domain predicate and conjugation Jacobians are all
+        # unaffected; only ``prime_space_action`` runs are supported.
+        self._canonical_transform = canonical_transform
+        if canonical_transform is not None and prime_space_action is None:
+            raise ValueError(
+                "canonical_transform is only supported on the "
+                "prime_space_action path."
+            )
+        if canonical_transform is not None and hasattr(
+            canonical_transform, "bind"
+        ):
+            canonical_transform.bind(self.param_names)
 
         # Coordinate bridge; defaults to the identity affine map so the
         # wrapper is usable without a proposal (e.g. in unit tests).
@@ -369,6 +392,10 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         reparameterisation's true order) and refresh reflection indices."""
         self.param_names = list(names)
         self._configure_reflection()
+        if self._canonical_transform is not None and hasattr(
+            self._canonical_transform, "bind"
+        ):
+            self._canonical_transform.bind(self.param_names)
 
     def set_coordinate_bridge(self, bridge):
         """Install a :class:`CoordinateBridge`.
@@ -420,6 +447,18 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         prime, _ = self._bridge.to_prime(x)
         return prime
 
+    def _to_base(self, canon):
+        """Canonical prime coords -> base-flow coords ``t`` and ``log|dt/dcanon|``."""
+        if self._canonical_transform is None:
+            return canon, canon.new_zeros(canon.shape[0])
+        return self._canonical_transform.forward(canon)
+
+    def _from_base(self, t):
+        """Base-flow coords ``t`` -> canonical prime coords and ``log|dcanon/dt|``."""
+        if self._canonical_transform is None:
+            return t, t.new_zeros(t.shape[0])
+        return self._canonical_transform.inverse(t)
+
     def _standardise(self, canon, modes):
         return (canon - self._canon_mean[modes]) / self._canon_std[modes]
 
@@ -452,16 +491,21 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         2**m sign patterns -- the density on the positive orthant whose
         sign-symmetric extension is the base flow (unit-normalised, no extra
         constant; the ``_canon_log_det`` term is added by the caller as usual).
+
+        A ``canonical_transform`` (if set) is applied first: ``canon -> t`` with
+        its ``log|det dt/dcanon|`` folded into the return value, and the
+        standardisation / reflection then act on ``t``.
         """
-        u = self._standardise(canon, modes)
+        t, log_j = self._to_base(canon)
+        u = self._standardise(t, modes)
         if self._sign_patterns is None:
-            return self.base_flow.log_prob(u, context=context)
+            return self.base_flow.log_prob(u, context=context) + log_j
         p = self._sign_patterns.shape[0]
         n, f = u.shape
         signs = self._sign_patterns.to(u.dtype)
         u_rep = (u.unsqueeze(0) * signs.unsqueeze(1)).reshape(p * n, f)
         lp = self.base_flow.log_prob(u_rep, context=context).view(p, n)
-        return torch.logsumexp(lp, dim=0)
+        return torch.logsumexp(lp, dim=0) + log_j
 
     def _apply_group_action(self, z_flat, modes_flat, inverse):
         """Apply the conjugated action to prime points.
@@ -576,6 +620,9 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         b = x.shape[0]
         assigned, pre, claimed = self._assign_branch(x)
         canon = pre[assigned, torch.arange(b, device=x.device)]
+        # The base flow (hence the standardisation buffers and the reflect
+        # walls) lives in the transformed frame ``t``, not raw ``canon``.
+        canon, _ = self._to_base(canon)
 
         def _pin_reflect(mean, std, data):
             # Reflect dims are symmetrised about their wall at 0, so the
@@ -827,7 +874,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             return self._sample_and_log_prob_truncated(num_samples, context)
         u = self.base_flow.sample(num_samples, context=context)
         modes = Categorical(probs=self.weights).sample((num_samples,))
-        canon = self._fold_reflect(self._destandardise(u, modes))
+        t = self._fold_reflect(self._destandardise(u, modes))
+        canon, _ = self._from_base(t)
         x, fwd_logdet = self._apply_group_action(
             canon, modes, inverse=False
         )
@@ -862,7 +910,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             n_draw = int(math.ceil(need / z_guess * 1.3)) + 32
             u = self.base_flow.sample(n_draw, context=context)
             modes = Categorical(probs=self.weights).sample((n_draw,))
-            canon = self._fold_reflect(self._destandardise(u, modes))
+            t = self._fold_reflect(self._destandardise(u, modes))
+            canon, _ = self._from_base(t)
             in_dom = self._in_domain(canon)
             n_drawn_tot += n_draw
             n_kept_tot += int(in_dom.sum())
@@ -912,8 +961,9 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         """
         assigned, pre, _ = self._assign_branch(x)
         canon = pre[assigned, torch.arange(x.shape[0], device=x.device)]
+        t, _ = self._to_base(canon)
         return self.base_flow.forward(
-            self._standardise(canon, assigned), context=context
+            self._standardise(t, assigned), context=context
         )
 
     def inverse(self, z, context=None):
@@ -926,7 +976,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         modes = Categorical(probs=self.weights).sample((z.shape[0],))
 
         u, _ = self.base_flow.inverse(z, context=context)
-        canon = self._fold_reflect(self._destandardise(u, modes))
+        t = self._fold_reflect(self._destandardise(u, modes))
+        canon, _ = self._from_base(t)
         x, fwd_logdet = self._apply_group_action(
             canon, modes, inverse=False
         )
@@ -983,6 +1034,7 @@ class GroupMixtureFlowModel(FlowModel):
     min_canon_std = 1e-2
     truncate_base_to_domain = True
     reflect_parameters = None
+    canonical_transform = None
 
     def initialise(self):
         """Initialise the model and optimiser via :meth:`get_model`."""
@@ -1041,6 +1093,10 @@ class GroupMixtureFlowModel(FlowModel):
         reflect_parameters = config_clean.pop(
             "reflect_parameters", getattr(self, "reflect_parameters", None)
         )
+        canonical_transform = config_clean.pop(
+            "canonical_transform",
+            getattr(self, "canonical_transform", None),
+        )
 
         if group_action_fn is None or group_size is None:
             raise ValueError(
@@ -1063,6 +1119,7 @@ class GroupMixtureFlowModel(FlowModel):
             min_canon_std=min_canon_std,
             truncate_base_to_domain=truncate_base_to_domain,
             reflect_parameters=reflect_parameters,
+            canonical_transform=canonical_transform,
         )
 
 
@@ -1076,6 +1133,7 @@ def make_group_mixture_flow(
     min_canon_std=1e-2,
     truncate_base_to_domain=True,
     reflect_parameters=None,
+    canonical_transform=None,
 ):
     """Factory constructing a ``GroupMixtureFlowModel`` bound to a specific group.
 
@@ -1136,6 +1194,16 @@ def make_group_mixture_flow(
         per-element standardisation of these dims is pinned to mean 0 / RMS
         scale, and a generative draw is folded back with ``abs``. Only
         supported on the ``prime_space_action`` path. Default: no reflection.
+    canonical_transform : object, optional
+        Fixed analytic bijection between the canonical prime coordinates and
+        the coordinates the base flow models (dimension-preserving), exposing
+        ``forward(canon) -> (t, log|det dt/dcanon|)``,
+        ``inverse(t) -> (canon, log|det dcanon/dt|)`` (batched torch) and an
+        optional ``bind(param_names)``. Applied inside the fundamental domain,
+        so the group action and domain predicate are untouched; use it to turn
+        a hard canonical geometry (a uniform sky octant with a sharp prior
+        edge) into a near-Gaussian frame before standardisation. Only
+        supported on the ``prime_space_action`` path. Default: identity.
 
     Notes
     -----
@@ -1160,6 +1228,7 @@ def make_group_mixture_flow(
     CustomGroupMixtureFlowModel.reflect_parameters = (
         list(reflect_parameters) if reflect_parameters else None
     )
+    CustomGroupMixtureFlowModel.canonical_transform = canonical_transform
     if in_fundamental_domain is not None:
         CustomGroupMixtureFlowModel.in_fundamental_domain = staticmethod(
             in_fundamental_domain

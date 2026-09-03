@@ -891,3 +891,116 @@ def test_reflect_standardisation_pinned_and_samples_in_domain(base_flow):
     assert (log_q >= honest - 1e-3).all()
 
 
+# --------------------------------------------------------------------------
+# canonical_transform
+
+
+class _SinhTransform:
+    """Toy canonical transform: ``t0 = sinh(canon0)`` on the first dim only."""
+
+    def __init__(self):
+        self.idx = 0
+
+    def bind(self, param_names):
+        self.idx = 0
+
+    def forward(self, canon):
+        t = canon.clone()
+        c = canon[:, self.idx]
+        t[:, self.idx] = torch.sinh(c)
+        # log|dt0/dcanon0| = log cosh(canon0)
+        return t, torch.log(torch.cosh(c))
+
+    def inverse(self, t):
+        canon = t.clone()
+        v = t[:, self.idx]
+        canon[:, self.idx] = torch.asinh(v)
+        # log|dcanon0/dt0| = -0.5 log(1 + t0**2)
+        return canon, -0.5 * torch.log1p(v * v)
+
+
+def _ct_wrapper(base_flow, transform):
+    def reflect(d, m, inverse=False):
+        sign = torch.where(m == 1, -1.0, 1.0).to(d["x"].dtype)
+        return {"x": d["x"] * sign, "y": d["y"]}, torch.zeros_like(d["x"])
+
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=None,
+        group_size=2,
+        param_names=["x", "y"],
+        prime_space_action=reflect,
+        prime_space_in_domain=lambda d: d["x"] >= 0.0,
+        canonical_transform=transform,
+    )
+    w.eval()
+    return w
+
+
+def test_canonical_transform_requires_prime_space(base_flow):
+    with pytest.raises(ValueError, match="prime_space_action"):
+        DiscreteGroupMixtureFlowWrapper(
+            base_flow=base_flow,
+            num_features=2,
+            group_action_fn=shift_group_action,
+            group_size=GROUP_SIZE,
+            param_names=PARAM_NAMES,
+            in_fundamental_domain=in_fundamental_domain,
+            canonical_transform=_SinhTransform(),
+        )
+
+
+def test_canonical_transform_roundtrip_and_jacobian():
+    t = _SinhTransform()
+    canon = torch.linspace(-1.5, 1.5, 20).unsqueeze(1)
+    canon = torch.cat([canon, torch.zeros_like(canon)], dim=1)
+    base, ljf = t.forward(canon)
+    back, lji = t.inverse(base)
+    assert torch.allclose(back, canon, atol=1e-5)
+    assert torch.allclose(ljf, -lji, atol=1e-5)
+    # forward log-Jacobian vs finite difference
+    eps = 1e-4
+    d = (
+        torch.sinh(canon[:, 0] + eps) - torch.sinh(canon[:, 0] - eps)
+    ) / (2 * eps)
+    assert torch.allclose(ljf, torch.log(d.abs()), atol=1e-3)
+
+
+def test_canonical_transform_identity_matches_no_transform(base_flow, rng):
+    class _Id:
+        def bind(self, names):
+            pass
+
+        def forward(self, c):
+            return c, c.new_zeros(c.shape[0])
+
+        def inverse(self, t):
+            return t, t.new_zeros(t.shape[0])
+
+    x = points_in_element(0, 16, rng)
+    torch.manual_seed(0)
+    w_none = _ct_wrapper(base_flow, None)
+    lp_none = w_none.log_prob(x)
+    w_id = _ct_wrapper(base_flow, _Id())
+    lp_id = w_id.log_prob(x)
+    assert torch.allclose(lp_none, lp_id, atol=1e-6)
+
+
+def test_canonical_transform_sample_and_log_prob_consistent(base_flow):
+    w = _ct_wrapper(base_flow, _SinhTransform())
+    torch.manual_seed(0)
+    x, log_q = w.sample_and_log_prob(64)
+    assert x.shape == (64, 2)
+    honest = w.log_prob(x)
+    assert torch.isfinite(log_q).all()
+    assert (log_q >= honest - 1e-4).all()
+
+    z = torch.randn(64, 2)
+    x2, log_j = w.inverse(z)
+    log_q2 = w.base_flow.base_distribution_log_prob(z) - log_j
+    finite = torch.isfinite(log_q2)
+    assert finite.any()
+    assert (log_q2[finite] >= w.log_prob(x2)[finite] - 1e-4).all()
+
+
