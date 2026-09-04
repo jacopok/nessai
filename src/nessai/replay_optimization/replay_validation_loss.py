@@ -3,6 +3,16 @@
 Optimise nessai's flow and training settings by *replaying* a finished nested
 sampling run, without ever calling the likelihood again.
 
+This variant of ``replay_optimisation.py`` collapses the optimisation to a
+**single** cost function: the flow's minimum validation loss (validation NLL),
+aggregated across checkpoints with a soft-max (:func:`_val_loss_softmax`) so the
+worst checkpoint dominates without the aggregate being decided by it alone.
+Optuna runs single-objective and *minimises* it.  Everything else -- the replay
+mechanics, the archived-run reconstruction, the plateau-stopped burst trainer,
+the ``--group`` ET-triangle mixture -- is unchanged from the multi-objective
+script; the coverage / support-mass / insertion-index machinery is simply not
+scored here.
+
 Motivation
 ----------
 A finished run is a complete record of what the sampler had to model: at every
@@ -156,7 +166,7 @@ from nessai.proposal.flowproposal import FlowProposal
 from nessai.utils.indices import compute_indices_ks_test
 from nessai.utils.threading import configure_threads
 
-logger = logging.getLogger("replay_optimisation")
+logger = logging.getLogger("replay_validation_loss")
 
 # --------------------------------------------------------------------------
 # Configuration -- the run being replayed is passed in via ``--result`` (and,
@@ -164,15 +174,29 @@ logger = logging.getLogger("replay_optimisation")
 # else generic to the optimisation lives here.
 # --------------------------------------------------------------------------
 
-STUDY_NAME = "nessai-replay"
-STORAGE = "sqlite:///nessai_replay.sqlite3"
+STUDY_NAME = "nessai-replay-valloss"
+STORAGE = "sqlite:///nessai_replay_valloss.sqlite3"
 # Separate study/storage for the ET-triangle group-mixture proposal
 # (``--group``): the flow is wrapped in a discrete 16-element symmetry mixture
 # with its own (triangular_group_reparameterisations) prime space, so its
 # trials are not comparable with the plain GW-reparameterised latent-ball runs.
-GROUP_STUDY_NAME = "nessai-replay-group"
-GROUP_STORAGE = "sqlite:///nessai_replay_group.sqlite3"
+GROUP_STUDY_NAME = "nessai-replay-group-valloss"
+GROUP_STORAGE = "sqlite:///nessai_replay_group_valloss.sqlite3"
 N_TRIALS = 2000
+
+# Soft-max (in nat units) that aggregates the per-checkpoint minimum validation
+# loss into the single cost:
+#
+#     softmax_b(v) = 1/b * log( mean_i exp(b * v_i) )
+#
+# -> ``max(v)`` as ``b -> inf`` and ``mean(v)`` as ``b -> 0``.  ``b = 2`` leans
+# towards the worst (deepest) checkpoint without being decided by it.
+VAL_LOSS_SOFTMAX_BETA = 2.0
+
+# Cost returned for a configuration that cannot be scored at some checkpoint
+# (:class:`ConfigRejected` -- e.g. the first-checkpoint divergence probe). Far
+# above any real validation NLL, so Optuna learns to avoid the region.
+REJECT_VAL_LOSS = 1.0e6
 
 
 def _make_storage(storage: str = STORAGE) -> optuna.storages.RDBStorage:
@@ -1092,6 +1116,16 @@ def _install_staged_training(proposal) -> None:
                     break
         proposal._replay_train_epochs = len(train_hist)
         proposal._replay_train_stop = stop_reason
+        # The single cost function: the lowest validation NLL this burst
+        # reached (falls back to the training NLL if validation was all-NaN).
+        val_series = np.asarray(val_hist, dtype=float)
+        if not np.isfinite(val_series).any():
+            val_series = np.asarray(train_hist, dtype=float)
+        proposal._replay_val_min = (
+            float(np.nanmin(val_series))
+            if np.isfinite(val_series).any()
+            else float("nan")
+        )
         return {"loss": train_hist, "val_loss": val_hist}
 
     proposal.flow.train = staged
@@ -1161,62 +1195,22 @@ def evaluate_checkpoint(
     proposal,
     rng: np.random.Generator,
 ) -> dict:
-    """Retrain ``proposal`` on the live set at ``iteration`` and score it.
+    """Retrain ``proposal`` on the live set at ``iteration`` and record the
+    flow's minimum validation loss.
 
     ``proposal`` is the per-trial object from :func:`_build_trial_proposal`;
     calling ``train`` again warm-starts the flow from the previous checkpoint.
+    Only training is done here -- the coverage / support-mass / insertion-index
+    scoring of the multi-objective script is not needed for the single cost.
     """
     indices = run.live_indices(iteration)
-    # indices are sorted, so the first is the worst point -- the one the
-    # sampler is about to replace.  It defines the likelihood threshold and
-    # must stay in the training set, exactly as in a real run.
-    worst = indices[:1]
-    rest = indices[1:]
-
-    n_heldout = int(round(HELDOUT_FRACTION * len(indices)))
-    shuffled = rng.permutation(rest)
-    heldout_idx = np.sort(shuffled[:n_heldout])
-    train_idx = np.sort(np.concatenate([worst, shuffled[n_heldout:]]))
-
-    x_train = run.live_points(train_idx, model)
-    x_heldout = run.live_points(heldout_idx, model)
-    worst_point = run.live_points(worst, model)
+    # Train on the full live set, exactly as a real run does; nessai holds out
+    # its own ``val_size`` fraction internally for the validation NLL.
+    x_train = run.live_points(np.sort(indices), model)
 
     start = time.perf_counter()
     proposal.train(x_train, plot=False)
     train_time = time.perf_counter() - start
-    n_train_epochs = int(getattr(proposal, "_replay_train_epochs", -1))
-    train_stop = str(getattr(proposal, "_replay_train_stop", "?"))
-    probe_drop = float(getattr(proposal, "_replay_probe_drop", float("nan")))
-
-    proposal.truncation.prepare(proposal, worst_point)
-
-    # --- fidelity: the insertion indices the proposal would produce ---------
-    inside = _coverage_mask(proposal, x_heldout)
-    coverage = float(np.mean(inside))
-    if coverage <= 0:
-        raise ConfigRejected(
-            f"Flow covers no live points at iteration {iteration}"
-        )
-
-    live_logl = np.sort(run.log_likelihood[indices])
-    # Matches NestedSampler.insert_live_point, which subtracts one so that
-    # index 0 is reachable.
-    insertion_indices = (
-        np.searchsorted(live_logl, run.log_likelihood[heldout_idx][inside]) - 1
-    )
-    insertion_indices = np.clip(insertion_indices, 0, run.nlive - 1)
-
-    # --- cost: likelihood calls the sampler would need per iteration --------
-    support = _support_statistics(proposal, rng)
-    log_ratio = (
-        support["log_support_mass"]
-        - run.log_volume(iteration)
-        - np.log(coverage)
-    )
-    likelihood_calls = float(np.exp(log_ratio))
-
-    ks_d, ks_p = compute_indices_ks_test(insertion_indices, run.nlive)
 
     n_params = sum(
         p.numel() for p in proposal.flow.model.parameters() if p.requires_grad
@@ -1224,29 +1218,26 @@ def evaluate_checkpoint(
 
     return dict(
         iteration=int(iteration),
-        insertion_indices=insertion_indices,
-        coverage=coverage,
-        likelihood_calls_per_iteration=likelihood_calls,
-        ks_statistic=float(ks_d) if ks_d is not None else float("nan"),
-        ks_p_value=float(ks_p) if ks_p is not None else float("nan"),
+        val_loss_min=float(getattr(proposal, "_replay_val_min", float("nan"))),
         train_time=train_time,
-        n_train_epochs=n_train_epochs,
-        train_stop=train_stop,
-        probe_drop=probe_drop,
+        n_train_epochs=int(getattr(proposal, "_replay_train_epochs", -1)),
+        train_stop=str(getattr(proposal, "_replay_train_stop", "?")),
+        probe_drop=float(getattr(proposal, "_replay_probe_drop", float("nan"))),
         n_flow_parameters=int(n_params),
-        **support,
     )
 
 
-def _log10_ess_softmin(ess_values: np.ndarray) -> float:
-    """Smooth minimum of ``log10(ESS)`` over checkpoints (see ESS_SOFTMIN_BETA).
+def _val_loss_softmax(val_losses: np.ndarray) -> float:
+    """Smooth maximum of the per-checkpoint validation loss (see
+    VAL_LOSS_SOFTMAX_BETA).
 
-    ``-1/b * log(mean_i exp(-b * log10 ESS_i))``: between ``min`` and ``mean`` of
-    the per-checkpoint ``log10(ESS)``, leaning towards the worst checkpoint.
+    ``1/b * log(mean_i exp(b * v_i))``: between ``max`` and ``mean`` of the
+    per-checkpoint minimum validation NLL, leaning towards the worst (deepest)
+    checkpoint.
     """
-    v = np.log10(np.asarray(ess_values, dtype=float))
-    b = ESS_SOFTMIN_BETA
-    return float(-(logsumexp(-b * v) - np.log(len(v))) / b)
+    v = np.asarray(val_losses, dtype=float)
+    b = VAL_LOSS_SOFTMAX_BETA
+    return float((logsumexp(b * v) - np.log(len(v))) / b)
 
 
 def evaluate_config(
@@ -1265,13 +1256,11 @@ def evaluate_config(
     One flow is built for the trial (:func:`_build_trial_proposal`) and
     retrained at each checkpoint, visited in iteration order (shallow to deep)
     so the flow warm-starts from the previous checkpoint -- the same trajectory
-    a real run's flow follows.  The objective is the *mean* over checkpoints:
-    the worst checkpoints are meant to dominate, because a real run must pass
-    through every iteration and its cost is set by where the flow struggles
-    most.  A :class:`ConfigRejected` from any checkpoint (empty support, no
-    coverage, all-invalid weights) stops the sweep and the summary comes back
-    flagged ``rejected`` with the worst-case objective sentinels (see
-    :func:`make_objective`).
+    a real run's flow follows.  The single cost is the soft-max over checkpoints
+    of the flow's minimum validation loss (:func:`_val_loss_softmax`).  A
+    :class:`ConfigRejected` from any checkpoint (the first-checkpoint divergence
+    probe) stops the sweep and the summary comes back flagged ``rejected`` with
+    the sentinel cost :data:`REJECT_VAL_LOSS` (see :func:`make_objective`).
     """
     rng = np.random.default_rng(seed)
     results = []
@@ -1298,68 +1287,36 @@ def evaluate_config(
                     reject_reason=str(exc),
                     reject_iteration=int(iteration),
                     n_checkpoints_evaluated=len(results),
-                    ks_statistic=float("nan"),
-                    ks_p_value=REJECT_KS_P_VALUE,
-                    likelihood_calls_per_iteration=float(
-                        10.0 ** REJECT_LOG10_LIKELIHOOD_CALLS
-                    ),
-                    effective_sample_size_min=float(
-                        min(
-                            [r["effective_sample_size"] for r in results],
-                            default=0.0,
+                    val_loss_softmax=REJECT_VAL_LOSS,
+                    val_loss_max=float(
+                        max(
+                            [r["val_loss_min"] for r in results],
+                            default=REJECT_VAL_LOSS,
                         )
                     ),
-                    log10_ess_softmin=REJECT_LOG10_ESS_SOFTMIN,
                 )
             results.append(result)
             logger.info(
-                "  trial=%s it=%-7d coverage=%.3f  KS D=%.4f  "
-                "log10 L-calls/it=%.2f  ESS=%.1f  train=%.1fs (%dep, %s)",
+                "  trial=%s it=%-7d val_loss_min=%.3f  train=%.1fs (%dep, %s)",
                 "?" if trial is None else trial.number,
                 result["iteration"],
-                result["coverage"],
-                result["ks_statistic"],
-                np.log10(result["likelihood_calls_per_iteration"]),
-                result["effective_sample_size"],
+                result["val_loss_min"],
                 result["train_time"],
                 result["n_train_epochs"],
                 result["train_stop"],
             )
             if trial is not None:
                 trial.set_user_attr(
-                    f"checkpoint_{iteration}",
-                    {
-                        k: v
-                        for k, v in result.items()
-                        if k != "insertion_indices"
-                    },
+                    f"checkpoint_{iteration}", dict(result)
                 )
 
-    # Pooling the indices mirrors the final (non-rolling) KS test, which is
-    # the one that failed for this run.
-    pooled = np.concatenate([r["insertion_indices"] for r in results])
-    ks_d, ks_p = compute_indices_ks_test(pooled, run.nlive)
-
-    calls = np.array(
-        [r["likelihood_calls_per_iteration"] for r in results], dtype=float
-    )
+    val_losses = [r["val_loss_min"] for r in results]
     return dict(
-        ks_statistic=float(ks_d),
-        ks_p_value=float(ks_p),
-        # The mean is the right estimator of the total: checkpoints are
-        # uniformly spaced in log prior volume, so each stands for an equal
-        # slice of the run.
-        likelihood_calls_per_iteration=float(np.mean(calls)),
-        likelihood_calls_median=float(np.median(calls)),
-        likelihood_calls_max=float(np.max(calls)),
-        coverage=float(np.mean([r["coverage"] for r in results])),
-        effective_sample_size_min=float(
-            np.min([r["effective_sample_size"] for r in results])
-        ),
-        # Objective 3: smooth minimum of log10(ESS) across checkpoints.
-        log10_ess_softmin=_log10_ess_softmin(
-            [r["effective_sample_size"] for r in results]
-        ),
+        # The single cost: soft-max over checkpoints of the minimum val loss.
+        val_loss_softmax=_val_loss_softmax(val_losses),
+        val_loss_mean=float(np.mean(val_losses)),
+        val_loss_max=float(np.max(val_losses)),
+        val_loss_per_checkpoint=[float(v) for v in val_losses],
         train_time=float(np.sum([r["train_time"] for r in results])),
         n_flow_parameters=int(results[0]["n_flow_parameters"]),
         n_checkpoints=len(results),
@@ -1565,41 +1522,23 @@ def make_objective(
             trial.set_user_attr(key, value)
         if summary.get("rejected"):
             logger.info(
-                "Trial %s: REJECTED at it=%s (%s) -> worst-case objectives "
-                "(%.3g, %.2f, %.2f)",
+                "Trial %s: REJECTED at it=%s (%s) -> cost %.3g",
                 trial.number,
                 summary.get("reject_iteration"),
                 summary.get("reject_reason"),
-                REJECT_KS_P_VALUE,
-                REJECT_LOG10_LIKELIHOOD_CALLS,
-                REJECT_LOG10_ESS_SOFTMIN,
+                REJECT_VAL_LOSS,
             )
-            return (
-                REJECT_KS_P_VALUE,
-                REJECT_LOG10_LIKELIHOOD_CALLS,
-                REJECT_LOG10_ESS_SOFTMIN,
-            )
-        log_likelihood_calls = float(
-            np.log10(summary["likelihood_calls_per_iteration"])
-        )
-        log10_ess_softmin = summary["log10_ess_softmin"]
+            return REJECT_VAL_LOSS
         logger.info(
-            "Trial %s: KS p=%.4g (D=%.4f), log10 L-calls/it=%.2f "
-            "(L-calls/it=%.2f), softmin log10 ESS=%.2f (ESS~%.0f), min ESS=%.1f",
+            "Trial %s: val_loss softmax=%.4f (mean=%.4f, max=%.4f) "
+            "per-checkpoint=%s",
             trial.number,
-            summary["ks_p_value"],
-            summary["ks_statistic"],
-            log_likelihood_calls,
-            summary["likelihood_calls_per_iteration"],
-            log10_ess_softmin,
-            10.0 ** log10_ess_softmin,
-            summary["effective_sample_size_min"],
+            summary["val_loss_softmax"],
+            summary["val_loss_mean"],
+            summary["val_loss_max"],
+            ["%.3f" % v for v in summary["val_loss_per_checkpoint"]],
         )
-        return (
-            summary["ks_p_value"],
-            log_likelihood_calls,
-            log10_ess_softmin,
-        )
+        return summary["val_loss_softmax"]
 
     return objective
 
@@ -1806,7 +1745,7 @@ def main():
     study = optuna.create_study(
         study_name=study_name,
         storage=_make_storage(storage),
-        directions=["maximize", "minimize", "maximize"],
+        direction="minimize",
         load_if_exists=True,
         sampler=_make_sampler(),
     )
@@ -1882,18 +1821,21 @@ def main():
         # `study` re-queries the shared storage on every access below, so it
         # already reflects what the workers wrote -- no need to reload it.
 
-    print(
-        "\nPareto-optimal trials "
-        "(KS p-value, log10 likelihood calls / it, softmin log10 ESS):"
-    )
-    for t in sorted(study.best_trials, key=lambda t: t.values[0], reverse=True):
+    complete = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+    ]
+    print("\nBest trials (softmax-over-checkpoints minimum validation loss):")
+    for t in sorted(complete, key=lambda t: t.value)[:10]:
+        vc = t.user_attrs.get("val_loss_per_checkpoint")
         print(
-            f"  trial {t.number:4d}  p={t.values[0]:.4g}  "
-            f"log10 calls/it={t.values[1]:6.2f}  "
-            f"(calls/it={10 ** t.values[1]:,.0f})  "
-            f"softmin log10 ESS={t.values[2]:5.2f} "
-            f"(ESS~{10 ** t.values[2]:,.0f})  {t.params}"
+            f"  trial {t.number:4d}  cost={t.value:.4f}  "
+            f"(mean={t.user_attrs.get('val_loss_mean', float('nan')):.4f}, "
+            f"max={t.user_attrs.get('val_loss_max', float('nan')):.4f})  "
+            f"{t.params}"
         )
+        if vc:
+            print(f"             per-checkpoint: {['%.3f' % v for v in vc]}")
 
 
 if __name__ == "__main__":
