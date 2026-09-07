@@ -356,7 +356,18 @@ FALLBACK_PROPOSAL_KWARGS = dict(
     max_radius=50.0,
     fallback_reparameterisation="zscore",
 )
-BASELINE_FLOW_CONFIG = dict(n_blocks=10, n_layers=4, n_neurons=48)
+BASELINE_FLOW_CONFIG = dict(
+    ftype="realnvp",
+    n_blocks=10,
+    n_layers=2,
+    n_neurons=96,
+    batch_norm_between_layers=True,
+    linear_transform="lu",
+)
+# ^ the winning config from the flow-size/batchnorm experiments (v13-size +
+# batchnorm), now in production (xg_inference launch_ET_Delta_*_v15_group.sh);
+# ~394k parameters.  Was ``dict(n_blocks=10, n_layers=4, n_neurons=48)``
+# (no batchnorm) before that round of experiments.
 # ``patience`` / ``annealing`` are absent on purpose: the plateau rule replaces
 # patience, and cosine annealing is incompatible with burst training (each burst
 # would restart the schedule -- see :func:`_install_staged_training`).
@@ -727,12 +738,18 @@ def _apply_proposal_overrides(
     *,
     names: list | None = None,
 ) -> dict:
-    """Overlay Optuna-suggested proposal/truncation settings onto the
-    archived run's fixed ``proposal_kwargs`` (see :func:`suggest_configs`).
+    """Overlay Optuna-suggested proposal settings onto the archived run's
+    fixed ``proposal_kwargs`` (see :func:`suggest_configs`).
 
-    ``overrides["latent_radius"]`` is merged, not substituted wholesale, so
-    that archived-config keys this module never searches over (``max_radius``,
-    ``min_radius``, ``compute_radius_with_all``) survive untouched.
+    ``overrides["latent_radius"]`` / ``overrides["latent_temperature"]`` are
+    only applied when present: this validation-loss objective only ever calls
+    ``proposal.train`` (see :func:`evaluate_checkpoint`), never ``populate``,
+    so the latent-ball truncation and sampling temperature have *zero* effect
+    on the score -- ``suggest_configs`` no longer searches over them, they are
+    pure noise dimensions for TPE.  ``overrides["latent_radius"]``, when given,
+    is merged rather than substituted wholesale, so that archived-config keys
+    this module never searches over (``max_radius``, ``min_radius``,
+    ``compute_radius_with_all``) survive untouched.
 
     ``overrides["flatten_distance_prior"]`` puts ``luminosity_distance`` on the
     power-law distance converter (power 2, i.e. uniform in Euclidean volume), so
@@ -740,20 +757,33 @@ def _apply_proposal_overrides(
     curvature the run's ``UniformSourceFrame`` prior otherwise leaves it.
     """
     kwargs = dict(proposal_kwargs)
-    kwargs["latent_temperature"] = overrides["latent_temperature"]
-    kwargs["truncation_methods"] = ["latent_radius"]
-    kwargs["truncation_kwargs"] = {
-        "latent_radius": {
-            **kwargs.get("truncation_kwargs", {}).get("latent_radius", {}),
-            **overrides["latent_radius"],
+    if "latent_temperature" in overrides:
+        kwargs["latent_temperature"] = overrides["latent_temperature"]
+    if "latent_radius" in overrides:
+        kwargs["truncation_methods"] = ["latent_radius"]
+        kwargs["truncation_kwargs"] = {
+            "latent_radius": {
+                **kwargs.get("truncation_kwargs", {}).get("latent_radius", {}),
+                **overrides["latent_radius"],
+            }
         }
-    }
     if overrides.get("flatten_distance_prior") and "luminosity_distance" in (
         names or []
     ):
         reparams = dict(kwargs.get("reparameterisations") or {})
         distance = dict(reparams.get("luminosity_distance") or {})
         distance.setdefault("reparameterisation", "distance")
+        # Explicit reparameterisations go through FlowProposal's generic
+        # spec-instantiation path (configure_reparameterisations ->
+        # instantiate_reparameterisation_from_spec), which only ever fills in
+        # `input_parameters`; GWReparamMixin's own default-reparameterisation
+        # path (used when nothing is given for a parameter) is what normally
+        # passes `parameters=<name>` straight into the class constructor.
+        # DistanceReparameterisation.__init__ defaults `parameters=None` and
+        # promptly does `len(parameters)`, so without this it crashes here
+        # every time flatten_distance_prior puts luminosity_distance on an
+        # explicit spec.
+        distance.setdefault("parameters", "luminosity_distance")
         distance["prior"] = "power-law"
         distance["converter_kwargs"] = {
             **distance.get("converter_kwargs", {}),
@@ -1334,39 +1364,45 @@ def suggest_configs(
     allow_nsf: bool = True,
     use_group: bool = False,
 ) -> tuple[dict, dict, dict]:
-    """Sample the flow architecture, the training settings, and the
-    proposal/truncation settings that control the latent ball the flow's
-    support is measured against (see :func:`_apply_proposal_overrides`).
+    """Sample the flow architecture and training settings.
 
-    ``allow_nsf`` is ``False`` when replaying an augmented run: the augmented
-    proposal injects a custom coupling ``mask`` into the flow config, which
-    nessai's neural-spline flow does not accept (it hard-codes an alternating
-    mask), so only ``realnvp`` can be used there.
+    Trimmed to what this objective can actually see, and centred on
+    :data:`BASELINE_FLOW_CONFIG` (v13-size + batchnorm) rather than the old
+    no-batchnorm baseline, so a run explores *bigger* flows from there:
+
+    * ``ftype``/``nsf``/``linear_transform``/``batch_norm_between_layers``/
+      ``dropout_probability``/``optimiser`` are no longer searched. The
+      batchnorm-vs-size sweep (see the flow-config experiments) already
+      settled all of these -- batchnorm on, ``lu``, no dropout, ``adamw`` -- so
+      spending TPE trials re-discovering them is wasted budget; NSF trials in
+      particular were a large share of why Optuna trials ran ~10x slower than
+      the standalone experiments.
+    * ``constant_volume_mode``/``volume_fraction``/``expansion_fraction``/
+      ``fuzz``/``latent_temperature`` are no longer searched *at all*: this
+      objective only ever calls ``proposal.train`` (see
+      :func:`evaluate_checkpoint`), never ``populate``, so the latent-ball
+      truncation and sampling temperature have **zero effect** on the score.
+      They were pure noise dimensions for TPE -- removing them shrinks the
+      space Optuna has to explore without giving up anything it could
+      measure.
+    * ``n_blocks``/``n_neurons`` now range well above
+      :data:`BASELINE_FLOW_CONFIG`, so the search can find something bigger
+      still pays off (or confirm the plateau the earlier experiments saw
+      starting to set in).
+
+    ``allow_nsf`` is accepted for backwards compatibility but no longer used:
+    only ``realnvp`` is searched here (see above).
     """
-    choices = ["realnvp", "nsf"] if allow_nsf else ["realnvp"]
-    ftype = trial.suggest_categorical("ftype", choices)
+    del allow_nsf  # no longer searched -- see the docstring
     flow_config = dict(
-        ftype=ftype,
-        n_blocks=trial.suggest_int("n_blocks", 2, 10),
-        n_layers=trial.suggest_int("n_layers", 1, 4),
-        n_neurons=trial.suggest_int("n_neurons", 16, 128, log=True),
-        batch_norm_between_layers=trial.suggest_categorical(
-            "batch_norm_between_layers", [True, False]
-        ),
-        dropout_probability=trial.suggest_float(
-            "dropout_probability", 0.0, 0.2
-        ),
-        linear_transform=trial.suggest_categorical(
-            "linear_transform", ["lu", "permutation"]
-        ),
+        ftype="realnvp",
+        n_blocks=trial.suggest_int("n_blocks", 6, 24),
+        n_layers=trial.suggest_int("n_layers", 1, 3),
+        n_neurons=trial.suggest_int("n_neurons", 48, 320, log=True),
+        batch_norm_between_layers=True,
+        dropout_probability=0.0,
+        linear_transform="lu",
     )
-    if ftype == "nsf":
-        # Spline flows are the reason to be here for complex surfaces: the bin
-        # count sets how much structure a single transform can represent.
-        flow_config["num_bins"] = trial.suggest_int("num_bins", 4, 8)
-        flow_config["tail_bound"] = trial.suggest_float(
-            "tail_bound", 3.0, 10.0
-        )
 
     training_config = dict(
         lr=trial.suggest_float("lr", 1e-4, 1e-2, log=True),
@@ -1377,7 +1413,7 @@ def suggest_configs(
         # :func:`_install_staged_training` stops training, and cosine annealing
         # would restart its schedule on every burst.
         max_epochs=MAX_EPOCHS,
-        optimiser=trial.suggest_categorical("optimiser", ["adam", "adamw"]),
+        optimiser="adamw",
         optimiser_kwargs={
             "weight_decay": trial.suggest_float(
                 "weight_decay", 1e-6, 1e-2, log=True
@@ -1394,56 +1430,6 @@ def suggest_configs(
         training_config["noise_type"] = "adaptive"
         training_config["noise_scale"] = noise_scale
 
-    # Rescales the latent draws the proposal samples from (see
-    # FlowProposal.sample_latent_distribution); temperature=1 is a no-op.
-    latent_temperature = trial.suggest_float(
-        "latent_temperature", 0.5, 2.0, log=True
-    )
-
-    # LatentRadiusTruncation.configure() makes volume_fraction and
-    # fuzz/expansion_fraction mutually exclusive: under constant_volume_mode
-    # the radius comes from volume_fraction and fuzz is forced back to 1.0;
-    # otherwise expansion_fraction, whenever it is set, silently overwrites
-    # fuzz.  So exactly one of the three is ever a live lever -- branch on
-    # which, rather than suggesting all three and letting two of them be
-    # ignored.
-    constant_volume_mode = trial.suggest_categorical(
-        "constant_volume_mode", [True, False]
-    )
-    if constant_volume_mode:
-        # Fraction of the flow's latent mass kept inside the ball -- the
-        # direct control on the fidelity/cost tradeoff objectives 1 and 2
-        # measure (see the module docstring).
-        latent_radius_config = dict(
-            constant_volume_mode=True,
-            fixed_radius=False,
-            volume_fraction=trial.suggest_float(
-                "volume_fraction", 0.8, 0.999
-            ),
-            fuzz=1.0,
-            expansion_fraction=None,
-        )
-    else:
-        use_expansion_fraction = trial.suggest_categorical(
-            "use_expansion_fraction", [True, False]
-        )
-        if use_expansion_fraction:
-            latent_radius_config = dict(
-                constant_volume_mode=False,
-                fixed_radius=False,
-                fuzz=1.0,
-                expansion_fraction=trial.suggest_float(
-                    "expansion_fraction", 0.5, 8.0, log=True
-                ),
-            )
-        else:
-            latent_radius_config = dict(
-                constant_volume_mode=False,
-                fixed_radius=False,
-                fuzz=trial.suggest_float("fuzz", 0.5, 2.0),
-                expansion_fraction=None,
-            )
-
     # The run left `luminosity_distance` on nessai-gw's identity distance
     # converter (its `UniformSourceFrame` prior is not one nessai-gw recognises),
     # so the flow has to absorb the ~d^2 prior curvature.  Toggle the power-law
@@ -1453,33 +1439,21 @@ def suggest_configs(
     # (whose mixin requires an affine reparameterisation).
     flatten_distance_prior = not use_group
 
-    proposal_overrides = dict(
-        latent_temperature=latent_temperature,
-        latent_radius=latent_radius_config,
-        flatten_distance_prior=flatten_distance_prior,
-    )
+    proposal_overrides = dict(flatten_distance_prior=flatten_distance_prior)
 
     return flow_config, training_config, proposal_overrides
 
 
 def baseline_params() -> dict:
-    """The archived run's settings, expressed in the search space above."""
+    """:data:`BASELINE_FLOW_CONFIG`, expressed in the search space above."""
     return dict(
-        ftype="realnvp",
         n_blocks=BASELINE_FLOW_CONFIG["n_blocks"],
         n_layers=BASELINE_FLOW_CONFIG["n_layers"],
         n_neurons=BASELINE_FLOW_CONFIG["n_neurons"],
-        batch_norm_between_layers=True,
-        dropout_probability=0.0,
-        linear_transform="lu",
         lr=1e-3,
         batch_size=1000,
-        optimiser="adamw",
         weight_decay=1e-6,
         noise_scale=1e-3,
-        latent_temperature=1.0,
-        constant_volume_mode=True,
-        volume_fraction=FALLBACK_PROPOSAL_KWARGS["volume_fraction"],
         flatten_distance_prior=False,
     )
 
