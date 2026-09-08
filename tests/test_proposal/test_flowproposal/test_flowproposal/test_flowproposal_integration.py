@@ -59,6 +59,31 @@ def test_flowproposal_populate(
     assert fp.x.size == n_draw
 
 
+@pytest.mark.integration_test
+@pytest.mark.timeout(30)
+def test_flowproposal_adapt_latent_temperature(tmp_path, model, flow_config):
+    """The adaptive latent-temperature option updates the temperature."""
+    output = tmp_path / "flowproposal"
+    output.mkdir()
+    fp = FlowProposal(
+        model,
+        output=output,
+        flow_config=flow_config,
+        plot=False,
+        poolsize=200,
+        adapt_latent_temperature=True,
+    )
+    assert fp.latent_temperature == 1.0
+
+    fp.initialise()
+    worst = numpy_array_to_live_points(0.01 * np.ones(fp.dims), fp.parameters)
+    fp.populate(worst, n_samples=50)
+
+    assert len(fp.latent_temperature_history) == 1
+    assert fp.latent_temperature == fp.latent_temperature_history[-1]
+    assert fp.latent_temperature > 0.0
+
+
 @pytest.mark.parametrize(
     "truncation_methods",
     [[], ["likelihood_threshold"]],
