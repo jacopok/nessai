@@ -611,14 +611,18 @@ class FlowProposal(BaseFlowProposal):
     def _latent_truncation_radius(self) -> float:
         """Return the hard latent-space truncation radius, or ``inf``.
 
-        Only a finite ``fixed_radius`` on the ``latent_radius`` rule is treated
-        as a temperature-independent hard cap on ``|z|``; any adaptively
-        recomputed radius is ignored (it is not constant across temperatures)
-        and the untruncated result is used instead.
+        The ``latent_radius`` rule applies a fixed ``|z| <= threshold`` cut for
+        the batch just drawn; that threshold is the radius the reweighting must
+        assume when extrapolating to another temperature (the fraction of the
+        base density inside it, ``F_T``, then depends on the temperature). If
+        no ``latent_radius`` rule is active the latent space is untruncated.
         """
         rule = self._get_latent_radius_rule()
         if rule is None:
             return np.inf
+        threshold = getattr(rule, "threshold", np.nan)
+        if threshold is not None and np.isfinite(threshold):
+            return float(threshold)
         fixed = getattr(rule, "fixed_radius", False)
         if fixed is not False and np.isfinite(fixed):
             return float(fixed)
@@ -713,14 +717,14 @@ class FlowProposal(BaseFlowProposal):
         n_val = self.latent_temperature_validation_size or self.drawsize
         eff_current = self._draw_latent_efficiency(current, n_val)
         eff_candidate = self._draw_latent_efficiency(candidate, n_val)
-        chosen, eff_chosen = current, eff_current
+        chosen = current
         if eff_candidate > eff_current:
-            chosen, eff_chosen = candidate, eff_candidate
+            chosen = candidate
         else:
             midpoint = float(np.sqrt(current * candidate))
             eff_mid = self._draw_latent_efficiency(midpoint, n_val)
             if eff_mid > eff_current:
-                chosen, eff_chosen = midpoint, eff_mid
+                chosen = midpoint
 
         logger.info(
             "Latent-temperature validation: current=%.4f (eff=%.4f), "
