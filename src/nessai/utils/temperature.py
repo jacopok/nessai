@@ -134,7 +134,7 @@ def optimise_latent_temperature(
     dims,
     temperature,
     radius=np.inf,
-    criterion="ess",
+    criterion="efficiency",
     tau=0.5,
     grid=None,
     n_grid=201,
@@ -157,8 +157,9 @@ def optimise_latent_temperature(
         Temperature ``T`` the batch was drawn at.
     radius : float, optional
         Truncation radius ``R``.
-    criterion : {"ess", "efficiency"}, optional
-        Target-quality criterion to maximise (Step 3).
+    criterion : {"efficiency", "ess"}, optional
+        Target-quality criterion to maximise (Step 3). Defaults to the
+        rejection-sampling efficiency ``mean(w) / max(w)``.
     tau : float, optional
         Trust-region threshold as a fraction of ``N``.
     grid : array_like, optional

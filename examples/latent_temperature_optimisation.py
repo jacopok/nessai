@@ -46,7 +46,13 @@ temperature = 1.0
 for iteration in range(10):
     r, log_w = draw_batch(temperature)
     result = optimise_latent_temperature(
-        log_w, r, DIMS, temperature=temperature, radius=RADIUS, tau=0.5
+        log_w,
+        r,
+        DIMS,
+        temperature=temperature,
+        radius=RADIUS,
+        tau=0.5,
+        criterion="efficiency",
     )
     print(
         f"iter {iteration}: T={temperature:.3f} -> T_hat*={result['temperature']:.3f}"
@@ -62,14 +68,16 @@ print(f"estimated T_hat*         : {result['temperature']:.3f}")
 grid = result["grid"]
 trust = result["trust_region"]
 fig, ax1 = plt.subplots(figsize=(7, 4))
-ax1.plot(grid, np.exp(result["criterion"]) / N, "C0", label="ESS / N")
+ax1.plot(
+    grid, np.exp(result["criterion"]), "C0", label="rejection efficiency"
+)
 ax1.axvline(TARGET_VAR, color="k", ls=":", label="true optimum")
 ax1.axvline(result["temperature"], color="C3", ls="--", label=r"$\hat{T}^*$")
 ax1.fill_between(
     grid, 0, 1, where=trust, color="C2", alpha=0.15, label="trust region"
 )
 ax1.set_xlabel(r"$T'$")
-ax1.set_ylabel("ESS / N")
+ax1.set_ylabel("rejection efficiency  mean(w) / max(w)")
 ax1.set_xscale("log")
 ax2 = ax1.twinx()
 ax2.plot(grid, result["secondary_ess"] / N, "C1", alpha=0.7)

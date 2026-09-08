@@ -80,17 +80,28 @@ def test_reweight_matches_direct_draw():
     assert ess(log_w2) / log_w2.size > 0.99
 
 
+@pytest.mark.parametrize("criterion", ["efficiency", "ess"])
 @pytest.mark.parametrize("target_var", [0.5, 1.5])
-def test_optimiser_recovers_target_variance(target_var):
+def test_optimiser_recovers_target_variance(target_var, criterion):
     dims = 2
     r, log_w = _identity_flow_batch(
         dims, temperature=1.0, target_var=target_var, n=50000, seed=7
     )
     result = optimise_latent_temperature(
-        log_w, r, dims, temperature=1.0, tau=0.5
+        log_w, r, dims, temperature=1.0, tau=0.5, criterion=criterion
     )
     assert result["temperature"] == pytest.approx(target_var, rel=0.15)
     assert not result["at_trust_boundary"]
+
+
+def test_efficiency_is_the_default_criterion():
+    dims, target_var = 2, 1.3
+    r, log_w = _identity_flow_batch(dims, 1.0, target_var, n=50000, seed=9)
+    default = optimise_latent_temperature(log_w, r, dims, temperature=1.0)
+    explicit = optimise_latent_temperature(
+        log_w, r, dims, temperature=1.0, criterion="efficiency"
+    )
+    assert default["temperature"] == explicit["temperature"]
 
 
 def test_optimiser_flags_trust_boundary_and_iterates():
