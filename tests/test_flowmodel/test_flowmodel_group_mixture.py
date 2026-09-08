@@ -1136,6 +1136,57 @@ def test_clustered_stays_k1_for_unimodal_data():
     assert int(w._n_active.item()) == 1
 
 
+def _unimodal(n, rng):
+    return torch.tensor(
+        np.stack([rng.uniform(0, 1, n), rng.normal(0, 1, n)], 1),
+        dtype=torch.float32,
+    )
+
+
+def _bimodal(n, rng):
+    y = np.where(rng.random(n) < 0.6, rng.normal(3, 0.4, n),
+                 rng.normal(-3, 0.4, n))
+    return torch.tensor(
+        np.stack([rng.uniform(0, 1, n), y], 1), dtype=torch.float32
+    )
+
+
+def test_clustered_k_evolves_unimodal_to_bimodal_with_warm_start():
+    w = _clustered_wrapper(2)
+    rng = np.random.default_rng(0)
+
+    w._cluster(_unimodal(800, rng))
+    assert int(w._n_active.item()) == 1
+
+    # a fresh (distinct data_ptr) bimodal round: k rises to 2
+    w._cluster(_bimodal(800, rng))
+    assert int(w._n_active.item()) == 2
+    # the newly activated expert was warm-started from expert 0
+    sd0 = w.experts[0].base_flow.state_dict()
+    sd1 = w.experts[1].base_flow.state_dict()
+    assert all(torch.allclose(sd0[k], sd1[k]) for k in sd0)
+    # ... and its per-cluster standardisation is re-bootstrapped
+    assert not bool(w.experts[1]._canon_seen.any())
+
+
+def test_clustered_k_shrink_needs_hysteresis():
+    w = ClusteredGroupMixtureFlowWrapper(
+        [_expert() for _ in range(2)], num_features=2, min_cluster_size=10,
+        max_cluster_overlap=0.1, k_shrink_patience=3,
+    )
+    rng = np.random.default_rng(1)
+    w._cluster(_bimodal(800, rng))
+    assert int(w._n_active.item()) == 2
+    # one unimodal round -> k held at 2 (hysteresis)
+    w._cluster(_unimodal(800, rng))
+    assert int(w._n_active.item()) == 2
+    w._cluster(_unimodal(800, rng))
+    assert int(w._n_active.item()) == 2
+    # third consecutive -> drops to 1
+    w._cluster(_unimodal(800, rng))
+    assert int(w._n_active.item()) == 1
+
+
 class _FoldedBimodalModel(PeriodicModel):
     def log_likelihood(self, x):
         base = super().log_likelihood(x)

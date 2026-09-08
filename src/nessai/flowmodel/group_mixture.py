@@ -1247,8 +1247,9 @@ def make_group_mixture_flow(
 # ---------------------------------------------------------------------------
 # Clustered group mixture: K independent group-mixture base flows, one per
 # data cluster, each with its own per-branch canonical standardisation and
-# latent ball. The clusters are found each training round (GMM, largest k in
-# [1, n_clusters_max] with well-separated components); k == 1 reproduces the
+# latent ball. Reclustered each training round (GMM, largest k in
+# [1, n_clusters_max] with well-separated components), so k tracks the folded
+# posterior as it goes unimodal -> bimodal over the run; k == 1 reproduces the
 # single-flow behaviour exactly.
 # ---------------------------------------------------------------------------
 class ClusteredGroupMixtureFlowWrapper(BaseFlow):
@@ -1278,6 +1279,7 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         max_cluster_overlap=0.05,
         min_cluster_size=200,
         weight_ema=0.5,
+        k_shrink_patience=3,
     ):
         super().__init__()
         self.experts = torch.nn.ModuleList(experts)
@@ -1285,6 +1287,10 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         self.num_features = int(num_features)
         self.group_size = experts[0].group_size
         self.cluster_method = cluster_method
+        # k rises immediately when a clean split appears, but only drops after
+        # this many consecutive rounds want fewer clusters (hysteresis, so a
+        # one-round blip does not discard an expert's training).
+        self.k_shrink_patience = int(k_shrink_patience)
         # Accept a k-way split only if it is *well separated*: at most this
         # fraction of points sit in the fuzzy zone between clusters (GMM
         # responsibility < 0.8).  Splitting a single blob makes ~half of it
@@ -1302,6 +1308,9 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         )
         self.register_buffer("_base_mu", torch.zeros(self.num_features))
         self.register_buffer("_base_sd", torch.ones(self.num_features))
+        self.register_buffer(
+            "_k_shrink_streak", torch.zeros((), dtype=torch.long)
+        )
         self.register_buffer(
             "_clustering_seen", torch.zeros((), dtype=torch.bool)
         )
@@ -1495,8 +1504,25 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
 
     # -- clustering update (called from GroupFlowProposalMixin.check_state)
     def _cluster(self, x):
-        """Fit the clusterer on the folded training data; cache the labels."""
-        key = (x.data_ptr(), int(x.shape[0]))
+        """Recluster the folded training data; return the per-row labels.
+
+        The number of clusters evolves over the run: an initially unimodal
+        folded posterior gives ``k = 1`` (the plain single flow), and the
+        moment it becomes decisively bimodal ``k`` rises to 2 and the second
+        expert -- warm-started from the first -- begins specialising.  A drop
+        in ``k`` is only applied after :attr:`k_shrink_patience` consecutive
+        rounds want it, so a one-round blip does not throw away an expert's
+        training.
+        """
+        # Fingerprint the data so the two back-to-back calls from
+        # ``check_state`` (update_mixture_weights then
+        # update_base_standardisation) reuse one clustering, without keying on
+        # ``data_ptr`` alone (memory addresses get recycled between rounds).
+        key = (
+            tuple(x.shape),
+            float(x.sum().item()),
+            float(x.reshape(-1)[:: max(x.numel() // 32, 1)].sum().item()),
+        )
         if self._cluster_cache is not None and self._cluster_cache[0] == key:
             return self._cluster_cache[1]
 
@@ -1506,21 +1532,47 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         sd = np.maximum(t.std(axis=0), 1e-9)
         ts = (t - mu) / sd
 
-        k, labels, centroids = 1, np.zeros(n, dtype=int), ts.mean(0, keepdims=True)
         k_max = min(self.n_experts, n // max(self.min_cluster_size, 1))
-        if k_max >= 2:
-            k, labels, centroids = self._select_k(ts, k_max)
+        k_want = self._choose_k(ts, k_max) if k_max >= 2 else 1
+        k_cur = int(self._n_active.item())
 
-        # order clusters tightest-first (stable slot assignment across rounds:
-        # the localised sheet keeps its expert)
+        if not bool(self._clustering_seen):
+            k = k_want
+        elif k_want > k_cur:
+            k = k_want
+            self._k_shrink_streak.zero_()
+        elif k_want < k_cur:
+            self._k_shrink_streak += 1
+            if int(self._k_shrink_streak.item()) >= self.k_shrink_patience:
+                k = k_want
+                self._k_shrink_streak.zero_()
+            else:
+                k = k_cur
+        else:
+            k = k_cur
+            self._k_shrink_streak.zero_()
+
+        labels, centroids = self._fit_gmm(ts, k)
+
+        # order clusters tightest-first so a given physical sheet keeps its
+        # expert slot across rounds (the localised sheet stays the tightest).
         if k >= 2:
-            spread = [ts[labels == c].std() for c in range(k)]
-            order = np.argsort(spread)
+            order = np.argsort([ts[labels == c].std() for c in range(k)])
             remap = {old: new for new, old in enumerate(order)}
             labels = np.array([remap[c] for c in labels])
             centroids = centroids[order]
 
         with torch.no_grad():
+            # warm-start any newly activated expert from expert 0 so the
+            # mixture is never dragged down by a random flow while the new
+            # expert catches up; re-bootstrap its per-cluster standardisation.
+            if k > k_cur and bool(self._clustering_seen):
+                src = self.experts[0].state_dict()
+                for j in range(max(k_cur, 1), k):
+                    self.experts[j].load_state_dict(src)
+                    self.experts[j]._canon_seen.zero_()
+                    self.experts[j]._domain_mass_seen = False
+
             dev = self.cluster_weights.device
             self._base_mu.copy_(torch.as_tensor(mu, dtype=self._base_mu.dtype))
             self._base_sd.copy_(torch.as_tensor(sd, dtype=self._base_sd.dtype))
@@ -1529,14 +1581,14 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
                 torch.as_tensor(centroids, dtype=self._centroids.dtype)
             )
             counts = np.bincount(labels, minlength=self.n_experts).astype(float)
-            w = torch.zeros(self.n_experts, device=dev, dtype=self.cluster_weights.dtype)
-            w[:k] = torch.as_tensor(
-                counts[:k] / counts[:k].sum(), dtype=self.cluster_weights.dtype
+            w = torch.zeros(
+                self.n_experts, device=dev, dtype=self.cluster_weights.dtype
             )
-            first = not bool(self._clustering_seen) or int(
-                self._n_active.item()
-            ) != k
-            if first:
+            w[:k] = torch.as_tensor(
+                counts[:k] / counts[:k].sum(),
+                dtype=self.cluster_weights.dtype,
+            )
+            if not bool(self._clustering_seen) or k != k_cur:
                 self.cluster_weights.copy_(w)
             else:
                 beta = self.weight_ema
@@ -1547,6 +1599,11 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
 
         lab_t = torch.as_tensor(labels, device=x.device, dtype=torch.long)
         self._cluster_cache = (key, lab_t)
+        if k != k_cur:
+            logger.info(
+                "Clustered group mixture: k %d -> %d (want %d)",
+                k_cur, k, k_want,
+            )
         logger.info(
             "Clustered group mixture: k=%d, weights=%s, sizes=%s",
             k,
@@ -1555,22 +1612,15 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         )
         return lab_t
 
-    def _select_k(self, ts, k_max):
-        """Pick ``k`` in ``[1, k_max]`` and return ``(k, labels, centroids)``.
-
-        The largest ``k`` whose GMM clusters are all above ``min_cluster_size``
-        and *well separated* -- the fraction of points with max responsibility
-        below 0.8 is under ``max_cluster_overlap``.  Over-splitting a single
-        blob makes ~half of it ambiguous, so it is rejected; ``k = 1`` when no
-        split is clean.
-        """
-        from sklearn.cluster import KMeans
+    def _choose_k(self, ts, k_max):
+        """Largest ``k`` in ``[1, k_max]`` whose GMM clusters are all above
+        ``min_cluster_size`` and *well separated* -- fewer than
+        ``max_cluster_overlap`` of points ambiguous (max responsibility < 0.8).
+        Over-splitting a single blob makes ~half of it ambiguous, so it is
+        rejected; returns 1 when no split is clean."""
         from sklearn.mixture import GaussianMixture
 
-        n = ts.shape[0]
-        k, labels, centroids = 1, np.zeros(n, dtype=int), ts.mean(
-            0, keepdims=True
-        )
+        k = 1
         for kk in range(2, k_max + 1):
             gm = GaussianMixture(
                 n_components=kk, covariance_type="full", n_init=3,
@@ -1580,17 +1630,27 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             lab = resp.argmax(axis=1)
             if np.bincount(lab, minlength=kk).min() < self.min_cluster_size:
                 continue
-            overlap = float(np.mean(resp.max(axis=1) < 0.8))
-            if overlap > self.max_cluster_overlap:
+            if float(np.mean(resp.max(axis=1) < 0.8)) > self.max_cluster_overlap:
                 continue
-            cen = gm.means_
-            if self.cluster_method == "kmeans":
-                km = KMeans(
-                    n_clusters=kk, n_init=10, random_state=0
-                ).fit(ts)
-                lab, cen = km.labels_, km.cluster_centers_
-            k, labels, centroids = kk, lab, cen
-        return k, labels, centroids
+            k = kk
+        return k
+
+    def _fit_gmm(self, ts, k):
+        """``(labels, centroids)`` for a ``k``-cluster fit (``k == 1`` trivial)."""
+        n = ts.shape[0]
+        if k <= 1:
+            return np.zeros(n, dtype=int), ts.mean(0, keepdims=True)
+        from sklearn.cluster import KMeans
+        from sklearn.mixture import GaussianMixture
+
+        gm = GaussianMixture(
+            n_components=k, covariance_type="full", n_init=3,
+            random_state=0, reg_covar=1e-4,
+        ).fit(ts)
+        if self.cluster_method == "kmeans":
+            km = KMeans(n_clusters=k, n_init=10, random_state=0).fit(ts)
+            return km.labels_, km.cluster_centers_
+        return gm.predict(ts), gm.means_
 
     @torch.no_grad()
     def update_mixture_weights(self, x, context=None, smoothing=1.0):
@@ -1621,6 +1681,7 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
     cluster_method = "gmm"
     max_cluster_overlap = 0.05
     min_cluster_size = 200
+    k_shrink_patience = 3
 
     def get_model(self, config):
         k = max(int(getattr(self, "n_clusters_max", 1)), 1)
@@ -1635,6 +1696,7 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
             cluster_method=getattr(self, "cluster_method", "gmm"),
             max_cluster_overlap=getattr(self, "max_cluster_overlap", 0.05),
             min_cluster_size=getattr(self, "min_cluster_size", 200),
+            k_shrink_patience=getattr(self, "k_shrink_patience", 3),
         )
 
 
@@ -1644,6 +1706,7 @@ def make_clustered_group_mixture_flow(
     cluster_method="gmm",
     max_cluster_overlap=0.05,
     min_cluster_size=200,
+    k_shrink_patience=3,
     **kwargs,
 ):
     """:func:`make_group_mixture_flow` with a clustered base flow.
@@ -1654,7 +1717,10 @@ def make_clustered_group_mixture_flow(
     ``max_cluster_overlap`` of points ambiguous).  ``k == 1`` -- the data is
     not decisively multi-modal, or ``n_clusters_max == 1`` -- is byte-identical
     to :func:`make_group_mixture_flow` (``get_model`` returns the plain
-    wrapper).  All other keyword arguments are passed straight through.
+    wrapper).  ``k`` evolves over the run -- it rises as soon as the folded
+    posterior becomes decisively multi-modal (the new expert is warm-started
+    from the first) and falls only after ``k_shrink_patience`` rounds want
+    fewer.  All other keyword arguments are passed straight through.
     """
     base_cls = make_group_mixture_flow(**kwargs)
 
@@ -1665,6 +1731,7 @@ def make_clustered_group_mixture_flow(
     ClusteredCustom.cluster_method = cluster_method
     ClusteredCustom.max_cluster_overlap = float(max_cluster_overlap)
     ClusteredCustom.min_cluster_size = int(min_cluster_size)
+    ClusteredCustom.k_shrink_patience = int(k_shrink_patience)
     return ClusteredCustom
 
 
