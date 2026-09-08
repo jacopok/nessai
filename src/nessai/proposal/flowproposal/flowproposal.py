@@ -453,12 +453,15 @@ class FlowProposal(BaseFlowProposal):
         n_accepted = 0
         accept = None
 
-        adapt_r = []
-        adapt_log_w = []
+        adapt_full_z = []
+        adapt_surv_z = []
+        adapt_surv_log_w = []
 
         while n_accepted < n_samples:
             z = self.sample_latent_distribution(self.drawsize)
             n_proposed += z.shape[0]
+            if self.adapt_latent_temperature:
+                adapt_full_z.append(np.asarray(z, dtype=float))
             z = self._truncation_scheme.apply_latent(self, z)
             if not len(z):
                 if n_proposed > max_samples:
@@ -497,8 +500,8 @@ class FlowProposal(BaseFlowProposal):
             log_w = self.compute_weights(x, log_q)
 
             if self.adapt_latent_temperature:
-                adapt_r.append(np.sqrt(np.sum(np.asarray(z) ** 2, axis=-1)))
-                adapt_log_w.append(np.asarray(log_w, dtype=float))
+                adapt_surv_z.append(np.asarray(z, dtype=float))
+                adapt_surv_log_w.append(np.asarray(log_w, dtype=float))
 
             if self.accumulate_weights:
                 samples = np.concatenate([samples, x])
@@ -543,10 +546,25 @@ class FlowProposal(BaseFlowProposal):
         else:
             self.x = samples[: min(n_accepted, n_samples)]
 
-        if self.adapt_latent_temperature and adapt_r:
-            self._update_latent_temperature(
-                np.concatenate(adapt_r), np.concatenate(adapt_log_w)
-            )
+        if self.adapt_latent_temperature and adapt_full_z:
+            full_z = np.concatenate(adapt_full_z)
+            r_full = np.sqrt(np.sum(full_z**2, axis=-1))
+            log_w_full = np.full(full_z.shape[0], -np.inf)
+            if adapt_surv_z:
+                surv_z = np.concatenate(adapt_surv_z)
+                surv_log_w = np.concatenate(adapt_surv_log_w)
+                index = {
+                    row.tobytes(): i for i, row in enumerate(full_z)
+                }
+                surv_idx = []
+                surv_w = []
+                for row, w in zip(surv_z, surv_log_w):
+                    i = index.get(row.tobytes())
+                    if i is not None:
+                        surv_idx.append(i)
+                        surv_w.append(w)
+                log_w_full[surv_idx] = surv_w
+            self._update_latent_temperature(r_full, log_w_full)
 
         self.samples = self.convert_to_samples(self.x, plot=plot)
         if self._plot_pool and plot:
@@ -595,9 +613,12 @@ class FlowProposal(BaseFlowProposal):
         and importance weights. Successive calls (one per ``populate``)
         implement the iterate-if-needed step.
         """
-        valid = np.isfinite(log_w) & np.isfinite(r)
+        # Keep zero-weight (-inf) draws: they represent samples lost to
+        # truncation / prior bounds and must count against the efficiency of a
+        # candidate temperature. Only genuine NaNs are dropped.
+        valid = ~np.isnan(log_w) & np.isfinite(r)
         r, log_w = r[valid], log_w[valid]
-        if r.size < 2:
+        if np.sum(np.isfinite(log_w)) < 2:
             return
         current = self.latent_temperature or 1.0
         try:
