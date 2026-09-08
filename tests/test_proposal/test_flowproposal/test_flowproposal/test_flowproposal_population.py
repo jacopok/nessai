@@ -41,6 +41,7 @@ def configure_population_test_proposal(proposal, rng, samples):
     proposal.model = MagicMock()
     proposal.training_data = samples([(0.0, 0.0), (1.0, 1.0)])
     proposal._truncation_scheme = TruncationScheme()
+    proposal.adapt_latent_temperature = False
     proposal.drawsize = 3
     proposal.flow = MagicMock()
     proposal.sample_latent_distribution = MagicMock(

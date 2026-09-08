@@ -140,6 +140,7 @@ cython_debug/
 
 # Project specific
 outdir/
+examples/*.png
 autoapi/
 
 # Offline group-mixture flow inspection: copied flow states, resume pickles,

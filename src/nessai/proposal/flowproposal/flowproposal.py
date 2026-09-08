@@ -12,6 +12,7 @@ from scipy.special import logsumexp
 from ... import config
 from ...livepoint import empty_structured_array
 from ...utils.structures import get_subset_arrays
+from ...utils.temperature import optimise_latent_temperature
 from .base import BaseFlowProposal
 from .truncation import (
     TruncationScheme,
@@ -41,6 +42,26 @@ class FlowProposal(BaseFlowProposal):
     latent_temperature : float, optional
         The temperature to use for the latent space. If None, no scaling is
         applied.
+    adapt_latent_temperature : bool, optional
+        If True, the latent temperature is re-estimated after every call to
+        :meth:`populate` by retroactively reweighting the drawn batch of latent
+        radii and importance weights (see
+        :func:`nessai.utils.temperature.optimise_latent_temperature`). The
+        temperature is initialised to 1.0 if not otherwise set.
+    latent_temperature_kwargs : dict, optional
+        Extra keyword arguments forwarded to
+        :func:`nessai.utils.temperature.optimise_latent_temperature`, e.g.
+        ``criterion`` ("efficiency" or "ess"), ``tau`` or ``grid_range``.
+    latent_temperature_validate : bool, optional
+        If True (default) a candidate temperature is only adopted when a fresh
+        validation batch drawn at that temperature has a higher rejection
+        efficiency than one drawn at the current temperature; otherwise the
+        geometric midpoint is tried, and failing that the temperature is left
+        unchanged. This guards against the retroactive estimate being
+        optimistically biased away from the draw temperature.
+    latent_temperature_validation_size : int, optional
+        Number of latent samples per validation batch. Defaults to
+        ``drawsize``.
     constant_volume_mode : bool, optional
         Whether to use constant volume mode for the latent radius. This argument
         is deprecated and should be configured via :code:`truncation_methods`
@@ -105,6 +126,10 @@ class FlowProposal(BaseFlowProposal):
         poolsize=None,
         latent_prior=None,
         latent_temperature=None,
+        adapt_latent_temperature=False,
+        latent_temperature_kwargs=None,
+        latent_temperature_validate=True,
+        latent_temperature_validation_size=None,
         constant_volume_mode=None,
         volume_fraction=None,
         fuzz=None,
@@ -130,6 +155,10 @@ class FlowProposal(BaseFlowProposal):
             drawsize,
             latent_prior=latent_prior,
             latent_temperature=latent_temperature,
+            adapt_latent_temperature=adapt_latent_temperature,
+            latent_temperature_kwargs=latent_temperature_kwargs,
+            latent_temperature_validate=latent_temperature_validate,
+            latent_temperature_validation_size=latent_temperature_validation_size,
         )
 
         self._truncation_scheme = TruncationScheme()
@@ -250,6 +279,10 @@ class FlowProposal(BaseFlowProposal):
         drawsize,
         latent_prior=None,
         latent_temperature=None,
+        adapt_latent_temperature=False,
+        latent_temperature_kwargs=None,
+        latent_temperature_validate=True,
+        latent_temperature_validation_size=None,
     ) -> None:
         """Configure settings related to population."""
         if drawsize is None:
@@ -269,9 +302,21 @@ class FlowProposal(BaseFlowProposal):
             if latent_temperature <= 0.0:
                 raise ValueError("latent_temperature must be positive")
 
+        if adapt_latent_temperature and latent_temperature is None:
+            latent_temperature = 1.0
+
         self.drawsize = drawsize
         self.latent_prior = "flow"
         self.latent_temperature = latent_temperature
+        self.adapt_latent_temperature = adapt_latent_temperature
+        self.latent_temperature_kwargs = {
+            **(latent_temperature_kwargs or {})
+        }
+        self.latent_temperature_validate = latent_temperature_validate
+        self.latent_temperature_validation_size = (
+            latent_temperature_validation_size
+        )
+        self.latent_temperature_history = []
 
     def configure_truncation(
         self,
@@ -428,9 +473,15 @@ class FlowProposal(BaseFlowProposal):
         n_accepted = 0
         accept = None
 
+        adapt_full_z = []
+        adapt_surv_z = []
+        adapt_surv_log_w = []
+
         while n_accepted < n_samples:
             z = self.sample_latent_distribution(self.drawsize)
             n_proposed += z.shape[0]
+            if self.adapt_latent_temperature:
+                adapt_full_z.append(np.asarray(z, dtype=float))
             z = self._truncation_scheme.apply_latent(self, z)
             if not len(z):
                 if n_proposed > max_samples:
@@ -467,6 +518,10 @@ class FlowProposal(BaseFlowProposal):
                     continue
 
             log_w = self.compute_weights(x, log_q)
+
+            if self.adapt_latent_temperature:
+                adapt_surv_z.append(np.asarray(z, dtype=float))
+                adapt_surv_log_w.append(np.asarray(log_w, dtype=float))
 
             if self.accumulate_weights:
                 samples = np.concatenate([samples, x])
@@ -511,6 +566,26 @@ class FlowProposal(BaseFlowProposal):
         else:
             self.x = samples[: min(n_accepted, n_samples)]
 
+        if self.adapt_latent_temperature and adapt_full_z:
+            full_z = np.concatenate(adapt_full_z)
+            r_full = np.sqrt(np.sum(full_z**2, axis=-1))
+            log_w_full = np.full(full_z.shape[0], -np.inf)
+            if adapt_surv_z:
+                surv_z = np.concatenate(adapt_surv_z)
+                surv_log_w = np.concatenate(adapt_surv_log_w)
+                index = {
+                    row.tobytes(): i for i, row in enumerate(full_z)
+                }
+                surv_idx = []
+                surv_w = []
+                for row, w in zip(surv_z, surv_log_w):
+                    i = index.get(row.tobytes())
+                    if i is not None:
+                        surv_idx.append(i)
+                        surv_w.append(w)
+                log_w_full[surv_idx] = surv_w
+            self._update_latent_temperature(r_full, log_w_full)
+
         self.samples = self.convert_to_samples(self.x, plot=plot)
         if self._plot_pool and plot:
             self.plot_pool(self.samples)
@@ -533,6 +608,132 @@ class FlowProposal(BaseFlowProposal):
         self.populated = True
         self._checked_population = False
 
+    def _latent_truncation_radius(self) -> float:
+        """Return the hard latent-space truncation radius, or ``inf``.
+
+        Only a finite ``fixed_radius`` on the ``latent_radius`` rule is treated
+        as a temperature-independent hard cap on ``|z|``; any adaptively
+        recomputed radius is ignored (it is not constant across temperatures)
+        and the untruncated result is used instead.
+        """
+        rule = self._get_latent_radius_rule()
+        if rule is None:
+            return np.inf
+        fixed = getattr(rule, "fixed_radius", False)
+        if fixed is not False and np.isfinite(fixed):
+            return float(fixed)
+        return np.inf
+
+    def _draw_latent_efficiency(self, temperature, n):
+        """Rejection efficiency of a fresh batch drawn at ``temperature``.
+
+        Draws ``n`` latent samples at ``temperature``, pushes them through the
+        flow and the same truncation stages used by :meth:`populate`, and
+        returns ``mean(w) / max(w)`` with every draw lost to truncation /
+        prior bounds counted as zero weight. Returns ``-inf`` if the batch is
+        entirely rejected.
+        """
+        original = self.latent_temperature
+        self.latent_temperature = float(temperature)
+        try:
+            z_full = np.asarray(
+                self.sample_latent_distribution(n), dtype=float
+            )
+            n_drawn = z_full.shape[0]
+            z = self._truncation_scheme.apply_latent(self, z_full)
+            if not len(z):
+                return -np.inf
+            x, log_q, z = self.backward_pass(
+                z,
+                rescale=True,
+                return_z=True,
+                return_unit_hypercube=self.map_to_unit_hypercube,
+            )
+            x, log_q, z = self._truncation_scheme.apply_after_backward(
+                self, x, log_q, z
+            )
+            if not len(x):
+                return -np.inf
+            log_w = self.compute_weights(x, log_q)
+        finally:
+            self.latent_temperature = original
+
+        log_w = log_w[np.isfinite(log_w)]
+        if log_w.size < 2:
+            return -np.inf
+        # mean over *all* draws (lost ones contribute zero), divided by max.
+        log_eff = (
+            logsumexp(log_w) - np.log(n_drawn) - np.max(log_w)
+        )
+        return float(np.exp(log_eff))
+
+    def _update_latent_temperature(self, r, log_w) -> None:
+        """Update ``latent_temperature`` from the drawn batch.
+
+        A candidate temperature is proposed by retroactively reweighting the
+        just-completed batch within the secondary-ESS trust region
+        (:func:`nessai.utils.temperature.optimise_latent_temperature`). When
+        ``latent_temperature_validate`` is True the candidate (and, failing
+        that, the geometric midpoint) is only accepted if a *fresh* validation
+        batch drawn at that temperature has a higher rejection efficiency than
+        one drawn at the current temperature -- so the temperature never moves
+        to a value that is measurably worse.
+        """
+        # Keep zero-weight (-inf) draws: they represent samples lost to
+        # truncation / prior bounds and must count against the efficiency of a
+        # candidate temperature. Only genuine NaNs are dropped.
+        valid = ~np.isnan(log_w) & np.isfinite(r)
+        r, log_w = r[valid], log_w[valid]
+        if np.sum(np.isfinite(log_w)) < 2:
+            return
+        current = self.latent_temperature or 1.0
+        try:
+            result = optimise_latent_temperature(
+                log_w,
+                r,
+                self.prime_dims,
+                temperature=current,
+                radius=self._latent_truncation_radius(),
+                **self.latent_temperature_kwargs,
+            )
+        except RuntimeError as exc:
+            logger.warning("Latent-temperature adaptation skipped: %s", exc)
+            return
+        candidate = result["temperature"]
+
+        if not self.latent_temperature_validate:
+            self.latent_temperature = candidate
+            self.latent_temperature_history.append(candidate)
+            return
+
+        if np.isclose(candidate, current, rtol=1e-3):
+            self.latent_temperature_history.append(current)
+            return
+
+        n_val = self.latent_temperature_validation_size or self.drawsize
+        eff_current = self._draw_latent_efficiency(current, n_val)
+        eff_candidate = self._draw_latent_efficiency(candidate, n_val)
+        chosen, eff_chosen = current, eff_current
+        if eff_candidate > eff_current:
+            chosen, eff_chosen = candidate, eff_candidate
+        else:
+            midpoint = float(np.sqrt(current * candidate))
+            eff_mid = self._draw_latent_efficiency(midpoint, n_val)
+            if eff_mid > eff_current:
+                chosen, eff_chosen = midpoint, eff_mid
+
+        logger.info(
+            "Latent-temperature validation: current=%.4f (eff=%.4f), "
+            "candidate=%.4f (eff=%.4f) -> %.4f",
+            current,
+            eff_current,
+            candidate,
+            eff_candidate,
+            chosen,
+        )
+        self.latent_temperature = chosen
+        self.latent_temperature_history.append(chosen)
+
     def reset(self) -> None:
         """Reset the proposal."""
         super().reset()
@@ -540,3 +741,15 @@ class FlowProposal(BaseFlowProposal):
 
     def __getstate__(self):
         return super().__getstate__()
+
+    def __setstate__(self, state):
+        # Back-fill the latent-temperature-adaptation attributes for resume
+        # files pickled before the feature existed: ``configure_population`` is
+        # not re-run on resume, and ``populate`` reads
+        # ``self.adapt_latent_temperature`` unconditionally.
+        state.setdefault("adapt_latent_temperature", False)
+        state.setdefault("latent_temperature_kwargs", {})
+        state.setdefault("latent_temperature_validate", True)
+        state.setdefault("latent_temperature_validation_size", None)
+        state.setdefault("latent_temperature_history", [])
+        self.__dict__.update(state)
