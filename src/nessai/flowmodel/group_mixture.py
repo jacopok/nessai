@@ -1244,6 +1244,430 @@ def make_group_mixture_flow(
     return CustomGroupMixtureFlowModel
 
 
+# ---------------------------------------------------------------------------
+# Clustered group mixture: K independent group-mixture base flows, one per
+# data cluster, each with its own per-branch canonical standardisation and
+# latent ball. The clusters are found each training round (GMM, largest k in
+# [1, n_clusters_max] with well-separated components); k == 1 reproduces the
+# single-flow behaviour exactly.
+# ---------------------------------------------------------------------------
+class ClusteredGroupMixtureFlowWrapper(BaseFlow):
+    """Mixture over ``K`` :class:`DiscreteGroupMixtureFlowWrapper` experts.
+
+    ``log q(x) = logsumexp_j [log w_j + log q_j(x)]`` with ``w_j`` the cluster
+    fraction and ``q_j`` the ``j``-th expert (a full group mixture with its
+    own canonical standardisation).  Only ``_n_active`` experts contribute;
+    the rest carry weight 0 and are not trained.  With ``_n_active == 1`` every
+    method is exactly ``experts[0]`` (the current single-flow behaviour).
+
+    Routing (which expert scores/generates a point, used for the per-cluster
+    training loss and the latent-radius geometry) is nearest-centroid in the
+    standardised base-flow frame -- the frame ``q0`` sees, after the branch
+    fold and the canonical transform.  The sklearn clusterer runs only in
+    :meth:`update_mixture_weights` to pick ``k`` and seed the centroids;
+    everything downstream is the centroid buffers, so the wrapper pickles and
+    resumes with the rest of the flow ``state_dict``.
+    """
+
+    def __init__(
+        self,
+        experts,
+        num_features,
+        *,
+        cluster_method="gmm",
+        max_cluster_overlap=0.05,
+        min_cluster_size=200,
+        weight_ema=0.5,
+    ):
+        super().__init__()
+        self.experts = torch.nn.ModuleList(experts)
+        self.n_experts = len(experts)
+        self.num_features = int(num_features)
+        self.group_size = experts[0].group_size
+        self.cluster_method = cluster_method
+        # Accept a k-way split only if it is *well separated*: at most this
+        # fraction of points sit in the fuzzy zone between clusters (GMM
+        # responsibility < 0.8).  Splitting a single blob makes ~half of it
+        # ambiguous, so this naturally rejects over-splitting; 0 <-> one flow.
+        self.max_cluster_overlap = float(max_cluster_overlap)
+        self.min_cluster_size = int(min_cluster_size)
+        self.weight_ema = float(weight_ema)
+
+        w0 = torch.zeros(self.n_experts)
+        w0[0] = 1.0
+        self.register_buffer("cluster_weights", w0)
+        self.register_buffer("_n_active", torch.tensor(1, dtype=torch.long))
+        self.register_buffer(
+            "_centroids", torch.zeros(self.n_experts, self.num_features)
+        )
+        self.register_buffer("_base_mu", torch.zeros(self.num_features))
+        self.register_buffer("_base_sd", torch.ones(self.num_features))
+        self.register_buffer(
+            "_clustering_seen", torch.zeros((), dtype=torch.bool)
+        )
+        self._cluster_cache = None  # (data_ptr, n, labels tensor)
+
+    # -- pass-throughs the proposal / diagnostics expect ----------------
+    @property
+    def uses_prime_space_action(self):
+        return self.experts[0].uses_prime_space_action
+
+    @property
+    def _min_canon_std(self):
+        return self.experts[0]._min_canon_std
+
+    @property
+    def weights(self):
+        # Group-element mixture weights of the routed/first expert. Read by
+        # ``GroupFlowProposalMixin._training_data_as_prime_tensor`` for the
+        # tensor dtype/device and by diagnostics; the clustered weights are
+        # ``cluster_weights``.
+        return self.experts[0].weights
+
+    @property
+    def param_names(self):
+        return self.experts[0].param_names
+
+    def set_param_names(self, names):
+        for e in self.experts:
+            e.set_param_names(names)
+
+    def set_coordinate_bridge(self, bridge):
+        for e in self.experts:
+            e.set_coordinate_bridge(bridge)
+
+    def set_affine_maps(self, scale, shift):
+        for e in self.experts:
+            e.set_affine_maps(scale, shift)
+
+    def _assign_branch(self, x):
+        return self.experts[0]._assign_branch(x)
+
+    def _to_base(self, canon):
+        return self.experts[0]._to_base(canon)
+
+    # -- routing --------------------------------------------------------
+    def _fold_to_base(self, x):
+        e = self.experts[0]
+        with torch.no_grad():
+            assigned, pre, _ = e._assign_branch(x)
+            canon = pre[assigned, torch.arange(x.shape[0], device=x.device)]
+            t, _ = e._to_base(canon)
+        return t
+
+    @torch.no_grad()
+    def _route(self, x):
+        act = int(self._n_active.item())
+        if act <= 1 or not bool(self._clustering_seen):
+            return torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+        ts = (self._fold_to_base(x) - self._base_mu) / self._base_sd
+        return torch.cdist(ts, self._centroids[:act]).argmin(dim=1)
+
+    # -- densities -----------------------------------------------------
+    def _active(self):
+        return int(self._n_active.item())
+
+    def log_prob(self, x, context=None):
+        act = self._active()
+        if act == 1:
+            return self.experts[0].log_prob(x, context=context)
+        lw = torch.log(self.cluster_weights[:act].clamp_min(1e-38))
+        lps = torch.stack(
+            [
+                self.experts[j].log_prob(x, context=context) + lw[j]
+                for j in range(act)
+            ],
+            dim=0,
+        )
+        return torch.logsumexp(lps, dim=0)
+
+    def base_distribution_log_prob(self, z, context=None):
+        return self.experts[0].base_distribution_log_prob(z, context=context)
+
+    def sample_latent_distribution(self, n, context=None):
+        return self.experts[0].sample_latent_distribution(n, context=context)
+
+    # -- generative --------------------------------------------------
+    def _draw_assignments(self, n, device):
+        act = self._active()
+        w = self.cluster_weights[:act]
+        return torch.multinomial(w / w.sum(), int(n), replacement=True).to(
+            device
+        )
+
+    def sample_and_log_prob(self, num_samples, context=None):
+        act = self._active()
+        if act == 1:
+            return self.experts[0].sample_and_log_prob(
+                num_samples, context=context
+            )
+        dev = self.cluster_weights.device
+        assign = self._draw_assignments(num_samples, dev)
+        parts = []
+        for j in range(act):
+            nj = int((assign == j).sum())
+            if nj:
+                xj, _ = self.experts[j].sample_and_log_prob(
+                    nj, context=context
+                )
+                parts.append(xj)
+        x = torch.cat(parts, dim=0)
+        x = x[torch.randperm(x.shape[0], device=x.device)]
+        return x, self.log_prob(x, context=context)
+
+    def sample(self, n, context=None):
+        return self.sample_and_log_prob(n, context=context)[0]
+
+    def forward(self, x, context=None):
+        act = self._active()
+        if act == 1:
+            return self.experts[0].forward(x, context=context)
+        r = self._route(x)
+        z = x.new_zeros(x.shape[0], self.num_features)
+        log_j = x.new_zeros(x.shape[0])
+        for j in range(act):
+            m = r == j
+            if bool(m.any()):
+                zj, jj = self.experts[j].forward(x[m], context=context)
+                z[m] = zj
+                log_j[m] = jj
+        return z, log_j
+
+    def inverse(self, z, context=None):
+        act = self._active()
+        if act == 1:
+            return self.experts[0].inverse(z, context=context)
+        assign = self._draw_assignments(z.shape[0], z.device)
+        x = z.new_zeros(z.shape[0], self.num_features)
+        for j in range(act):
+            m = assign == j
+            if bool(m.any()):
+                xj, _ = self.experts[j].inverse(z[m], context=context)
+                x[m] = xj
+        # non-literal log_j: base_distribution_log_prob(z) - log_j == log q(x)
+        log_q = self.log_prob(x, context=context)
+        log_j = (
+            self.base_distribution_log_prob(z, context=context) - log_q
+        )
+        return x, log_j
+
+    def forward_and_log_prob(self, x, context=None):
+        z, _ = self.forward(x, context=context)
+        return z, self.log_prob(x, context=context)
+
+    def freeze_transform(self):
+        for e in self.experts:
+            e.freeze_transform()
+
+    def unfreeze_transform(self):
+        for e in self.experts:
+            e.unfreeze_transform()
+
+    def finalise(self):
+        for e in self.experts:
+            e.finalise()
+
+    def end_iteration(self):
+        for e in self.experts:
+            e.end_iteration()
+
+    # -- per-cluster training loss ----------------------------------
+    def loss_function(self, x, conditional=None):
+        """Per-cluster negative log-likelihood.
+
+        Each point is scored only by its routed expert; the weighted sum is
+        the mixture NLL with a hard assignment (the piecewise-flow objective
+        of arXiv:2305.02930).  ``FlowModel._train`` picks this up via
+        ``hasattr(model, "loss_function")``.
+        """
+        act = self._active()
+        if act == 1:
+            return -self.experts[0].log_prob(x).mean()
+        r = self._route(x)
+        total = x.new_zeros(())
+        for j in range(act):
+            m = r == j
+            if bool(m.any()):
+                total = total + self.cluster_weights[j] * (
+                    -self.experts[j].log_prob(x[m]).mean()
+                )
+        return total
+
+    # -- clustering update (called from GroupFlowProposalMixin.check_state)
+    def _cluster(self, x):
+        """Fit the clusterer on the folded training data; cache the labels."""
+        key = (x.data_ptr(), int(x.shape[0]))
+        if self._cluster_cache is not None and self._cluster_cache[0] == key:
+            return self._cluster_cache[1]
+
+        t = self._fold_to_base(x).detach().cpu().numpy()
+        n = t.shape[0]
+        mu = t.mean(axis=0)
+        sd = np.maximum(t.std(axis=0), 1e-9)
+        ts = (t - mu) / sd
+
+        k, labels, centroids = 1, np.zeros(n, dtype=int), ts.mean(0, keepdims=True)
+        k_max = min(self.n_experts, n // max(self.min_cluster_size, 1))
+        if k_max >= 2:
+            k, labels, centroids = self._select_k(ts, k_max)
+
+        # order clusters tightest-first (stable slot assignment across rounds:
+        # the localised sheet keeps its expert)
+        if k >= 2:
+            spread = [ts[labels == c].std() for c in range(k)]
+            order = np.argsort(spread)
+            remap = {old: new for new, old in enumerate(order)}
+            labels = np.array([remap[c] for c in labels])
+            centroids = centroids[order]
+
+        with torch.no_grad():
+            dev = self.cluster_weights.device
+            self._base_mu.copy_(torch.as_tensor(mu, dtype=self._base_mu.dtype))
+            self._base_sd.copy_(torch.as_tensor(sd, dtype=self._base_sd.dtype))
+            self._centroids.zero_()
+            self._centroids[:k].copy_(
+                torch.as_tensor(centroids, dtype=self._centroids.dtype)
+            )
+            counts = np.bincount(labels, minlength=self.n_experts).astype(float)
+            w = torch.zeros(self.n_experts, device=dev, dtype=self.cluster_weights.dtype)
+            w[:k] = torch.as_tensor(
+                counts[:k] / counts[:k].sum(), dtype=self.cluster_weights.dtype
+            )
+            first = not bool(self._clustering_seen) or int(
+                self._n_active.item()
+            ) != k
+            if first:
+                self.cluster_weights.copy_(w)
+            else:
+                beta = self.weight_ema
+                self.cluster_weights.mul_(1 - beta).add_(beta * w)
+                self.cluster_weights.div_(self.cluster_weights.sum())
+            self._n_active.fill_(k)
+            self._clustering_seen.fill_(True)
+
+        lab_t = torch.as_tensor(labels, device=x.device, dtype=torch.long)
+        self._cluster_cache = (key, lab_t)
+        logger.info(
+            "Clustered group mixture: k=%d, weights=%s, sizes=%s",
+            k,
+            np.round(self.cluster_weights[:k].cpu().numpy(), 3).tolist(),
+            np.bincount(labels, minlength=k).tolist(),
+        )
+        return lab_t
+
+    def _select_k(self, ts, k_max):
+        """Pick ``k`` in ``[1, k_max]`` and return ``(k, labels, centroids)``.
+
+        The largest ``k`` whose GMM clusters are all above ``min_cluster_size``
+        and *well separated* -- the fraction of points with max responsibility
+        below 0.8 is under ``max_cluster_overlap``.  Over-splitting a single
+        blob makes ~half of it ambiguous, so it is rejected; ``k = 1`` when no
+        split is clean.
+        """
+        from sklearn.cluster import KMeans
+        from sklearn.mixture import GaussianMixture
+
+        n = ts.shape[0]
+        k, labels, centroids = 1, np.zeros(n, dtype=int), ts.mean(
+            0, keepdims=True
+        )
+        for kk in range(2, k_max + 1):
+            gm = GaussianMixture(
+                n_components=kk, covariance_type="full", n_init=3,
+                random_state=0, reg_covar=1e-4,
+            ).fit(ts)
+            resp = gm.predict_proba(ts)
+            lab = resp.argmax(axis=1)
+            if np.bincount(lab, minlength=kk).min() < self.min_cluster_size:
+                continue
+            overlap = float(np.mean(resp.max(axis=1) < 0.8))
+            if overlap > self.max_cluster_overlap:
+                continue
+            cen = gm.means_
+            if self.cluster_method == "kmeans":
+                km = KMeans(
+                    n_clusters=kk, n_init=10, random_state=0
+                ).fit(ts)
+                lab, cen = km.labels_, km.cluster_centers_
+            k, labels, centroids = kk, lab, cen
+        return k, labels, centroids
+
+    @torch.no_grad()
+    def update_mixture_weights(self, x, context=None, smoothing=1.0):
+        labels = self._cluster(x)
+        for j in range(self._active()):
+            m = labels == j
+            if bool(m.any()):
+                self.experts[j].update_mixture_weights(
+                    x[m], context=context, smoothing=smoothing
+                )
+
+    @torch.no_grad()
+    def update_base_standardisation(self, x, context=None):
+        labels = self._cluster(x)
+        for j in range(self._active()):
+            m = labels == j
+            if bool(m.any()):
+                self.experts[j].update_base_standardisation(
+                    x[m], context=context
+                )
+
+
+class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
+    """:class:`GroupMixtureFlowModel` building a
+    :class:`ClusteredGroupMixtureFlowWrapper` of ``n_clusters_max`` experts."""
+
+    n_clusters_max = 2
+    cluster_method = "gmm"
+    max_cluster_overlap = 0.05
+    min_cluster_size = 200
+
+    def get_model(self, config):
+        k = max(int(getattr(self, "n_clusters_max", 1)), 1)
+        experts = [
+            GroupMixtureFlowModel.get_model(self, config) for _ in range(k)
+        ]
+        if k == 1:
+            return experts[0]
+        return ClusteredGroupMixtureFlowWrapper(
+            experts,
+            experts[0].num_features,
+            cluster_method=getattr(self, "cluster_method", "gmm"),
+            max_cluster_overlap=getattr(self, "max_cluster_overlap", 0.05),
+            min_cluster_size=getattr(self, "min_cluster_size", 200),
+        )
+
+
+def make_clustered_group_mixture_flow(
+    *,
+    n_clusters_max=2,
+    cluster_method="gmm",
+    max_cluster_overlap=0.05,
+    min_cluster_size=200,
+    **kwargs,
+):
+    """:func:`make_group_mixture_flow` with a clustered base flow.
+
+    ``n_clusters_max`` independent group-mixture experts, one per data cluster
+    found each training round (GMM; ``k`` = the largest value in
+    ``[1, n_clusters_max]`` whose components are all well separated -- at most
+    ``max_cluster_overlap`` of points ambiguous).  ``k == 1`` -- the data is
+    not decisively multi-modal, or ``n_clusters_max == 1`` -- is byte-identical
+    to :func:`make_group_mixture_flow` (``get_model`` returns the plain
+    wrapper).  All other keyword arguments are passed straight through.
+    """
+    base_cls = make_group_mixture_flow(**kwargs)
+
+    class ClusteredCustom(ClusteredGroupMixtureFlowModel, base_cls):
+        pass
+
+    ClusteredCustom.n_clusters_max = int(n_clusters_max)
+    ClusteredCustom.cluster_method = cluster_method
+    ClusteredCustom.max_cluster_overlap = float(max_cluster_overlap)
+    ClusteredCustom.min_cluster_size = int(min_cluster_size)
+    return ClusteredCustom
+
+
 class GroupFlowProposalMixin:
     """Mixin wiring a :class:`~nessai.proposal.FlowProposal` to a group-mixture flow.
 

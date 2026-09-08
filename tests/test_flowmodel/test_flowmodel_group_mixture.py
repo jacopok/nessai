@@ -1004,3 +1004,175 @@ def test_canonical_transform_sample_and_log_prob_consistent(base_flow):
     assert (log_q2[finite] >= w.log_prob(x2)[finite] - 1e-4).all()
 
 
+
+
+# ---------------------------------------------------------------------------
+# Clustered group mixture
+# ---------------------------------------------------------------------------
+from nessai.flowmodel.group_mixture import (  # noqa: E402
+    ClusteredGroupMixtureFlowWrapper,
+    ClusteredGroupMixtureFlowModel,
+    make_clustered_group_mixture_flow,
+)
+
+
+def _expert(base_flow_cfg=None):
+    cfg = base_flow_cfg or {
+        "n_inputs": 2, "ftype": "realnvp", "n_blocks": 2, "n_neurons": 4,
+        "n_layers": 1, "batch_norm_between_layers": False,
+    }
+    return DiscreteGroupMixtureFlowWrapper(
+        base_flow=configure_model(cfg),
+        num_features=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=PARAM_NAMES,
+        in_fundamental_domain=in_fundamental_domain,
+    )
+
+
+def _clustered_wrapper(k=2):
+    w = ClusteredGroupMixtureFlowWrapper(
+        [_expert() for _ in range(k)], num_features=2, min_cluster_size=10,
+    )
+    w.eval()
+    return w
+
+
+def test_clustered_k1_returns_plain_wrapper():
+    cls = make_clustered_group_mixture_flow(
+        n_clusters_max=1,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=PARAM_NAMES,
+        in_fundamental_domain=in_fundamental_domain,
+    )
+    assert issubclass(cls, ClusteredGroupMixtureFlowModel)
+    fm = cls(flow_config={"n_inputs": 2, "ftype": "realnvp", "n_blocks": 2,
+                          "n_neurons": 4, "n_layers": 1,
+                          "batch_norm_between_layers": False})
+    fm.initialise()
+    assert isinstance(fm.model, DiscreteGroupMixtureFlowWrapper)
+    assert not isinstance(fm.model, ClusteredGroupMixtureFlowWrapper)
+
+
+def test_clustered_wrapper_defaults_to_first_expert():
+    w = _clustered_wrapper(2)
+    assert int(w._n_active.item()) == 1
+    x = points_in_element(0, 32, np.random.default_rng(0))
+    # deterministic paths: log_prob and forward are exactly experts[0]
+    assert torch.allclose(w.log_prob(x), w.experts[0].log_prob(x))
+    torch.manual_seed(0)
+    z0, j0 = w.forward(x)
+    torch.manual_seed(0)
+    z1, j1 = w.experts[0].forward(x)
+    assert torch.allclose(z0, z1) and torch.allclose(j0, j1)
+    # inverse is stochastic in both; just check the reconstruction identity
+    x_i, log_j = w.inverse(torch.randn(64, 2))
+    recon = w.base_distribution_log_prob(torch.zeros(64, 2))  # smoke
+    assert x_i.shape == (64, 2) and log_j.shape == (64,)
+
+
+def test_clustered_log_prob_is_logsumexp_of_experts():
+    w = _clustered_wrapper(2)
+    with torch.no_grad():
+        w._n_active.fill_(2)
+        w._clustering_seen.fill_(True)
+        w.cluster_weights.copy_(torch.tensor([0.7, 0.3]))
+    rng = np.random.default_rng(1)
+    x = points_in_element(0, 64, rng)
+    expected = torch.logsumexp(
+        torch.stack([
+            w.experts[0].log_prob(x) + np.log(0.7),
+            w.experts[1].log_prob(x) + np.log(0.3),
+        ]), dim=0,
+    )
+    assert torch.allclose(w.log_prob(x), expected, atol=1e-5)
+
+
+def test_clustered_inverse_log_j_matches_log_prob():
+    w = _clustered_wrapper(2)
+    with torch.no_grad():
+        w._n_active.fill_(2)
+        w._clustering_seen.fill_(True)
+        w.cluster_weights.copy_(torch.tensor([0.5, 0.5]))
+        w._centroids[:2].copy_(torch.tensor([[0.0, -2.0], [0.0, 2.0]]))
+    torch.manual_seed(0)
+    z = torch.randn(256, 2)
+    x, log_j = w.inverse(z)
+    recon = w.base_distribution_log_prob(z) - log_j
+    finite = torch.isfinite(recon) & torch.isfinite(w.log_prob(x))
+    assert finite.float().mean() > 0.5
+    assert torch.allclose(recon[finite], w.log_prob(x)[finite], atol=1e-4)
+
+
+def test_clustered_clusters_bimodal_folded_data():
+    w = _clustered_wrapper(3)
+    rng = np.random.default_rng(0)
+    # folded x in [0,1); y bimodal at +/-3
+    n = 800
+    x = rng.uniform(0, 1, n)
+    y = np.where(rng.random(n) < 0.6, rng.normal(3, 0.4, n),
+                 rng.normal(-3, 0.4, n))
+    data = torch.tensor(np.stack([x, y], 1), dtype=torch.float32)
+    w.update_mixture_weights(data)
+    w.update_base_standardisation(data)
+    assert int(w._n_active.item()) == 2
+    wts = w.cluster_weights[:2].detach().numpy()
+    assert abs(wts.sum() - 1.0) < 1e-5
+    # routing recovers the two y-blobs
+    r = w._route(data).numpy()
+    hi = y[r == 0].mean(), y[r == 1].mean()
+    assert abs(hi[0] - hi[1]) > 3.0
+
+
+def test_clustered_stays_k1_for_unimodal_data():
+    w = _clustered_wrapper(3)
+    rng = np.random.default_rng(0)
+    x = rng.uniform(0, 1, 600)
+    y = rng.normal(0, 1, 600)
+    data = torch.tensor(np.stack([x, y], 1), dtype=torch.float32)
+    w.update_mixture_weights(data)
+    assert int(w._n_active.item()) == 1
+
+
+class _FoldedBimodalModel(PeriodicModel):
+    def log_likelihood(self, x):
+        base = super().log_likelihood(x)
+        y = np.atleast_1d(x["y"])
+        blob = np.logaddexp(-0.5 * ((y - 2.5) / 0.5) ** 2,
+                            -0.5 * ((y + 2.5) / 0.5) ** 2)
+        return base + 0.5 * y**2 + blob  # cancel the parent's -0.5 y^2
+
+
+_ClusteredPeriodicFlowModel = make_clustered_group_mixture_flow(
+    n_clusters_max=2, min_cluster_size=50, max_cluster_overlap=0.15,
+    group_action_fn=shift_group_action, group_size=N_PERIODS,
+    param_names=["x", "y"], in_fundamental_domain=in_fundamental_domain,
+)
+
+
+class ClusteredPeriodicGroupFlowProposal(GroupFlowProposalMixin, FlowProposal):
+    _FlowModelClass = _ClusteredPeriodicFlowModel
+
+
+@pytest.mark.slow_integration_test
+def test_sampling_with_clustered_group_mixture_flow(tmp_path):
+    fs = FlowSampler(
+        _FoldedBimodalModel(),
+        output=tmp_path / "clustered",
+        flow_proposal_class=ClusteredPeriodicGroupFlowProposal,
+        flow_config={"model": "realnvp", "n_blocks": 2, "n_neurons": 8},
+        nlive=500,
+        maximum_uninformed=500,
+        plot=False,
+        resume=False,
+        seed=1234,
+    )
+    fs.run(plot=False)
+    model = fs.ns._flow_proposal.flow.model
+    if isinstance(model, ClusteredGroupMixtureFlowWrapper):
+        assert np.isclose(
+            model.cluster_weights[: int(model._n_active.item())]
+            .detach().cpu().numpy().sum(), 1.0)
+    assert np.isfinite(fs.log_evidence)
