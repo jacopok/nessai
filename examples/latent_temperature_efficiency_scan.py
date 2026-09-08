@@ -15,6 +15,8 @@ more draws fall outside the prior box.
 Run: ``python examples/latent_temperature_efficiency_scan.py``
 """
 
+import os
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -149,5 +151,9 @@ ax.set_ylabel("efficiency")
 ax.set_xscale("log")
 ax.legend()
 fig.tight_layout()
-fig.savefig("latent_temperature_efficiency_scan.png", dpi=120)
-print("saved latent_temperature_efficiency_scan.png")
+plot_path = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "latent_temperature_efficiency_scan.png",
+)
+fig.savefig(plot_path, dpi=120)
+print(f"saved {plot_path}")

@@ -52,6 +52,16 @@ class FlowProposal(BaseFlowProposal):
         Extra keyword arguments forwarded to
         :func:`nessai.utils.temperature.optimise_latent_temperature`, e.g.
         ``criterion`` ("efficiency" or "ess"), ``tau`` or ``grid_range``.
+    latent_temperature_validate : bool, optional
+        If True (default) a candidate temperature is only adopted when a fresh
+        validation batch drawn at that temperature has a higher rejection
+        efficiency than one drawn at the current temperature; otherwise the
+        geometric midpoint is tried, and failing that the temperature is left
+        unchanged. This guards against the retroactive estimate being
+        optimistically biased away from the draw temperature.
+    latent_temperature_validation_size : int, optional
+        Number of latent samples per validation batch. Defaults to
+        ``drawsize``.
     constant_volume_mode : bool, optional
         Whether to use constant volume mode for the latent radius. This argument
         is deprecated and should be configured via :code:`truncation_methods`
@@ -118,6 +128,8 @@ class FlowProposal(BaseFlowProposal):
         latent_temperature=None,
         adapt_latent_temperature=False,
         latent_temperature_kwargs=None,
+        latent_temperature_validate=True,
+        latent_temperature_validation_size=None,
         constant_volume_mode=None,
         volume_fraction=None,
         fuzz=None,
@@ -145,6 +157,8 @@ class FlowProposal(BaseFlowProposal):
             latent_temperature=latent_temperature,
             adapt_latent_temperature=adapt_latent_temperature,
             latent_temperature_kwargs=latent_temperature_kwargs,
+            latent_temperature_validate=latent_temperature_validate,
+            latent_temperature_validation_size=latent_temperature_validation_size,
         )
 
         self._truncation_scheme = TruncationScheme()
@@ -267,6 +281,8 @@ class FlowProposal(BaseFlowProposal):
         latent_temperature=None,
         adapt_latent_temperature=False,
         latent_temperature_kwargs=None,
+        latent_temperature_validate=True,
+        latent_temperature_validation_size=None,
     ) -> None:
         """Configure settings related to population."""
         if drawsize is None:
@@ -296,6 +312,10 @@ class FlowProposal(BaseFlowProposal):
         self.latent_temperature_kwargs = {
             **(latent_temperature_kwargs or {})
         }
+        self.latent_temperature_validate = latent_temperature_validate
+        self.latent_temperature_validation_size = (
+            latent_temperature_validation_size
+        )
         self.latent_temperature_history = []
 
     def configure_truncation(
@@ -604,14 +624,60 @@ class FlowProposal(BaseFlowProposal):
             return float(fixed)
         return np.inf
 
-    def _update_latent_temperature(self, r, log_w) -> None:
-        """Retroactively update ``latent_temperature`` from the drawn batch.
+    def _draw_latent_efficiency(self, temperature, n):
+        """Rejection efficiency of a fresh batch drawn at ``temperature``.
 
-        Uses :func:`nessai.utils.temperature.optimise_latent_temperature` to
-        estimate the temperature that best matches the target within the
-        secondary-ESS trust region, reusing the current batch of latent radii
-        and importance weights. Successive calls (one per ``populate``)
-        implement the iterate-if-needed step.
+        Draws ``n`` latent samples at ``temperature``, pushes them through the
+        flow and the same truncation stages used by :meth:`populate`, and
+        returns ``mean(w) / max(w)`` with every draw lost to truncation /
+        prior bounds counted as zero weight. Returns ``-inf`` if the batch is
+        entirely rejected.
+        """
+        original = self.latent_temperature
+        self.latent_temperature = float(temperature)
+        try:
+            z_full = np.asarray(
+                self.sample_latent_distribution(n), dtype=float
+            )
+            n_drawn = z_full.shape[0]
+            z = self._truncation_scheme.apply_latent(self, z_full)
+            if not len(z):
+                return -np.inf
+            x, log_q, z = self.backward_pass(
+                z,
+                rescale=True,
+                return_z=True,
+                return_unit_hypercube=self.map_to_unit_hypercube,
+            )
+            x, log_q, z = self._truncation_scheme.apply_after_backward(
+                self, x, log_q, z
+            )
+            if not len(x):
+                return -np.inf
+            log_w = self.compute_weights(x, log_q)
+        finally:
+            self.latent_temperature = original
+
+        log_w = log_w[np.isfinite(log_w)]
+        if log_w.size < 2:
+            return -np.inf
+        # mean over *all* draws (lost ones contribute zero), divided by max.
+        log_eff = (
+            logsumexp(log_w) - np.log(n_drawn) - np.max(log_w)
+        )
+        return float(np.exp(log_eff))
+
+    def _update_latent_temperature(self, r, log_w) -> None:
+        """Update ``latent_temperature`` from the drawn batch.
+
+        A candidate temperature is proposed by retroactively reweighting the
+        just-completed batch within the secondary-ESS trust region
+        (:func:`nessai.utils.temperature.optimise_latent_temperature`). When
+        ``latent_temperature_validate`` is True the candidate (and, failing
+        that, the geometric midpoint) is only accepted if a *fresh* validation
+        batch drawn at that temperature has a higher rejection efficiency than
+        one drawn at the current temperature -- so the temperature never moves
+        to a value that is measurably worse.
         """
         # Keep zero-weight (-inf) draws: they represent samples lost to
         # truncation / prior bounds and must count against the efficiency of a
@@ -633,15 +699,40 @@ class FlowProposal(BaseFlowProposal):
         except RuntimeError as exc:
             logger.warning("Latent-temperature adaptation skipped: %s", exc)
             return
-        new_temperature = result["temperature"]
+        candidate = result["temperature"]
+
+        if not self.latent_temperature_validate:
+            self.latent_temperature = candidate
+            self.latent_temperature_history.append(candidate)
+            return
+
+        if np.isclose(candidate, current, rtol=1e-3):
+            self.latent_temperature_history.append(current)
+            return
+
+        n_val = self.latent_temperature_validation_size or self.drawsize
+        eff_current = self._draw_latent_efficiency(current, n_val)
+        eff_candidate = self._draw_latent_efficiency(candidate, n_val)
+        chosen, eff_chosen = current, eff_current
+        if eff_candidate > eff_current:
+            chosen, eff_chosen = candidate, eff_candidate
+        else:
+            midpoint = float(np.sqrt(current * candidate))
+            eff_mid = self._draw_latent_efficiency(midpoint, n_val)
+            if eff_mid > eff_current:
+                chosen, eff_chosen = midpoint, eff_mid
+
         logger.info(
-            "Adapted latent_temperature %.4f -> %.4f (boundary=%s)",
+            "Latent-temperature validation: current=%.4f (eff=%.4f), "
+            "candidate=%.4f (eff=%.4f) -> %.4f",
             current,
-            new_temperature,
-            result["at_trust_boundary"],
+            eff_current,
+            candidate,
+            eff_candidate,
+            chosen,
         )
-        self.latent_temperature = new_temperature
-        self.latent_temperature_history.append(new_temperature)
+        self.latent_temperature = chosen
+        self.latent_temperature_history.append(chosen)
 
     def reset(self) -> None:
         """Reset the proposal."""

@@ -140,4 +140,5 @@ cython_debug/
 
 # Project specific
 outdir/
+examples/*.png
 autoapi/

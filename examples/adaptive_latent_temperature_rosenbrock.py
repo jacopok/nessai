@@ -1,11 +1,14 @@
 """Compare FlowProposal with and without adaptive latent-temperature.
 
-Runs nessai twice on a 5-D Rosenbrock likelihood (uniform prior): once with the
-default proposal and once with ``adapt_latent_temperature=True``, then compares
-the per-population proposal acceptance.
+Runs nessai on a 5-D Rosenbrock likelihood (uniform prior) for a handful of
+seeds, once with the default proposal and once with
+``adapt_latent_temperature=True`` (validation-batch gated), and compares the
+per-population proposal acceptance and the evidence.
 
 Run: ``python examples/adaptive_latent_temperature_rosenbrock.py``
 """
+
+import os
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -15,8 +18,12 @@ from nessai.model import Model
 from nessai.utils import configure_logger
 
 DIMS = 5
-SEED = 1451
+SEEDS = [1451, 7, 20240, 99]
 BASE_OUTPUT = "./outdir/adaptive_latent_temperature_rosenbrock/"
+PLOT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "adaptive_latent_temperature_rosenbrock.png",
+)
 
 configure_logger(output=BASE_OUTPUT, log_level="WARNING")
 
@@ -43,47 +50,86 @@ class RosenbrockModel(Model):
         )
 
 
-def run(label, **proposal_kwargs):
+def run(label, seed, **proposal_kwargs):
     model = RosenbrockModel(DIMS)
     fs = FlowSampler(
         model,
-        output=BASE_OUTPUT + label,
+        output=f"{BASE_OUTPUT}{label}_{seed}",
         flow_config=dict(n_blocks=4, n_neurons=10, n_layers=3),
         resume=False,
-        seed=SEED,
+        seed=seed,
         plot=False,
         **proposal_kwargs,
     )
     fs.run(plot=False)
     ns = fs.ns
     accept = np.asarray(ns.history["population_acceptance"], dtype=float)
-    temps = getattr(fs.ns._flow_proposal, "latent_temperature_history", [])
-    print(
-        f"[{label}] logZ = {fs.log_evidence:.3f} +/- {fs.log_evidence_error:.3f}"
-        f" | likelihood evals = {ns.total_likelihood_evaluations}"
-        f" | mean proposal acceptance = {np.nanmean(accept):.4f}"
+    temps = list(
+        getattr(fs.ns._flow_proposal, "latent_temperature_history", [])
     )
-    if temps:
-        print(f"[{label}] final latent_temperature = {temps[-1]:.3f}")
-    return accept, temps
+    return dict(
+        accept=accept,
+        temps=temps,
+        logZ=fs.log_evidence,
+        logZ_err=fs.log_evidence_error,
+        n_like=ns.total_likelihood_evaluations,
+    )
 
 
-baseline_acc, _ = run("baseline")
-adaptive_acc, adaptive_temps = run(
-    "adaptive", adapt_latent_temperature=True
+baseline, adaptive = [], []
+for seed in SEEDS:
+    b = run("baseline", seed)
+    a = run(
+        "adaptive",
+        seed,
+        adapt_latent_temperature=True,
+        latent_temperature_validation_size=20000,
+    )
+    baseline.append(b)
+    adaptive.append(a)
+    print(
+        f"seed {seed:>6}: "
+        f"acceptance {np.nanmean(b['accept']):.4f} -> "
+        f"{np.nanmean(a['accept']):.4f} | "
+        f"logZ {b['logZ']:.3f} -> {a['logZ']:.3f} | "
+        f"n_like {b['n_like']} -> {a['n_like']} | "
+        f"final T {a['temps'][-1] if a['temps'] else 1.0:.2f}"
+    )
+
+b_acc = np.array([np.nanmean(r["accept"]) for r in baseline])
+a_acc = np.array([np.nanmean(r["accept"]) for r in adaptive])
+b_lnz = np.array([r["logZ"] for r in baseline])
+a_lnz = np.array([r["logZ"] for r in adaptive])
+print(
+    f"\nmean acceptance  baseline {b_acc.mean():.4f} +/- {b_acc.std():.4f}"
+    f"   adaptive {a_acc.mean():.4f} +/- {a_acc.std():.4f}"
+)
+print(
+    f"mean logZ        baseline {b_lnz.mean():.3f} +/- {b_lnz.std():.3f}"
+    f"   adaptive {a_lnz.mean():.3f} +/- {a_lnz.std():.3f}"
 )
 
-fig, axs = plt.subplots(2, 1, figsize=(7, 6), sharex=False)
-axs[0].plot(baseline_acc, label="baseline", marker=".")
-axs[0].plot(adaptive_acc, label="adaptive T", marker=".")
-axs[0].set_xlabel("population index")
-axs[0].set_ylabel("proposal acceptance")
-axs[0].legend()
-axs[1].plot(adaptive_temps, marker=".", color="C1")
+fig, axs = plt.subplots(1, 2, figsize=(11, 4.2))
+axs[0].axhline(0, color="k", lw=0.8)
+axs[0].bar(
+    np.arange(len(SEEDS)),
+    a_acc - b_acc,
+    color=["C2" if d > 0 else "C3" for d in a_acc - b_acc],
+)
+axs[0].set_xticks(np.arange(len(SEEDS)))
+axs[0].set_xticklabels(SEEDS)
+axs[0].set_xlabel("seed")
+axs[0].set_ylabel("adaptive - baseline mean acceptance")
+axs[0].set_title(
+    f"acceptance: {b_acc.mean():.3f} -> {a_acc.mean():.3f}"
+)
+for r in adaptive:
+    axs[1].plot(r["temps"], marker=".", alpha=0.8)
 axs[1].axhline(1.0, color="k", ls=":", label="baseline T = 1")
 axs[1].set_xlabel("adaptation step")
 axs[1].set_ylabel("latent_temperature")
+axs[1].set_title("adaptive temperature trajectories")
 axs[1].legend()
 fig.tight_layout()
-fig.savefig("adaptive_latent_temperature_rosenbrock.png", dpi=120)
-print("saved adaptive_latent_temperature_rosenbrock.png")
+fig.savefig(PLOT_PATH, dpi=120)
+print(f"saved {PLOT_PATH}")

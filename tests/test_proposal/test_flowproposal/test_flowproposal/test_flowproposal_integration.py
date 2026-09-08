@@ -84,6 +84,37 @@ def test_flowproposal_adapt_latent_temperature(tmp_path, model, flow_config):
     assert fp.latent_temperature > 0.0
 
 
+@pytest.mark.integration_test
+@pytest.mark.timeout(30)
+def test_flowproposal_adapt_latent_temperature_validation_rejects(
+    tmp_path, model, flow_config
+):
+    """A candidate that does not validate leaves the temperature unchanged."""
+    output = tmp_path / "flowproposal"
+    output.mkdir()
+    fp = FlowProposal(
+        model,
+        output=output,
+        flow_config=flow_config,
+        plot=False,
+        poolsize=200,
+        adapt_latent_temperature=True,
+        latent_temperature_validate=True,
+    )
+    fp.initialise()
+
+    # Validation always reports the current temperature as the best option.
+    fp._draw_latent_efficiency = lambda temperature, n: (
+        1.0 if np.isclose(temperature, fp.latent_temperature) else 0.0
+    )
+
+    worst = numpy_array_to_live_points(0.01 * np.ones(fp.dims), fp.parameters)
+    fp.populate(worst, n_samples=50)
+
+    assert fp.latent_temperature == 1.0
+    assert fp.latent_temperature_history == [1.0]
+
+
 @pytest.mark.parametrize(
     "truncation_methods",
     [[], ["likelihood_threshold"]],
