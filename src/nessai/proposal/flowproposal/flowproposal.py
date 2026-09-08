@@ -62,6 +62,9 @@ class FlowProposal(BaseFlowProposal):
     latent_temperature_validation_size : int, optional
         Number of latent samples per validation batch. Defaults to
         ``drawsize``.
+    latent_temperature_warmup : int, optional
+        Number of flow trainings to wait before adapting the temperature; the
+        density model is unreliable early in the run. Defaults to 2.
     constant_volume_mode : bool, optional
         Whether to use constant volume mode for the latent radius. This argument
         is deprecated and should be configured via :code:`truncation_methods`
@@ -130,6 +133,7 @@ class FlowProposal(BaseFlowProposal):
         latent_temperature_kwargs=None,
         latent_temperature_validate=True,
         latent_temperature_validation_size=None,
+        latent_temperature_warmup=2,
         constant_volume_mode=None,
         volume_fraction=None,
         fuzz=None,
@@ -159,6 +163,7 @@ class FlowProposal(BaseFlowProposal):
             latent_temperature_kwargs=latent_temperature_kwargs,
             latent_temperature_validate=latent_temperature_validate,
             latent_temperature_validation_size=latent_temperature_validation_size,
+            latent_temperature_warmup=latent_temperature_warmup,
         )
 
         self._truncation_scheme = TruncationScheme()
@@ -283,6 +288,7 @@ class FlowProposal(BaseFlowProposal):
         latent_temperature_kwargs=None,
         latent_temperature_validate=True,
         latent_temperature_validation_size=None,
+        latent_temperature_warmup=2,
     ) -> None:
         """Configure settings related to population."""
         if drawsize is None:
@@ -316,6 +322,7 @@ class FlowProposal(BaseFlowProposal):
         self.latent_temperature_validation_size = (
             latent_temperature_validation_size
         )
+        self.latent_temperature_warmup = int(latent_temperature_warmup)
         self.latent_temperature_history = []
 
     def configure_truncation(
@@ -611,14 +618,18 @@ class FlowProposal(BaseFlowProposal):
     def _latent_truncation_radius(self) -> float:
         """Return the hard latent-space truncation radius, or ``inf``.
 
-        Only a finite ``fixed_radius`` on the ``latent_radius`` rule is treated
-        as a temperature-independent hard cap on ``|z|``; any adaptively
-        recomputed radius is ignored (it is not constant across temperatures)
-        and the untruncated result is used instead.
+        The ``latent_radius`` rule applies a fixed ``|z| <= threshold`` cut for
+        the batch just drawn; that threshold is the radius the reweighting must
+        assume when extrapolating to another temperature (the fraction of the
+        base density inside it, ``F_T``, then depends on the temperature). If
+        no ``latent_radius`` rule is active the latent space is untruncated.
         """
         rule = self._get_latent_radius_rule()
         if rule is None:
             return np.inf
+        threshold = getattr(rule, "threshold", np.nan)
+        if threshold is not None and np.isfinite(threshold):
+            return float(threshold)
         fixed = getattr(rule, "fixed_radius", False)
         if fixed is not False and np.isfinite(fixed):
             return float(fixed)
@@ -678,7 +689,16 @@ class FlowProposal(BaseFlowProposal):
         batch drawn at that temperature has a higher rejection efficiency than
         one drawn at the current temperature -- so the temperature never moves
         to a value that is measurably worse.
+
+        No update is made until the flow has been trained more than
+        ``latent_temperature_warmup`` times, since the density model (and hence
+        the estimate) is unreliable early in the run.
         """
+        if self.training_count <= self.latent_temperature_warmup:
+            self.latent_temperature_history.append(
+                self.latent_temperature or 1.0
+            )
+            return
         # Keep zero-weight (-inf) draws: they represent samples lost to
         # truncation / prior bounds and must count against the efficiency of a
         # candidate temperature. Only genuine NaNs are dropped.
@@ -713,14 +733,14 @@ class FlowProposal(BaseFlowProposal):
         n_val = self.latent_temperature_validation_size or self.drawsize
         eff_current = self._draw_latent_efficiency(current, n_val)
         eff_candidate = self._draw_latent_efficiency(candidate, n_val)
-        chosen, eff_chosen = current, eff_current
+        chosen = current
         if eff_candidate > eff_current:
-            chosen, eff_chosen = candidate, eff_candidate
+            chosen = candidate
         else:
             midpoint = float(np.sqrt(current * candidate))
             eff_mid = self._draw_latent_efficiency(midpoint, n_val)
             if eff_mid > eff_current:
-                chosen, eff_chosen = midpoint, eff_mid
+                chosen = midpoint
 
         logger.info(
             "Latent-temperature validation: current=%.4f (eff=%.4f), "
@@ -751,5 +771,6 @@ class FlowProposal(BaseFlowProposal):
         state.setdefault("latent_temperature_kwargs", {})
         state.setdefault("latent_temperature_validate", True)
         state.setdefault("latent_temperature_validation_size", None)
+        state.setdefault("latent_temperature_warmup", 2)
         state.setdefault("latent_temperature_history", [])
         self.__dict__.update(state)

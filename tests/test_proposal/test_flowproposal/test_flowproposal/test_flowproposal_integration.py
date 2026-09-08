@@ -72,6 +72,7 @@ def test_flowproposal_adapt_latent_temperature(tmp_path, model, flow_config):
         plot=False,
         poolsize=200,
         adapt_latent_temperature=True,
+        latent_temperature_warmup=0,
     )
     assert fp.latent_temperature == 1.0
 
@@ -82,6 +83,32 @@ def test_flowproposal_adapt_latent_temperature(tmp_path, model, flow_config):
     assert len(fp.latent_temperature_history) == 1
     assert fp.latent_temperature == fp.latent_temperature_history[-1]
     assert fp.latent_temperature > 0.0
+
+
+@pytest.mark.integration_test
+@pytest.mark.timeout(30)
+def test_flowproposal_adapt_latent_temperature_warmup(
+    tmp_path, model, flow_config
+):
+    """During warmup the temperature is held at its initial value."""
+    output = tmp_path / "flowproposal"
+    output.mkdir()
+    fp = FlowProposal(
+        model,
+        output=output,
+        flow_config=flow_config,
+        plot=False,
+        poolsize=200,
+        adapt_latent_temperature=True,
+        latent_temperature_warmup=5,
+    )
+    fp.initialise()
+    fp._draw_latent_efficiency = lambda temperature, n: 1.0 / temperature
+    worst = numpy_array_to_live_points(0.01 * np.ones(fp.dims), fp.parameters)
+    fp.populate(worst, n_samples=50)
+
+    assert fp.latent_temperature == 1.0
+    assert fp.latent_temperature_history == [1.0]
 
 
 @pytest.mark.integration_test
@@ -100,6 +127,7 @@ def test_flowproposal_adapt_latent_temperature_validation_rejects(
         poolsize=200,
         adapt_latent_temperature=True,
         latent_temperature_validate=True,
+        latent_temperature_warmup=0,
     )
     fp.initialise()
 
