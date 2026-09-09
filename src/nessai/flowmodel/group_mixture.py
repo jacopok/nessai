@@ -1428,10 +1428,24 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         min_cluster_size=200,
         weight_ema=0.5,
         k_shrink_patience=3,
+        bg_expert=None,
+        bg_weight=0.0,
     ):
         super().__init__()
         self.experts = torch.nn.ModuleList(experts)
         self.n_experts = len(experts)
+        # Optional always-on "background" expert: a full group-mixture flow
+        # trained every round on *all* the data (not routed), blended into the
+        # generative / density path at a fixed weight whenever ``k >= 2``.  It
+        # floors the mixture density everywhere the live points are, so no
+        # importance weight can blow up where the per-cluster experts leave
+        # off.  ``bg_weight == 0`` (the default) leaves ``_bg_expert is None``
+        # and every path byte-identical to the plain clustered mixture.
+        self._bg_expert = bg_expert if float(bg_weight) > 0.0 else None
+        self.register_buffer(
+            "_bg_weight", torch.tensor(float(bg_weight))
+        )
+        self.register_buffer("_bg_seen", torch.zeros((), dtype=torch.bool))
         self.num_features = int(num_features)
         self.group_size = experts[0].group_size
         self.cluster_method = cluster_method
@@ -1515,15 +1529,15 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         return self.experts[0].param_names
 
     def set_param_names(self, names):
-        for e in self.experts:
+        for e in self._all_experts():
             e.set_param_names(names)
 
     def set_coordinate_bridge(self, bridge):
-        for e in self.experts:
+        for e in self._all_experts():
             e.set_coordinate_bridge(bridge)
 
     def set_affine_maps(self, scale, shift):
-        for e in self.experts:
+        for e in self._all_experts():
             e.set_affine_maps(scale, shift)
 
     def _assign_branch(self, x):
@@ -1577,6 +1591,36 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         split is pending."""
         return int(self._n_active.item())
 
+    def _bg_on(self):
+        """True when the background expert should contribute to the mixture.
+
+        Only for ``k >= 2``: at ``k == 1`` ``experts[0]`` is already the
+        full-data flow, so the background component would be redundant and the
+        (byte-identical) single-flow fast path is kept.
+        """
+        return (
+            self._bg_expert is not None
+            and float(self._bg_weight) > 0.0
+            and self._active() >= 2
+        )
+
+    def _all_experts(self):
+        """Cluster experts plus the background expert (if any) -- for
+        lifecycle calls (param names, bridge, freeze, finalise, ...)."""
+        if self._bg_expert is None:
+            return list(self.experts)
+        return list(self.experts) + [self._bg_expert]
+
+    def _blend_bg(self, fg_log_prob, x, context=None):
+        """logaddexp the background density into a foreground log-prob."""
+        if not self._bg_on():
+            return fg_log_prob
+        w = float(self._bg_weight)
+        bg = self._bg_expert.log_prob(x, context=context)
+        return torch.logaddexp(
+            fg_log_prob + math.log1p(-w), bg + math.log(w)
+        )
+
     def log_prob(self, x, context=None):
         act = self._active()
         if act == 1:
@@ -1589,7 +1633,7 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             ],
             dim=0,
         )
-        return torch.logsumexp(lps, dim=0)
+        return self._blend_bg(torch.logsumexp(lps, dim=0), x, context=context)
 
     def base_distribution_log_prob(self, z, context=None):
         return self.experts[0].base_distribution_log_prob(z, context=context)
@@ -1612,7 +1656,15 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
                 num_samples, context=context
             )
         dev = self.cluster_weights.device
-        assign = self._draw_assignments(num_samples, dev)
+        n_bg = 0
+        if self._bg_on():
+            n_bg = int(
+                torch.binomial(
+                    torch.tensor(float(num_samples)),
+                    torch.tensor(float(self._bg_weight)),
+                ).item()
+            )
+        assign = self._draw_assignments(num_samples - n_bg, dev)
         parts = []
         for j in range(act):
             nj = int((assign == j).sum())
@@ -1621,6 +1673,9 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
                     nj, context=context
                 )
                 parts.append(xj)
+        if n_bg:
+            xb, _ = self._bg_expert.sample_and_log_prob(n_bg, context=context)
+            parts.append(xb)
         x = torch.cat(parts, dim=0)
         x = x[torch.randperm(x.shape[0], device=x.device)]
         return x, self.log_prob(x, context=context)
@@ -1647,8 +1702,8 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         act = self._active()
         if act == 1:
             return self.experts[0].inverse(z, context=context)
-        assign = self._draw_assignments(z.shape[0], z.device)
-        x = z.new_zeros(z.shape[0], self.num_features)
+        n = z.shape[0]
+        x = z.new_zeros(n, self.num_features)
         # Each expert is a domain-truncated flow: ~20-30 % of its base N(0, I)
         # mass maps to a canonical representative *outside* the fundamental
         # domain, and ``DiscreteGroupMixtureFlowWrapper.inverse`` flags those
@@ -1657,16 +1712,25 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         # Recomputing ``log_q`` below from :meth:`log_prob` alone would
         # resurrect them with a small *finite* raw density -> a fat
         # importance-weight tail that collapses ``populate()``.  Carry the
-        # per-expert domain rejection through.
-        gen_out_of_domain = torch.zeros(
-            z.shape[0], dtype=torch.bool, device=z.device
-        )
-        for j in range(act):
-            m = assign == j
-            if bool(m.any()):
-                xj, log_j_j = self.experts[j].inverse(z[m], context=context)
-                x[m] = xj
-                gen_out_of_domain[m] = ~torch.isfinite(log_j_j)
+        # per-expert (and background) domain rejection through.
+        gen_out_of_domain = torch.zeros(n, dtype=torch.bool, device=z.device)
+        if self._bg_on():
+            use_bg = torch.rand(n, device=z.device) < float(self._bg_weight)
+        else:
+            use_bg = torch.zeros(n, dtype=torch.bool, device=z.device)
+        fg = (~use_bg).nonzero(as_tuple=True)[0]
+        if fg.numel():
+            assign = self._draw_assignments(fg.numel(), z.device)
+            for j in range(act):
+                sub = fg[assign == j]
+                if sub.numel():
+                    xj, ljj = self.experts[j].inverse(z[sub], context=context)
+                    x[sub] = xj
+                    gen_out_of_domain[sub] = ~torch.isfinite(ljj)
+        if bool(use_bg.any()):
+            xb, ljb = self._bg_expert.inverse(z[use_bg], context=context)
+            x[use_bg] = xb
+            gen_out_of_domain[use_bg] = ~torch.isfinite(ljb)
         # non-literal log_j: base_distribution_log_prob(z) - log_j == log q(x)
         log_q = self.log_prob(x, context=context)
         if bool(gen_out_of_domain.any()):
@@ -1682,15 +1746,15 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         return z, self.log_prob(x, context=context)
 
     def freeze_transform(self):
-        for e in self.experts:
+        for e in self._all_experts():
             e.freeze_transform()
 
     def unfreeze_transform(self):
-        for e in self.experts:
+        for e in self._all_experts():
             e.unfreeze_transform()
 
     def finalise(self):
-        for e in self.experts:
+        for e in self._all_experts():
             e.finalise()
         # A full training pass at the new k has just completed: the
         # per-cluster loss has specialised the experts, so release the
@@ -1707,7 +1771,7 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             )
 
     def end_iteration(self):
-        for e in self.experts:
+        for e in self._all_experts():
             e.end_iteration()
 
     # -- per-cluster training loss ----------------------------------
@@ -1915,6 +1979,11 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
                 self.experts[j].update_mixture_weights(
                     xj, context=context, smoothing=smoothing
                 )
+        if self._bg_expert is not None and x.shape[0]:
+            # the background expert always tracks the full data
+            self._bg_expert.update_mixture_weights(
+                x, context=context, smoothing=smoothing
+            )
 
     @torch.no_grad()
     def update_base_standardisation(self, x, context=None):
@@ -1926,6 +1995,8 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
                 self.experts[j].update_base_standardisation(
                     xj, context=context
                 )
+        if self._bg_expert is not None and x.shape[0]:
+            self._bg_expert.update_base_standardisation(x, context=context)
 
 
 class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
@@ -1937,6 +2008,10 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
     max_cluster_overlap = 0.05
     min_cluster_size = 200
     k_shrink_patience = 3
+    # Weight of an always-on background expert (trained on all data, blended in
+    # at ``k >= 2``).  0 -> no background expert (default; byte-identical to the
+    # plain clustered mixture).
+    bg_weight = 0.0
 
     def train(self, samples, weights=None, conditional=None, plot=True,
               **kwargs):
@@ -2001,6 +2076,23 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
                     j, sub.shape[0], len(hj["loss"]),
                     min(hj["val_loss"]) if hj["val_loss"] else float("nan"),
                 )
+            if model._bg_expert is not None and samples.shape[0] >= 2:
+                self.model = model._bg_expert
+                self._optimiser = self.get_optimiser()
+                hb = super().train(
+                    np.ascontiguousarray(samples), plot=False,
+                    output=os.path.join(output, "expert_bg"), **kwargs,
+                )
+                history["loss"].append(hb["loss"])
+                history["val_loss"].append(hb["val_loss"])
+                model._bg_seen.fill_(True)
+                logger.info(
+                    "Clustered group mixture: background expert trained on "
+                    "%d pts (%d epochs, best val loss %.4g, blend weight %.3g)",
+                    samples.shape[0], len(hb["loss"]),
+                    min(hb["val_loss"]) if hb["val_loss"] else float("nan"),
+                    float(model._bg_weight),
+                )
         finally:
             self.model, self._optimiser = full_model, full_opt
 
@@ -2019,6 +2111,12 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
         ]
         if k == 1:
             return experts[0]
+        bg_weight = float(getattr(self, "bg_weight", 0.0))
+        bg_expert = (
+            GroupMixtureFlowModel.get_model(self, config)
+            if bg_weight > 0.0
+            else None
+        )
         return ClusteredGroupMixtureFlowWrapper(
             experts,
             experts[0].num_features,
@@ -2026,6 +2124,8 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
             max_cluster_overlap=getattr(self, "max_cluster_overlap", 0.05),
             min_cluster_size=getattr(self, "min_cluster_size", 200),
             k_shrink_patience=getattr(self, "k_shrink_patience", 3),
+            bg_expert=bg_expert,
+            bg_weight=bg_weight,
         )
 
 
@@ -2036,6 +2136,7 @@ def make_clustered_group_mixture_flow(
     max_cluster_overlap=0.05,
     min_cluster_size=200,
     k_shrink_patience=3,
+    bg_weight=0.0,
     **kwargs,
 ):
     """:func:`make_group_mixture_flow` with a clustered base flow.
@@ -2061,6 +2162,7 @@ def make_clustered_group_mixture_flow(
     ClusteredCustom.max_cluster_overlap = float(max_cluster_overlap)
     ClusteredCustom.min_cluster_size = int(min_cluster_size)
     ClusteredCustom.k_shrink_patience = int(k_shrink_patience)
+    ClusteredCustom.bg_weight = float(bg_weight)
     return ClusteredCustom
 
 

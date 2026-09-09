@@ -1493,6 +1493,95 @@ def test_clustered_trains_each_expert_independently(tmp_path):
     assert not bool(model._pending_split_train.item())
 
 
+def test_clustered_bg_weight_zero_is_inert():
+    """bg_weight == 0 -> no background expert, every path unchanged."""
+    w = _clustered_wrapper(2)
+    assert w._bg_expert is None
+    assert float(w._bg_weight) == 0.0
+    assert not w._bg_on()
+    assert w._all_experts() == list(w.experts)
+    # cluster_weights / n_active state still round-trips, no extra keys
+    keys = set(w.state_dict())
+    assert not any(k.startswith("_bg_expert") for k in keys)
+    assert "_bg_weight" in keys
+
+
+_ClusteredBgFlowModel = make_clustered_group_mixture_flow(
+    n_clusters_max=2, min_cluster_size=50, max_cluster_overlap=0.15,
+    bg_weight=0.3, group_action_fn=shift_group_action, group_size=N_PERIODS,
+    param_names=["x", "y"], in_fundamental_domain=in_fundamental_domain,
+)
+
+
+def test_clustered_bg_expert_builds_trains_and_blends(tmp_path):
+    fm = _ClusteredBgFlowModel(
+        flow_config={"n_inputs": 2, "model": "realnvp", "n_blocks": 2,
+                     "n_neurons": 8},
+        training_config={"max_epochs": 12, "patience": 12, "batch_size": 200},
+        output=str(tmp_path),
+    )
+    fm.initialise()
+    model = fm.model
+    assert isinstance(model, ClusteredGroupMixtureFlowWrapper)
+    assert model._bg_expert is not None
+    assert float(model._bg_weight) == pytest.approx(0.3)
+
+    rng = np.random.default_rng(0)
+    n = 1200
+    y = np.where(rng.random(n) < 0.5, rng.normal(2.5, 0.3, n),
+                 rng.normal(-2.5, 0.3, n))
+    data = np.stack([rng.uniform(0, 1, n), y], axis=1).astype(np.float32)
+    t = torch.as_tensor(data)
+    model.update_mixture_weights(t)
+    model.update_base_standardisation(t)
+    assert model._n_active_experts() == 2
+    assert model._bg_on()
+
+    bg_before = {k: v.clone()
+                 for k, v in model._bg_expert.base_flow.state_dict().items()}
+    history = fm.train(data)
+    # per-cluster experts + the background expert
+    assert len(history["loss"]) == 3
+    assert bool(model._bg_seen.item())
+    bg_after = model._bg_expert.base_flow.state_dict()
+    assert any(not torch.allclose(bg_after[k], v)
+               for k, v in bg_before.items())
+
+    # the blended density sits between the pure cluster mixture and the bg
+    with torch.no_grad():
+        blended = model.log_prob(t)
+        model._bg_weight.fill_(0.0)          # temporarily disable the blend
+        cluster_only = model.log_prob(t)
+        model._bg_weight.fill_(0.3)
+    assert not torch.allclose(blended, cluster_only)
+    assert torch.isfinite(blended).all()
+
+    # inverse routes ~bg_weight of draws through the background expert and
+    # still carries the domain rejection (finite reconstruction == log_prob)
+    torch.manual_seed(0)
+    z = torch.randn(512, 2)
+    x, log_j = model.inverse(z)
+    recon = model.base_distribution_log_prob(z) - log_j
+    finite = torch.isfinite(recon) & torch.isfinite(model.log_prob(x))
+    assert finite.any()
+    assert torch.allclose(recon[finite], model.log_prob(x)[finite], atol=1e-4)
+
+    # state_dict round-trips with the background expert
+    fresh = _ClusteredBgFlowModel(
+        flow_config={"n_inputs": 2, "model": "realnvp", "n_blocks": 2,
+                     "n_neurons": 8},
+        training_config={"max_epochs": 1, "patience": 1},
+        output=str(tmp_path / "fresh"),
+    )
+    fresh.initialise()
+    fresh.model.load_state_dict(model.state_dict())
+    fresh.model.eval()
+    model.eval()
+    with torch.no_grad():
+        assert torch.allclose(fresh.model.log_prob(t), model.log_prob(t),
+                              atol=1e-4)
+
+
 @pytest.mark.slow_integration_test
 def test_sampling_with_clustered_group_mixture_flow(tmp_path):
     fs = FlowSampler(
