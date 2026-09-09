@@ -1249,6 +1249,46 @@ class ClusteredPeriodicGroupFlowProposal(GroupFlowProposalMixin, FlowProposal):
     _FlowModelClass = _ClusteredPeriodicFlowModel
 
 
+def test_clustered_trains_each_expert_independently(tmp_path):
+    """The clustered FlowModel trains each active expert on its own cluster,
+    each to its own early stop -- history has one entry per expert and both
+    experts move away from their shared init."""
+    fm = _ClusteredPeriodicFlowModel(
+        flow_config={"n_inputs": 2, "model": "realnvp", "n_blocks": 2,
+                     "n_neurons": 8},
+        training_config={"max_epochs": 15, "patience": 15, "batch_size": 200},
+        output=str(tmp_path),
+    )
+    fm.initialise()
+    model = fm.model
+    assert isinstance(model, ClusteredGroupMixtureFlowWrapper)
+
+    rng = np.random.default_rng(0)
+    n = 1200
+    y = np.where(rng.random(n) < 0.5, rng.normal(2.5, 0.3, n),
+                 rng.normal(-2.5, 0.3, n))
+    data = np.stack([rng.uniform(0, 1, n), y], axis=1).astype(np.float32)
+    t = torch.as_tensor(data)
+    model.update_mixture_weights(t)
+    model.update_base_standardisation(t)
+    assert model._n_active_experts() == 2
+
+    before = [
+        {k: v.clone() for k, v in e.base_flow.state_dict().items()}
+        for e in model.experts[:2]
+    ]
+    history = fm.train(data)
+
+    # one (loss, val_loss) history per expert
+    assert len(history["loss"]) == 2 and len(history["val_loss"]) == 2
+    # both experts actually updated
+    for j, b in enumerate(before):
+        after = model.experts[j].base_flow.state_dict()
+        assert any(not torch.allclose(after[k], b[k]) for k in b)
+    # split is no longer pending
+    assert not bool(model._pending_split_train.item())
+
+
 @pytest.mark.slow_integration_test
 def test_sampling_with_clustered_group_mixture_flow(tmp_path):
     fs = FlowSampler(

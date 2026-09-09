@@ -4,6 +4,7 @@ Discrete group-mixture flow extension for nessai.
 
 import logging
 import math
+import os
 
 import numpy as np
 import torch
@@ -1374,6 +1375,15 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         return t
 
     @torch.no_grad()
+    def route_prime_array(self, samples):
+        """Nearest-centroid expert assignment for an unstructured prime-space
+        array -- the training data :meth:`FlowModel.train` receives."""
+        x = torch.as_tensor(
+            samples, dtype=self.weights.dtype, device=self.weights.device
+        )
+        return self._route(x).cpu().numpy()
+
+    @torch.no_grad()
     def _route(self, x):
         act = int(self._n_active.item())
         if act <= 1 or not bool(self._clustering_seen):
@@ -1744,6 +1754,80 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
     max_cluster_overlap = 0.05
     min_cluster_size = 200
     k_shrink_patience = 3
+
+    def train(self, samples, weights=None, conditional=None, plot=True,
+              **kwargs):
+        """Train each active expert independently on its own cluster.
+
+        The joint objective
+        (:meth:`ClusteredGroupMixtureFlowWrapper.loss_function`) shares one
+        optimiser and one early stop across all experts, so a
+        slower-converging expert is cut short the moment the (dominant)
+        faster one starts to overfit -- the ``k >= 2`` flow then carries a
+        heavy importance-weight tail.  Training each expert as its own
+        single group-mixture flow on its cluster's points (the
+        ``n_clusters_max == 1`` code path) removes that coupling: each
+        expert gets its own optimiser and runs to its own validation-loss
+        early stop.
+        """
+        model = self.model
+        if not (
+            isinstance(model, ClusteredGroupMixtureFlowWrapper)
+            and model._n_active_experts() >= 2
+            and weights is None
+            and conditional is None
+        ):
+            return super().train(
+                samples, weights=weights, conditional=conditional, plot=plot,
+                **kwargs,
+            )
+
+        if not self.initialised:
+            self.initialise()
+        if not np.isfinite(samples).all():
+            raise ValueError("Training data is not finite")
+
+        output = kwargs.pop("output", None) or self.output
+        os.makedirs(output, exist_ok=True)
+        labels = model.route_prime_array(samples)
+        k = model._n_active_experts()
+
+        full_model, full_opt = self.model, self._optimiser
+        history = dict(loss=[], val_loss=[])
+        try:
+            for j in range(k):
+                sub = np.ascontiguousarray(samples[labels == j])
+                if sub.shape[0] < 2:
+                    logger.warning(
+                        "Clustered group mixture: expert %d has %d routed "
+                        "points -- skipping its training this round",
+                        j, sub.shape[0],
+                    )
+                    continue
+                self.model = model.experts[j]
+                self._optimiser = self.get_optimiser()
+                hj = super().train(
+                    sub, plot=False,
+                    output=os.path.join(output, f"expert_{j}"), **kwargs,
+                )
+                history["loss"].append(hj["loss"])
+                history["val_loss"].append(hj["val_loss"])
+                logger.info(
+                    "Clustered group mixture: expert %d solo-trained on %d "
+                    "pts (%d epochs, best val loss %.4g)",
+                    j, sub.shape[0], len(hj["loss"]),
+                    min(hj["val_loss"]) if hj["val_loss"] else float("nan"),
+                )
+        finally:
+            self.model, self._optimiser = full_model, full_opt
+
+        self.model.train()
+        self.model.eval()
+        self.finalise()
+        self.save_weights(os.path.join(output, "model.pt"))
+        self.move_to(self.inference_device)
+        self.model.eval()
+        return history
 
     def get_model(self, config):
         k = max(int(getattr(self, "n_clusters_max", 1)), 1)
