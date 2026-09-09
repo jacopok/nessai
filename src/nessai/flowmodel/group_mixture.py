@@ -1649,13 +1649,29 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             return self.experts[0].inverse(z, context=context)
         assign = self._draw_assignments(z.shape[0], z.device)
         x = z.new_zeros(z.shape[0], self.num_features)
+        # Each expert is a domain-truncated flow: ~20-30 % of its base N(0, I)
+        # mass maps to a canonical representative *outside* the fundamental
+        # domain, and ``DiscreteGroupMixtureFlowWrapper.inverse`` flags those
+        # draws with a non-finite ``log_j`` so ``backward_pass`` discards them
+        # (exactly what its rejection-based ``sample_and_log_prob`` does).
+        # Recomputing ``log_q`` below from :meth:`log_prob` alone would
+        # resurrect them with a small *finite* raw density -> a fat
+        # importance-weight tail that collapses ``populate()``.  Carry the
+        # per-expert domain rejection through.
+        gen_out_of_domain = torch.zeros(
+            z.shape[0], dtype=torch.bool, device=z.device
+        )
         for j in range(act):
             m = assign == j
             if bool(m.any()):
-                xj, _ = self.experts[j].inverse(z[m], context=context)
+                xj, log_j_j = self.experts[j].inverse(z[m], context=context)
                 x[m] = xj
+                gen_out_of_domain[m] = ~torch.isfinite(log_j_j)
         # non-literal log_j: base_distribution_log_prob(z) - log_j == log q(x)
         log_q = self.log_prob(x, context=context)
+        if bool(gen_out_of_domain.any()):
+            log_q = log_q.clone()
+            log_q[gen_out_of_domain] = -float("inf")
         log_j = (
             self.base_distribution_log_prob(z, context=context) - log_q
         )

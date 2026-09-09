@@ -1275,8 +1275,39 @@ def test_clustered_inverse_log_j_matches_log_prob():
     x, log_j = w.inverse(z)
     recon = w.base_distribution_log_prob(z) - log_j
     finite = torch.isfinite(recon) & torch.isfinite(w.log_prob(x))
-    assert finite.float().mean() > 0.5
+    # some draws survive the domain rejection, and for those the log_j
+    # reconstruction matches the mixture density exactly
+    assert finite.any()
     assert torch.allclose(recon[finite], w.log_prob(x)[finite], atol=1e-4)
+
+
+def test_clustered_inverse_carries_expert_domain_rejection():
+    """The clustered inverse rejects the same domain-leaked draws its per-expert
+    ``inverse`` does -- it must not resurrect them with a finite raw density."""
+    w = _clustered_wrapper(2)
+    with torch.no_grad():
+        w._n_active.fill_(2)
+        w._clustering_seen.fill_(True)
+        w.cluster_weights.copy_(torch.tensor([0.5, 0.5]))
+        w._centroids[:2].copy_(torch.tensor([[0.0, -2.0], [0.0, 2.0]]))
+
+    # single expert's own inverse domain-leak rate (the reference)
+    torch.manual_seed(1)
+    z_ref = torch.randn(4096, 2)
+    _, lj0 = w.experts[0].inverse(z_ref)
+    _, lj1 = w.experts[1].inverse(z_ref)
+    expert_reject = 0.5 * (
+        (~torch.isfinite(lj0)).float().mean()
+        + (~torch.isfinite(lj1)).float().mean()
+    )
+    assert expert_reject > 0.05  # the toy domain does leak
+
+    torch.manual_seed(1)
+    z = torch.randn(4096, 2)
+    _, log_j = w.inverse(z)
+    clustered_reject = (~torch.isfinite(log_j)).float().mean()
+    # within Monte-Carlo noise of the per-expert rate, not ~0
+    assert abs(clustered_reject - expert_reject) < 0.06
 
 
 def test_clustered_clusters_bimodal_folded_data():
