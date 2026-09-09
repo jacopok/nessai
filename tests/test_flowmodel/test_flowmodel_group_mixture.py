@@ -1161,12 +1161,39 @@ def test_clustered_k_evolves_unimodal_to_bimodal_with_warm_start():
     # a fresh (distinct data_ptr) bimodal round: k rises to 2
     w._cluster(_bimodal(800, rng))
     assert int(w._n_active.item()) == 2
-    # the newly activated expert was warm-started from expert 0
-    sd0 = w.experts[0].base_flow.state_dict()
-    sd1 = w.experts[1].base_flow.state_dict()
+    # the newly activated expert is a byte-identical copy of expert 0
+    # (weights *and* canonical standardisation) and the split is pending its
+    # first training pass
+    sd0 = w.experts[0].state_dict()
+    sd1 = w.experts[1].state_dict()
     assert all(torch.allclose(sd0[k], sd1[k]) for k in sd0)
-    # ... and its per-cluster standardisation is re-bootstrapped
-    assert not bool(w.experts[1]._canon_seen.any())
+    assert bool(w._pending_split_train.item())
+
+
+def test_clustered_split_transition_is_density_preserving():
+    """The k 1->2 flip must not change the mixture density: both experts are
+    identical copies of expert 0 and the weights sum to 1, so
+    ``log q_mixture == log q_expert0`` until the first post-split training."""
+    w = _clustered_wrapper(2)
+    rng = np.random.default_rng(2)
+    w.update_mixture_weights(_unimodal(800, rng))
+    w.update_base_standardisation(_unimodal(800, rng))
+    assert int(w._n_active.item()) == 1
+
+    bim = _bimodal(800, rng)
+    w.update_mixture_weights(bim)
+    w.update_base_standardisation(bim)
+    assert int(w._n_active.item()) == 2
+    assert bool(w._pending_split_train.item())
+
+    x = points_in_element(0, 128, np.random.default_rng(3))
+    assert torch.allclose(
+        w.log_prob(x), w.experts[0].log_prob(x), atol=1e-5
+    )
+
+    # after a training pass finalise() releases the freeze
+    w.finalise()
+    assert not bool(w._pending_split_train.item())
 
 
 def test_clustered_k_shrink_needs_hysteresis():
@@ -1185,6 +1212,18 @@ def test_clustered_k_shrink_needs_hysteresis():
     # third consecutive -> drops to 1
     w._cluster(_unimodal(800, rng))
     assert int(w._n_active.item()) == 1
+
+
+def test_clustered_load_state_dict_tolerates_missing_new_buffers():
+    """A checkpoint written before ``_pending_split_train`` (and the
+    k-evolution buffers) existed must still resume under ``strict=True``."""
+    w = _clustered_wrapper(2)
+    sd = {k: v for k, v in w.state_dict().items()
+          if k not in ("_pending_split_train",)}
+    assert "_pending_split_train" not in sd
+    w2 = _clustered_wrapper(2)
+    w2.load_state_dict(sd)  # strict=True by default -> must not raise
+    assert not bool(w2._pending_split_train.item())
 
 
 class _FoldedBimodalModel(PeriodicModel):

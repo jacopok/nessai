@@ -1314,6 +1314,15 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         self.register_buffer(
             "_clustering_seen", torch.zeros((), dtype=torch.bool)
         )
+        # True between a k-increase and the first training pass that follows
+        # it: while set, every active expert is kept a byte-identical copy of
+        # expert 0 (standardised on the *full* data), so the mixture density
+        # is exactly the pre-split single-flow density and the flip costs no
+        # population acceptance.  The per-cluster loss specialises the experts
+        # during that training; :meth:`finalise` then clears the flag.
+        self.register_buffer(
+            "_pending_split_train", torch.zeros((), dtype=torch.bool)
+        )
         self._cluster_cache = None  # (data_ptr, n, labels tensor)
 
     # -- pass-throughs the proposal / diagnostics expect ----------------
@@ -1475,6 +1484,17 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     def finalise(self):
         for e in self.experts:
             e.finalise()
+        # A full training pass at the new k has just completed: the
+        # per-cluster loss has specialised the experts, so release the
+        # standardisation freeze and let subsequent rounds track each
+        # cluster independently.
+        if bool(self._pending_split_train.item()) and self._active() >= 2:
+            self._pending_split_train.fill_(False)
+            logger.info(
+                "Clustered group mixture: split trained, per-cluster "
+                "standardisation now active (k=%d)",
+                self._active(),
+            )
 
     def end_iteration(self):
         for e in self.experts:
@@ -1563,15 +1583,22 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             centroids = centroids[order]
 
         with torch.no_grad():
-            # warm-start any newly activated expert from expert 0 so the
-            # mixture is never dragged down by a random flow while the new
-            # expert catches up; re-bootstrap its per-cluster standardisation.
+            # warm-start any newly activated expert as a byte-identical copy
+            # of expert 0 (weights *and* canonical standardisation *and*
+            # domain-mass buffers), and freeze per-cluster standardisation
+            # until the next training pass.  The mixture density is then
+            # exactly expert 0's at the flip -- no acceptance cliff -- and the
+            # per-cluster loss pulls the experts apart during that training.
             if k > k_cur and bool(self._clustering_seen):
                 src = self.experts[0].state_dict()
                 for j in range(max(k_cur, 1), k):
                     self.experts[j].load_state_dict(src)
-                    self.experts[j]._canon_seen.zero_()
-                    self.experts[j]._domain_mass_seen = False
+                    self.experts[j]._domain_mass_seen = (
+                        self.experts[0]._domain_mass_seen
+                    )
+                self._pending_split_train.fill_(True)
+            if k <= 1:
+                self._pending_split_train.fill_(False)
 
             dev = self.cluster_weights.device
             self._base_mu.copy_(torch.as_tensor(mu, dtype=self._base_mu.dtype))
@@ -1652,9 +1679,35 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             return km.labels_, km.cluster_centers_
         return gm.predict(ts), gm.means_
 
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        # Forward compatibility: a checkpoint written by an older build can
+        # predate buffers added since (``_pending_split_train``, the
+        # k-evolution buffers).  Fill any missing buffer with its current
+        # default so ``strict=True`` resume still works.
+        sd = dict(state_dict)
+        for name, val in super().state_dict().items():
+            sd.setdefault(name, val)
+        return super().load_state_dict(sd, strict=strict, assign=assign)
+
+    @torch.no_grad()
+    def _sync_experts_from_first(self):
+        """Make every active expert a byte-identical copy of expert 0."""
+        src = self.experts[0].state_dict()
+        for j in range(1, max(self._active(), 1)):
+            self.experts[j].load_state_dict(src)
+            self.experts[j]._domain_mass_seen = (
+                self.experts[0]._domain_mass_seen
+            )
+
     @torch.no_grad()
     def update_mixture_weights(self, x, context=None, smoothing=1.0):
         labels = self._cluster(x)
+        if bool(self._pending_split_train.item()):
+            self.experts[0].update_mixture_weights(
+                x, context=context, smoothing=smoothing
+            )
+            self._sync_experts_from_first()
+            return
         for j in range(self._active()):
             m = labels == j
             if bool(m.any()):
@@ -1665,6 +1718,13 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     @torch.no_grad()
     def update_base_standardisation(self, x, context=None):
         labels = self._cluster(x)
+        if bool(self._pending_split_train.item()):
+            # experts are identical copies of expert 0 until the first
+            # post-split training; standardise them all on the full data so
+            # the mixture density stays exactly the pre-split density.
+            self.experts[0].update_base_standardisation(x, context=context)
+            self._sync_experts_from_first()
+            return
         for j in range(self._active()):
             m = labels == j
             if bool(m.any()):
