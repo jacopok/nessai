@@ -1383,6 +1383,21 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
 
     # -- densities -----------------------------------------------------
     def _active(self):
+        """Experts contributing to the *generative / density* path.
+
+        Collapses to 1 while a k-increase is pending its first training pass:
+        ``populate()`` then only ever sees the (safe) pre-split single-flow
+        density -- no acceptance cliff -- while the per-cluster loss still
+        specialises all ``k`` experts during that training (see
+        :meth:`_n_active_experts`).
+        """
+        if bool(self._pending_split_train.item()):
+            return 1
+        return int(self._n_active.item())
+
+    def _n_active_experts(self):
+        """The real ``k`` -- experts that train per-cluster, even while a
+        split is pending."""
         return int(self._n_active.item())
 
     def log_prob(self, x, context=None):
@@ -1488,12 +1503,14 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         # per-cluster loss has specialised the experts, so release the
         # standardisation freeze and let subsequent rounds track each
         # cluster independently.
-        if bool(self._pending_split_train.item()) and self._active() >= 2:
+        if bool(self._pending_split_train.item()) and (
+            self._n_active_experts() >= 2
+        ):
             self._pending_split_train.fill_(False)
             logger.info(
-                "Clustered group mixture: split trained, per-cluster "
-                "standardisation now active (k=%d)",
-                self._active(),
+                "Clustered group mixture: split trained, all %d experts now "
+                "contribute to the proposal",
+                self._n_active_experts(),
             )
 
     def end_iteration(self):
@@ -1509,7 +1526,7 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         of arXiv:2305.02930).  ``FlowModel._train`` picks this up via
         ``hasattr(model, "loss_function")``.
         """
-        act = self._active()
+        act = self._n_active_experts()
         if act == 1:
             return -self.experts[0].log_prob(x).mean()
         r = self._route(x)
@@ -1583,19 +1600,20 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             centroids = centroids[order]
 
         with torch.no_grad():
-            # warm-start any newly activated expert as a byte-identical copy
-            # of expert 0 (weights *and* canonical standardisation *and*
-            # domain-mass buffers), and freeze per-cluster standardisation
-            # until the next training pass.  The mixture density is then
-            # exactly expert 0's at the flip -- no acceptance cliff -- and the
-            # per-cluster loss pulls the experts apart during that training.
+            # warm-start any newly activated expert's *flow weights* from
+            # expert 0 (a sane starting point) but re-bootstrap its
+            # per-cluster canonical standardisation, and mark the split
+            # pending: until the first training pass at the new k, the
+            # generative / density path (populate) runs on expert 0 alone
+            # (``_active() == 1``), so there is no acceptance cliff, while the
+            # per-cluster loss specialises every expert in its own frame
+            # during that training.  ``finalise`` then clears the flag.
             if k > k_cur and bool(self._clustering_seen):
                 src = self.experts[0].state_dict()
                 for j in range(max(k_cur, 1), k):
                     self.experts[j].load_state_dict(src)
-                    self.experts[j]._domain_mass_seen = (
-                        self.experts[0]._domain_mass_seen
-                    )
+                    self.experts[j]._canon_seen.zero_()
+                    self.experts[j]._domain_mass_seen = False
                 self._pending_split_train.fill_(True)
             if k <= 1:
                 self._pending_split_train.fill_(False)
@@ -1690,46 +1708,30 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         return super().load_state_dict(sd, strict=strict, assign=assign)
 
     @torch.no_grad()
-    def _sync_experts_from_first(self):
-        """Make every active expert a byte-identical copy of expert 0."""
-        src = self.experts[0].state_dict()
-        for j in range(1, max(self._active(), 1)):
-            self.experts[j].load_state_dict(src)
-            self.experts[j]._domain_mass_seen = (
-                self.experts[0]._domain_mass_seen
-            )
-
-    @torch.no_grad()
     def update_mixture_weights(self, x, context=None, smoothing=1.0):
         labels = self._cluster(x)
-        if bool(self._pending_split_train.item()):
-            self.experts[0].update_mixture_weights(
-                x, context=context, smoothing=smoothing
-            )
-            self._sync_experts_from_first()
-            return
-        for j in range(self._active()):
-            m = labels == j
-            if bool(m.any()):
+        pending = bool(self._pending_split_train.item())
+        for j in range(self._n_active_experts()):
+            # while a split is pending, expert 0 keeps tracking the *full*
+            # data (populate() still runs on it alone, so it must stay the
+            # pre-split single flow); the new experts bootstrap on their
+            # cluster so the next training can specialise them in the right
+            # frame.
+            xj = x if (pending and j == 0) else x[labels == j]
+            if xj.shape[0]:
                 self.experts[j].update_mixture_weights(
-                    x[m], context=context, smoothing=smoothing
+                    xj, context=context, smoothing=smoothing
                 )
 
     @torch.no_grad()
     def update_base_standardisation(self, x, context=None):
         labels = self._cluster(x)
-        if bool(self._pending_split_train.item()):
-            # experts are identical copies of expert 0 until the first
-            # post-split training; standardise them all on the full data so
-            # the mixture density stays exactly the pre-split density.
-            self.experts[0].update_base_standardisation(x, context=context)
-            self._sync_experts_from_first()
-            return
-        for j in range(self._active()):
-            m = labels == j
-            if bool(m.any()):
+        pending = bool(self._pending_split_train.item())
+        for j in range(self._n_active_experts()):
+            xj = x if (pending and j == 0) else x[labels == j]
+            if xj.shape[0]:
                 self.experts[j].update_base_standardisation(
-                    x[m], context=context
+                    xj, context=context
                 )
 
 

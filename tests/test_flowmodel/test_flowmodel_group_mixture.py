@@ -1161,13 +1161,16 @@ def test_clustered_k_evolves_unimodal_to_bimodal_with_warm_start():
     # a fresh (distinct data_ptr) bimodal round: k rises to 2
     w._cluster(_bimodal(800, rng))
     assert int(w._n_active.item()) == 2
-    # the newly activated expert is a byte-identical copy of expert 0
-    # (weights *and* canonical standardisation) and the split is pending its
-    # first training pass
-    sd0 = w.experts[0].state_dict()
-    sd1 = w.experts[1].state_dict()
+    # the newly activated expert's flow weights are warm-started from
+    # expert 0, its per-cluster standardisation is re-bootstrapped, and the
+    # split is pending its first training pass
+    sd0 = w.experts[0].base_flow.state_dict()
+    sd1 = w.experts[1].base_flow.state_dict()
     assert all(torch.allclose(sd0[k], sd1[k]) for k in sd0)
+    assert not bool(w.experts[1]._canon_seen.any())
     assert bool(w._pending_split_train.item())
+    # while pending, the generative path collapses to expert 0 alone
+    assert w._active() == 1 and w._n_active_experts() == 2
 
 
 def test_clustered_split_transition_is_density_preserving():
