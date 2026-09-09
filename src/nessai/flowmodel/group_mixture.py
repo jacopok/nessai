@@ -1400,6 +1400,24 @@ def make_group_mixture_flow(
 # posterior as it goes unimodal -> bimodal over the run; k == 1 reproduces the
 # single-flow behaviour exactly.
 # ---------------------------------------------------------------------------
+def _farthest_point_seeds(ts, existing, m):
+    """``m`` rows of ``ts`` maximising the minimum distance to ``existing`` (and
+    to already-picked seeds) -- a k-means++-style spread used to place the
+    centres of *newly added* clusters when ``k`` grows."""
+    m = int(m)
+    if m <= 0:
+        return np.empty((0, ts.shape[1]))
+    picks = []
+    base = list(np.atleast_2d(np.asarray(existing, dtype=float)))
+    for _ in range(m):
+        ref = np.asarray(base + picks)
+        d = np.linalg.norm(
+            ts[:, None, :] - ref[None, :, :], axis=2
+        ).min(axis=1)
+        picks.append(ts[int(np.argmax(d))])
+    return np.asarray(picks)
+
+
 class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     """Mixture over ``K`` :class:`DiscreteGroupMixtureFlowWrapper` experts.
 
@@ -1428,6 +1446,8 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         min_cluster_size=200,
         weight_ema=0.5,
         k_shrink_patience=3,
+        k_grow_patience=2,
+        centroid_ema=None,
         bg_expert=None,
         bg_weight=0.0,
     ):
@@ -1449,10 +1469,19 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         self.num_features = int(num_features)
         self.group_size = experts[0].group_size
         self.cluster_method = cluster_method
-        # k rises immediately when a clean split appears, but only drops after
-        # this many consecutive rounds want fewer clusters (hysteresis, so a
-        # one-round blip does not discard an expert's training).
+        # k hysteresis: a *rise* only takes after this many consecutive rounds
+        # want more clusters (so a one-round spurious split does not spawn --
+        # then, ``k_shrink_patience`` rounds later, discard -- an expert), and a
+        # *drop* only after ``k_shrink_patience`` want fewer.
         self.k_shrink_patience = int(k_shrink_patience)
+        self.k_grow_patience = max(int(k_grow_patience), 1)
+        # EMA weight for the per-cluster routing centroids across rounds (in raw
+        # base-flow-frame units), when ``k`` is unchanged.  Smooths the routing
+        # boundary so points near it stop hopping between experts round to
+        # round.  Defaults to ``weight_ema``.
+        self.centroid_ema = (
+            float(weight_ema) if centroid_ema is None else float(centroid_ema)
+        )
         # Accept a k-way split only if it is *well separated*: at most this
         # fraction of points sit in the fuzzy zone between clusters (GMM
         # responsibility < 0.8).  Splitting a single blob makes ~half of it
@@ -1472,6 +1501,9 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         self.register_buffer("_base_sd", torch.ones(self.num_features))
         self.register_buffer(
             "_k_shrink_streak", torch.zeros((), dtype=torch.long)
+        )
+        self.register_buffer(
+            "_k_grow_streak", torch.zeros((), dtype=torch.long)
         )
         self.register_buffer(
             "_clustering_seen", torch.zeros((), dtype=torch.bool)
@@ -1801,12 +1833,22 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         """Recluster the folded training data; return the per-row labels.
 
         The number of clusters evolves over the run: an initially unimodal
-        folded posterior gives ``k = 1`` (the plain single flow), and the
-        moment it becomes decisively bimodal ``k`` rises to 2 and the second
-        expert -- warm-started from the first -- begins specialising.  A drop
-        in ``k`` is only applied after :attr:`k_shrink_patience` consecutive
-        rounds want it, so a one-round blip does not throw away an expert's
-        training.
+        folded posterior gives ``k = 1`` (the plain single flow), and once it
+        becomes decisively multi-modal ``k`` rises and the new expert --
+        warm-started from the first -- begins specialising.  ``k`` is
+        regularised so it (and the cluster<->expert mapping) does not jitter
+        round to round:
+
+          * a *rise* in ``k`` takes only after :attr:`k_grow_patience`
+            consecutive rounds want it, a *drop* only after
+            :attr:`k_shrink_patience` (hysteresis both ways);
+          * the GMM is warm-started from the previous round's centroids
+            (:meth:`_fit_gmm` ``means_init``) so point membership is stable;
+          * clusters are matched to the previous round's centroids by optimal
+            assignment (:meth:`_match_clusters`), so a physical sheet keeps its
+            expert slot instead of swapping;
+          * the routing centroids are carried with an EMA
+            (:attr:`centroid_ema`) while ``k`` is unchanged.
         """
         # Fingerprint the data so the two back-to-back calls from
         # ``check_state`` (update_mixture_weights then
@@ -1833,10 +1875,16 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         if not bool(self._clustering_seen):
             k = k_want
         elif k_want > k_cur:
-            k = k_want
+            self._k_grow_streak += 1
             self._k_shrink_streak.zero_()
+            if int(self._k_grow_streak.item()) >= self.k_grow_patience:
+                k = k_want
+                self._k_grow_streak.zero_()
+            else:
+                k = k_cur
         elif k_want < k_cur:
             self._k_shrink_streak += 1
+            self._k_grow_streak.zero_()
             if int(self._k_shrink_streak.item()) >= self.k_shrink_patience:
                 k = k_want
                 self._k_shrink_streak.zero_()
@@ -1845,16 +1893,65 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         else:
             k = k_cur
             self._k_shrink_streak.zero_()
+            self._k_grow_streak.zero_()
 
-        labels, centroids = self._fit_gmm(ts, k)
+        # Previous-round routing centroids in raw base-flow-frame units
+        # (``_base_mu`` / ``_base_sd`` still hold last round's normalisation --
+        # they are overwritten below).  ``None`` on the first clustering.
+        prev_raw = None
+        if bool(self._clustering_seen) and k_cur >= 1:
+            prev_raw = (
+                self._centroids[:k_cur].detach().cpu().numpy()
+                * self._base_sd.detach().cpu().numpy()
+                + self._base_mu.detach().cpu().numpy()
+            )
 
-        # order clusters tightest-first so a given physical sheet keeps its
-        # expert slot across rounds (the localised sheet stays the tightest).
+        # Warm-start the GMM from the previous centroids so cluster membership
+        # is stable round to round -- a cold ``n_init=3`` fit hops between the
+        # ~equivalent local optima as the training data drifts by a few points.
+        means_init = None
+        if prev_raw is not None and k >= 2:
+            seed = (prev_raw - mu) / sd
+            if k > k_cur:
+                seed = np.vstack(
+                    [seed, _farthest_point_seeds(ts, seed, k - k_cur)]
+                )
+            means_init = seed[:k]
+        labels, centroids = self._fit_gmm(ts, k, means_init=means_init)
+
+        # Keep each cluster with the expert slot whose *previous-round* centroid
+        # it is nearest to (optimal assignment), so a physical sheet does not
+        # swap experts between rounds -- a swap attaches a trained flow and its
+        # per-cluster standardisation to the wrong sub-population and throws the
+        # mixture density off by hundreds of nats on the swapped fraction.
+        # Tightest-first only on the first clustering (no history yet).
         if k >= 2:
-            order = np.argsort([ts[labels == c].std() for c in range(k)])
+            spreads = np.array([
+                ts[labels == c].std() if np.any(labels == c) else np.inf
+                for c in range(k)
+            ])
+            if prev_raw is not None:
+                order = self._match_clusters(
+                    centroids, prev_raw, mu, sd, spreads
+                )
+            else:
+                order = np.argsort(spreads)
             remap = {old: new for new, old in enumerate(order)}
             labels = np.array([remap[c] for c in labels])
             centroids = centroids[order]
+
+        # Smooth the routing centroids across rounds when k is unchanged, so
+        # points near a cluster boundary stop flip-flopping between experts.
+        if (
+            prev_raw is not None
+            and k == k_cur
+            and k >= 1
+            and 0.0 <= self.centroid_ema < 1.0
+        ):
+            b = self.centroid_ema
+            cent_raw = centroids * sd + mu
+            cent_raw = (1.0 - b) * prev_raw + b * cent_raw
+            centroids = (cent_raw - mu) / sd
 
         with torch.no_grad():
             # warm-start any newly activated expert's *flow weights* from
@@ -1906,6 +2003,14 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
                 "Clustered group mixture: k %d -> %d (want %d)",
                 k_cur, k, k_want,
             )
+        elif k_want != k_cur:
+            logger.info(
+                "Clustered group mixture: k held at %d (want %d; "
+                "grow streak %d/%d, shrink streak %d/%d)",
+                k, k_want,
+                int(self._k_grow_streak.item()), self.k_grow_patience,
+                int(self._k_shrink_streak.item()), self.k_shrink_patience,
+            )
         logger.info(
             "Clustered group mixture: k=%d, weights=%s, sizes=%s",
             k,
@@ -1913,6 +2018,39 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             np.bincount(labels, minlength=k).tolist(),
         )
         return lab_t
+
+    def _match_clusters(self, centroids_std, prev_raw, mu, sd, spreads):
+        """``order`` (length ``k``): the new GMM component to place in each
+        expert slot ``0..k-1``.
+
+        Optimal (minimum total distance) assignment of this round's components
+        to the previous round's centroids, in the current standardised frame.
+        When ``k`` grew, the components with no previous match take the
+        remaining slots tightest-first (``spreads`` = per-component std); when
+        ``k`` shrank, only the closest surviving slots are filled.
+        """
+        from scipy.optimize import linear_sum_assignment
+
+        k = centroids_std.shape[0]
+        prev_now = (np.asarray(prev_raw, dtype=float) - mu) / sd  # (k_cur, d)
+        cost = np.linalg.norm(
+            centroids_std[:, None, :] - prev_now[None, :, :], axis=2
+        )  # (k, k_cur)
+        comp_ind, slot_ind = linear_sum_assignment(cost)
+        order = [None] * k
+        matched = set()
+        for c, s in zip(comp_ind, slot_ind):
+            if s < k:
+                order[s] = int(c)
+                matched.add(int(c))
+        leftovers = sorted(
+            (c for c in range(k) if c not in matched),
+            key=lambda c: spreads[c],
+        )
+        empty = [s for s in range(k) if order[s] is None]
+        for s, c in zip(empty, leftovers):
+            order[s] = c
+        return np.asarray(order, dtype=int)
 
     def _choose_k(self, ts, k_max):
         """Largest ``k`` in ``[1, k_max]`` whose GMM clusters are all above
@@ -1937,18 +2075,35 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             k = kk
         return k
 
-    def _fit_gmm(self, ts, k):
-        """``(labels, centroids)`` for a ``k``-cluster fit (``k == 1`` trivial)."""
+    def _fit_gmm(self, ts, k, means_init=None):
+        """``(labels, centroids)`` for a ``k``-cluster fit (``k == 1`` trivial).
+
+        ``means_init`` (k, d), when finite, warm-starts the GMM with a single
+        EM run from those centres instead of a cold ``n_init=3`` search -- this
+        is what carries cluster identity across training rounds.
+        """
         n = ts.shape[0]
         if k <= 1:
             return np.zeros(n, dtype=int), ts.mean(0, keepdims=True)
         from sklearn.cluster import KMeans
         from sklearn.mixture import GaussianMixture
 
-        gm = GaussianMixture(
-            n_components=k, covariance_type="full", n_init=3,
-            random_state=0, reg_covar=1e-4,
-        ).fit(ts)
+        warm = (
+            means_init is not None
+            and np.shape(means_init) == (k, ts.shape[1])
+            and np.all(np.isfinite(means_init))
+        )
+        if warm:
+            gm = GaussianMixture(
+                n_components=k, covariance_type="full", n_init=1,
+                means_init=np.asarray(means_init, dtype=float),
+                random_state=0, reg_covar=1e-4,
+            ).fit(ts)
+        else:
+            gm = GaussianMixture(
+                n_components=k, covariance_type="full", n_init=3,
+                random_state=0, reg_covar=1e-4,
+            ).fit(ts)
         if self.cluster_method == "kmeans":
             km = KMeans(n_clusters=k, n_init=10, random_state=0).fit(ts)
             return km.labels_, km.cluster_centers_
@@ -2008,6 +2163,8 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
     max_cluster_overlap = 0.05
     min_cluster_size = 200
     k_shrink_patience = 3
+    k_grow_patience = 2
+    centroid_ema = None
     # Weight of an always-on background expert (trained on all data, blended in
     # at ``k >= 2``).  0 -> no background expert (default; byte-identical to the
     # plain clustered mixture).
@@ -2124,6 +2281,8 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
             max_cluster_overlap=getattr(self, "max_cluster_overlap", 0.05),
             min_cluster_size=getattr(self, "min_cluster_size", 200),
             k_shrink_patience=getattr(self, "k_shrink_patience", 3),
+            k_grow_patience=getattr(self, "k_grow_patience", 2),
+            centroid_ema=getattr(self, "centroid_ema", None),
             bg_expert=bg_expert,
             bg_weight=bg_weight,
         )
@@ -2136,6 +2295,8 @@ def make_clustered_group_mixture_flow(
     max_cluster_overlap=0.05,
     min_cluster_size=200,
     k_shrink_patience=3,
+    k_grow_patience=2,
+    centroid_ema=None,
     bg_weight=0.0,
     **kwargs,
 ):
@@ -2147,10 +2308,14 @@ def make_clustered_group_mixture_flow(
     ``max_cluster_overlap`` of points ambiguous).  ``k == 1`` -- the data is
     not decisively multi-modal, or ``n_clusters_max == 1`` -- is byte-identical
     to :func:`make_group_mixture_flow` (``get_model`` returns the plain
-    wrapper).  ``k`` evolves over the run -- it rises as soon as the folded
-    posterior becomes decisively multi-modal (the new expert is warm-started
-    from the first) and falls only after ``k_shrink_patience`` rounds want
-    fewer.  All other keyword arguments are passed straight through.
+    wrapper).  ``k`` evolves over the run -- it rises once the folded posterior
+    becomes decisively multi-modal (the new expert is warm-started from the
+    first) and falls again if it collapses back, with hysteresis both ways
+    (``k_grow_patience`` / ``k_shrink_patience`` consecutive rounds).  The
+    clustering is warm-started from the previous round and the cluster<->expert
+    identity is held by centroid matching + ``centroid_ema`` smoothing, so
+    routing does not jitter round to round.  All other keyword arguments are
+    passed straight through.
     """
     base_cls = make_group_mixture_flow(**kwargs)
 
@@ -2162,6 +2327,10 @@ def make_clustered_group_mixture_flow(
     ClusteredCustom.max_cluster_overlap = float(max_cluster_overlap)
     ClusteredCustom.min_cluster_size = int(min_cluster_size)
     ClusteredCustom.k_shrink_patience = int(k_shrink_patience)
+    ClusteredCustom.k_grow_patience = int(k_grow_patience)
+    ClusteredCustom.centroid_ema = (
+        None if centroid_ema is None else float(centroid_ema)
+    )
     ClusteredCustom.bg_weight = float(bg_weight)
     return ClusteredCustom
 

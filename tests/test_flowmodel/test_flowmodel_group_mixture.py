@@ -1204,9 +1204,14 @@ def _expert(base_flow_cfg=None):
     )
 
 
-def _clustered_wrapper(k=2):
+def _clustered_wrapper(k=2, **kwargs):
+    # Most unit tests here exercise a single clustering round, so default the
+    # grow hysteresis off (``k_grow_patience=1``); the production default (2)
+    # and the hysteresis itself are covered by their own tests below.
+    kwargs.setdefault("k_grow_patience", 1)
     w = ClusteredGroupMixtureFlowWrapper(
         [_expert() for _ in range(k)], num_features=2, min_cluster_size=10,
+        **kwargs,
     )
     w.eval()
     return w
@@ -1419,6 +1424,73 @@ def test_clustered_k_shrink_needs_hysteresis():
     # third consecutive -> drops to 1
     w._cluster(_unimodal(800, rng))
     assert int(w._n_active.item()) == 1
+
+
+def test_clustered_k_grow_needs_hysteresis():
+    """A k rise takes only after ``k_grow_patience`` consecutive rounds want
+    it (the production default is 2), so a one-round spurious split does not
+    spawn -- then discard -- an expert."""
+    w = ClusteredGroupMixtureFlowWrapper(
+        [_expert() for _ in range(2)], num_features=2, min_cluster_size=10,
+        max_cluster_overlap=0.1, k_grow_patience=2,
+    )
+    rng = np.random.default_rng(3)
+    # establish k=1
+    w._cluster(_unimodal(800, rng))
+    assert int(w._n_active.item()) == 1
+    # one bimodal round -> still k=1 (grow streak 1/2)
+    w._cluster(_bimodal(800, rng))
+    assert int(w._n_active.item()) == 1
+    assert not bool(w._pending_split_train.item())
+    # a single unimodal round resets the streak
+    w._cluster(_unimodal(800, rng))
+    assert int(w._n_active.item()) == 1
+    # now two consecutive bimodal rounds -> k rises to 2
+    w._cluster(_bimodal(800, rng))
+    assert int(w._n_active.item()) == 1
+    w._cluster(_bimodal(800, rng))
+    assert int(w._n_active.item()) == 2
+
+
+def test_clustered_default_k_grow_patience_is_two():
+    cls = make_clustered_group_mixture_flow(
+        n_clusters_max=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=PARAM_NAMES,
+        in_fundamental_domain=in_fundamental_domain,
+    )
+    assert cls.k_grow_patience == 2
+    assert make_clustered_group_mixture_flow(
+        n_clusters_max=2, k_grow_patience=1,
+        group_action_fn=shift_group_action, group_size=GROUP_SIZE,
+        param_names=PARAM_NAMES, in_fundamental_domain=in_fundamental_domain,
+    ).k_grow_patience == 1
+
+
+def test_clustered_centroid_identity_is_stable_across_rounds():
+    """Once k=2, the cluster<->expert mapping must not swap between rounds:
+    expert 0 keeps tracking the same physical blob even as the data is
+    resampled, thanks to previous-centroid matching + the centroid EMA."""
+    w = _clustered_wrapper(2, k_grow_patience=1, centroid_ema=0.5)
+    rng = np.random.default_rng(7)
+    w._cluster(_bimodal(1000, rng))
+    assert int(w._n_active.item()) == 2
+
+    # which expert owns the low-y blob now?
+    data0 = _bimodal(1000, rng)
+    r0 = w._route(data0).numpy()
+    y0 = data0[:, 1].numpy()
+    low_expert = int(np.argmin([y0[r0 == 0].mean(), y0[r0 == 1].mean()]))
+
+    for _ in range(6):
+        w._cluster(_bimodal(1000, rng))
+        assert int(w._n_active.item()) == 2
+        d = _bimodal(1000, rng)
+        r = w._route(d).numpy()
+        y = d[:, 1].numpy()
+        still_low = int(np.argmin([y[r == 0].mean(), y[r == 1].mean()]))
+        assert still_low == low_expert  # never swapped
 
 
 def test_clustered_load_state_dict_tolerates_missing_new_buffers():
