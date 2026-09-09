@@ -194,6 +194,179 @@ def test_update_mixture_weights_drops_persistently_empty_element(wrapper, rng):
     assert wrapper.weights[3] > 0.0
 
 
+# -- factorised (generator-by-generator) mixture-weight estimator ----------
+
+FACTOR_GROUP_SIZE = 6  # Z3 x Z2, mode index little-endian [3, 2]
+FACTOR_SIZES = [3, 2]
+
+
+@pytest.fixture()
+def factor_wrapper(base_flow):
+    flow = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=shift_group_action,
+        group_size=FACTOR_GROUP_SIZE,
+        param_names=PARAM_NAMES,
+        in_fundamental_domain=in_fundamental_domain,
+        mode_factor_sizes=FACTOR_SIZES,
+    )
+    flow.eval()
+    return flow
+
+
+def _factor_counts(f0_weights, f1_weights):
+    """Per-mode counts of a perfectly factorised assignment."""
+    return [
+        f0_weights[k % 3] * f1_weights[k // 3]
+        for k in range(FACTOR_GROUP_SIZE)
+    ]
+
+
+def test_mode_factor_sizes_product_must_match_group_size(base_flow):
+    with pytest.raises(ValueError, match="multiply to"):
+        DiscreteGroupMixtureFlowWrapper(
+            base_flow,
+            2,
+            shift_group_action,
+            FACTOR_GROUP_SIZE,
+            mode_factor_sizes=[3, 3],
+        )
+
+
+def test_factorised_weights_are_product_of_marginals(factor_wrapper, rng):
+    counts = _factor_counts([6, 3, 1], [3, 1])
+    x = torch.cat(
+        [points_in_element(k, n, rng) for k, n in enumerate(counts)]
+    )
+    factor_wrapper.update_mixture_weights(x, smoothing=0.0)
+    expected = torch.tensor(counts, dtype=torch.float32) / sum(counts)
+    assert torch.allclose(factor_wrapper.weights, expected, atol=1e-6)
+    assert factor_wrapper.weights.sum() == pytest.approx(1.0)
+
+
+def test_factorised_weights_robust_to_empty_joint_mode(factor_wrapper, rng):
+    # Mode 4 (factor0 == 1, factor1 == 1) never receives a point, but both of
+    # its marginals are populated (mode 1 has factor0 == 1, modes 3 and 5 have
+    # factor1 == 1). The factorised estimator must keep its weight positive
+    # even past the empty-element patience.
+    present = [0, 1, 2, 3, 5]
+    x = torch.cat([points_in_element(k, 12, rng) for k in present])
+    for _ in range(factor_wrapper._weight_empty_patience + 2):
+        factor_wrapper.update_mixture_weights(x, smoothing=1.0)
+    assert factor_wrapper.weights[4] > 0.0
+    assert factor_wrapper.weights.sum() == pytest.approx(1.0)
+
+
+def test_factorised_update_records_marginals(factor_wrapper, rng):
+    counts = _factor_counts([6, 3, 1], [3, 1])
+    x = torch.cat(
+        [points_in_element(k, n, rng) for k, n in enumerate(counts)]
+    )
+    factor_wrapper.update_mixture_weights(x, smoothing=0.0)
+    marg = factor_wrapper._last_factor_marginals
+    assert [tuple(m.shape) for m in marg] == [(3,), (2,)]
+    for m in marg:
+        assert m.sum().item() == pytest.approx(1.0)
+    assert [tuple(c.shape) for c in factor_wrapper._last_factor_counts] == [
+        (3,),
+        (2,),
+    ]
+    # flat path leaves them unset
+    wrapper_flat = DiscreteGroupMixtureFlowWrapper(
+        factor_wrapper.base_flow,
+        2,
+        shift_group_action,
+        FACTOR_GROUP_SIZE,
+        param_names=PARAM_NAMES,
+        in_fundamental_domain=in_fundamental_domain,
+    )
+    wrapper_flat.update_mixture_weights(x)
+    assert wrapper_flat._last_factor_marginals is None
+
+
+def test_factorised_update_debug_logs_marginals(factor_wrapper, rng, caplog):
+    x = torch.cat([points_in_element(k, 10, rng) for k in range(6)])
+    with caplog.at_level("DEBUG", logger="nessai.flowmodel.group_mixture"):
+        factor_wrapper.update_mixture_weights(x)
+    assert any(
+        "factor marginals" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_flat_estimator_drops_the_same_empty_mode(wrapper, rng):
+    # Contrast: without a factorisation the flat estimator zeros a joint mode
+    # that has been empty for the patience window.
+    x = torch.cat([points_in_element(k, 12, rng) for k in range(3)])
+    for _ in range(wrapper._weight_empty_patience):
+        wrapper.update_mixture_weights(x)
+    assert wrapper.weights[3] == 0.0
+
+
+def test_factorised_weights_drop_whole_empty_marginal_slice(
+    factor_wrapper, rng
+):
+    # If an entire factor-1 slice (modes 3, 4, 5) stays empty past the
+    # patience window, every mode in it goes to zero weight.
+    x = torch.cat([points_in_element(k, 12, rng) for k in range(3)])
+    for _ in range(factor_wrapper._weight_empty_patience):
+        factor_wrapper.update_mixture_weights(x, smoothing=1.0)
+    assert torch.allclose(
+        factor_wrapper.weights[3:], torch.zeros(3), atol=1e-7
+    )
+    assert factor_wrapper.weights[:3].sum() == pytest.approx(1.0)
+
+
+def test_factory_plumbs_mode_factor_sizes(base_flow):
+    cls = make_group_mixture_flow(
+        shift_group_action,
+        FACTOR_GROUP_SIZE,
+        PARAM_NAMES,
+        in_fundamental_domain,
+        mode_factor_sizes=FACTOR_SIZES,
+    )
+    assert cls.mode_factor_sizes == FACTOR_SIZES
+    model = create_autospec(GroupMixtureFlowModel)
+    model.group_action_fn = staticmethod(shift_group_action)
+    model.group_size = FACTOR_GROUP_SIZE
+    model.param_names = PARAM_NAMES
+    model.in_fundamental_domain = staticmethod(in_fundamental_domain)
+    model.mode_factor_sizes = FACTOR_SIZES
+    flow = GroupMixtureFlowModel.get_model(
+        model,
+        {
+            "n_inputs": 2,
+            "ftype": "realnvp",
+            "n_blocks": 2,
+            "n_neurons": 4,
+            "n_layers": 1,
+        },
+    )
+    assert flow.mode_factor_sizes == FACTOR_SIZES
+    assert flow._mode_factor_index.shape == (FACTOR_GROUP_SIZE, 2)
+
+
+def test_factorised_wrapper_state_dict_round_trips(factor_wrapper, base_flow):
+    sd = factor_wrapper.state_dict()
+    other = DiscreteGroupMixtureFlowWrapper(
+        base_flow,
+        2,
+        shift_group_action,
+        FACTOR_GROUP_SIZE,
+        param_names=PARAM_NAMES,
+        in_fundamental_domain=in_fundamental_domain,
+        mode_factor_sizes=FACTOR_SIZES,
+    )
+    other.load_state_dict(sd)
+    # A checkpoint predating the factor buffers still loads (strict=True).
+    legacy = {
+        k: v
+        for k, v in sd.items()
+        if k not in ("_mode_factor_index", "_factor_empty_rounds")
+    }
+    other.load_state_dict(legacy)
+
+
 def test_set_affine_maps_updates_buffers(wrapper):
     scale = torch.tensor([2.0, 3.0])
     shift = torch.tensor([1.0, -1.0])

@@ -19,6 +19,16 @@ proposal reconstructs the full posterior as a mixture over the group:
 where the mixture weights :math:`\pi_g` are set in closed form each training
 round to the fraction of live points assigned to each group element.
 
+If the group decomposes into commuting cyclic factors
+:math:`G = \mathbb{Z}_{s_0} \times \cdots \times \mathbb{Z}_{s_{F-1}}` you can
+pass ``mode_factor_sizes = [s_0, ..., s_{F-1}]`` (with the mode index a
+little-endian mixed-radix code, ``factor_f(g) = (g // prod(s_{<f})) % s_f``).
+The weights are then the product of the :math:`F` per-factor marginals, each
+estimated from that factor's assignment counts pooled over every other factor.
+This is markedly more robust to transient mode collapse: a starved joint mode
+keeps a non-zero weight until a whole marginal slice empties, rather than being
+dropped as soon as its single tile is empty for a few rounds.
+
 The implementation lives in :mod:`nessai.flowmodel.group_mixture`.
 
 

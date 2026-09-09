@@ -206,6 +206,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         truncate_base_to_domain=True,
         reflect_parameters=None,
         canonical_transform=None,
+        mode_factor_sizes=None,
     ):
         super().__init__()
         self.base_flow = base_flow
@@ -291,6 +292,54 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             "weights", torch.full((group_size,), 1.0 / group_size)
         )
 
+        # Optional factorisation of the group into commuting cyclic factors
+        # (``mode_factor_sizes = [s_0, ..., s_{F-1}]``, ``prod = group_size``),
+        # with the mode index a little-endian mixed-radix code:
+        # ``factor_f(g) = (g // prod(s_{<f})) % s_f``. When present,
+        # :meth:`update_mixture_weights` estimates the ``F`` marginal
+        # distributions over the factors independently (each pooling counts
+        # over every other factor) and sets ``pi_g`` to their product. A
+        # single starved joint mode then keeps a non-zero weight as long as
+        # its per-factor marginals are populated, which makes the estimator
+        # far more robust to transient mode collapse than the flat
+        # per-mode count. Residual bias from non-independent factors (only
+        # the approximate phase symmetry is a plausible offender, and roughly
+        # independently of the sky/reflection factors) is corrected by the
+        # downstream importance reweighting.
+        if mode_factor_sizes:
+            mode_factor_sizes = [int(s) for s in mode_factor_sizes]
+            prod = 1
+            for s in mode_factor_sizes:
+                prod *= s
+            if prod != group_size:
+                raise ValueError(
+                    f"mode_factor_sizes {mode_factor_sizes} multiply to "
+                    f"{prod}, not group_size={group_size}."
+                )
+        else:
+            mode_factor_sizes = None
+        self.mode_factor_sizes = mode_factor_sizes
+        if mode_factor_sizes is not None:
+            g = torch.arange(group_size)
+            cols, stride = [], 1
+            for s in mode_factor_sizes:
+                cols.append(torch.div(g, stride, rounding_mode="floor") % s)
+                stride *= s
+            self.register_buffer(
+                "_mode_factor_index", torch.stack(cols, dim=1)
+            )
+            self.register_buffer(
+                "_factor_empty_rounds",
+                torch.zeros(sum(mode_factor_sizes), dtype=torch.long),
+            )
+            self._factor_offsets = [0]
+            for s in mode_factor_sizes:
+                self._factor_offsets.append(self._factor_offsets[-1] + s)
+        else:
+            self.register_buffer("_mode_factor_index", None)
+            self.register_buffer("_factor_empty_rounds", None)
+            self._factor_offsets = None
+
         # Per-element standardisation of the canonical coordinates seen by
         # the base flow, refreshed by ``update_base_standardisation``. It
         # rescales every mode's surviving region to a common size so a
@@ -348,6 +397,13 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         self._last_leakage_fraction_domain = 0.0
         self._last_leakage_fraction_roundtrip = 0.0
 
+        # Diagnostics for the factorised weight estimator: the per-factor
+        # marginal distributions and raw assignment counts from the last
+        # ``update_mixture_weights`` call (``None`` on the flat path). Consumed
+        # by ``GroupFlowProposalMixin._log_group_weight_entropy``.
+        self._last_factor_marginals = None
+        self._last_factor_counts = None
+
         # ``truncate_base_to_domain``: reject a generative draw whose ``canon``
         # falls outside the fundamental domain instead of scoring it with the
         # leaky single-branch shortcut. The base density then becomes ``q0``
@@ -364,6 +420,16 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     @property
     def uses_prime_space_action(self):
         return self.prime_space_action is not None
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        # Forward compatibility: a checkpoint written before the factorised
+        # weight estimator predates ``_mode_factor_index`` /
+        # ``_factor_empty_rounds``. Fill any missing buffer with its current
+        # (config-derived) default so ``strict=True`` resume still works.
+        sd = dict(state_dict)
+        for name, val in super().state_dict().items():
+            sd.setdefault(name, val)
+        return super().load_state_dict(sd, strict=strict, assign=assign)
 
     def _configure_reflection(self):
         """(Re)build the reflect-dim indices and sign patterns from
@@ -685,29 +751,85 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
 
     @torch.no_grad()
     def update_mixture_weights(self, x, context=None, smoothing=1.0):
-        """EM M-step: set the mixture weights to the assigned-point fractions.
+        """EM M-step: set the mixture weights from the assigned-point counts.
 
         Each point is assigned to the single group element whose inverse
-        action maps it into the fundamental domain, so the maximum-
-        likelihood weights are the assignment counts. ``smoothing`` keeps a
-        transiently-empty element in play; an element empty for
-        ``_weight_empty_patience`` consecutive rounds is dropped (weight 0)
-        until points return to it.
+        action maps it into the fundamental domain. Without a group
+        factorisation the maximum-likelihood weights are the per-mode
+        assignment fractions; ``smoothing`` keeps a transiently-empty element
+        in play and an element empty for ``_weight_empty_patience``
+        consecutive rounds is dropped (weight 0) until points return to it.
+
+        With ``mode_factor_sizes`` set the weights are instead the product of
+        the ``F`` per-factor marginal distributions, each estimated from the
+        counts of that factor's value pooled over every other factor (see
+        :meth:`__init__`). The same smoothing / empty-patience rule then acts
+        per factor *value*, so a starved joint mode is only zeroed when a
+        whole marginal slice empties -- a much rarer event.
         """
         assigned, _, claimed = self._assign_branch(x)
-        counts = torch.bincount(
-            assigned[claimed], minlength=self.group_size
-        ).to(self.weights)
-        self._empty_rounds = torch.where(
-            counts == 0,
-            self._empty_rounds + 1,
-            torch.zeros_like(self._empty_rounds),
-        )
-        active = self._empty_rounds < self._weight_empty_patience
-        smoothed = torch.where(
-            active, counts + smoothing, torch.zeros_like(counts)
-        )
-        self.weights.copy_(smoothed / smoothed.sum())
+        a = assigned[claimed]
+
+        if self.mode_factor_sizes is None:
+            counts = torch.bincount(a, minlength=self.group_size).to(
+                self.weights
+            )
+            self._empty_rounds = torch.where(
+                counts == 0,
+                self._empty_rounds + 1,
+                torch.zeros_like(self._empty_rounds),
+            )
+            active = self._empty_rounds < self._weight_empty_patience
+            smoothed = torch.where(
+                active, counts + smoothing, torch.zeros_like(counts)
+            )
+            self.weights.copy_(smoothed / smoothed.sum())
+            return
+
+        if a.numel() == 0:
+            # No claimed points this round: keep the current weights rather
+            # than dividing 0/0.
+            return
+        log_w = torch.zeros_like(self.weights)
+        marginals, raw_counts = [], []
+        for f, size in enumerate(self.mode_factor_sizes):
+            off = self._factor_offsets[f]
+            fac_of_mode = self._mode_factor_index[:, f]
+            fcounts = torch.bincount(
+                fac_of_mode[a], minlength=size
+            ).to(self.weights)
+            er = self._factor_empty_rounds[off : off + size]
+            er = torch.where(fcounts == 0, er + 1, torch.zeros_like(er))
+            self._factor_empty_rounds[off : off + size] = er
+            active = er < self._weight_empty_patience
+            smoothed = torch.where(
+                active, fcounts + smoothing, torch.zeros_like(fcounts)
+            )
+            total = smoothed.sum()
+            if total == 0:
+                # Every value of this factor was dropped -- fall back to a
+                # uniform marginal so the product stays well defined.
+                p_f = torch.full_like(smoothed, 1.0 / size)
+            else:
+                p_f = smoothed / total
+            log_w = log_w + torch.log(p_f[fac_of_mode])
+            marginals.append(p_f.detach().cpu())
+            raw_counts.append(fcounts.detach().cpu())
+        self.weights.copy_(torch.softmax(log_w, dim=0))
+        self._last_factor_marginals = marginals
+        self._last_factor_counts = raw_counts
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Group-mixture factor marginals: %s",
+                " | ".join(
+                    f"f{f}[{'x'.join(map(str, self.mode_factor_sizes))}]="
+                    + np.array2string(
+                        m.numpy(), precision=3, separator=",",
+                        suppress_small=True,
+                    )
+                    for f, m in enumerate(marginals)
+                ),
+            )
 
     def _branch_log_probs(self, x, context=None):
         """Return ``base_lp(g_k^-1 x) + log pi_k`` for every group element: ``[K, B]``.
@@ -1036,6 +1158,7 @@ class GroupMixtureFlowModel(FlowModel):
     truncate_base_to_domain = True
     reflect_parameters = None
     canonical_transform = None
+    mode_factor_sizes = None
 
     def initialise(self):
         """Initialise the model and optimiser via :meth:`get_model`."""
@@ -1098,6 +1221,11 @@ class GroupMixtureFlowModel(FlowModel):
             "canonical_transform",
             getattr(self, "canonical_transform", None),
         )
+        mode_factor_sizes = config_clean.pop(
+            "mode_factor_sizes", getattr(self, "mode_factor_sizes", None)
+        )
+        if not isinstance(mode_factor_sizes, (list, tuple)):
+            mode_factor_sizes = None
 
         if group_action_fn is None or group_size is None:
             raise ValueError(
@@ -1121,6 +1249,7 @@ class GroupMixtureFlowModel(FlowModel):
             truncate_base_to_domain=truncate_base_to_domain,
             reflect_parameters=reflect_parameters,
             canonical_transform=canonical_transform,
+            mode_factor_sizes=mode_factor_sizes,
         )
 
 
@@ -1135,6 +1264,7 @@ def make_group_mixture_flow(
     truncate_base_to_domain=True,
     reflect_parameters=None,
     canonical_transform=None,
+    mode_factor_sizes=None,
 ):
     """Factory constructing a ``GroupMixtureFlowModel`` bound to a specific group.
 
@@ -1205,6 +1335,18 @@ def make_group_mixture_flow(
         a hard canonical geometry (a uniform sky octant with a sharp prior
         edge) into a near-Gaussian frame before standardisation. Only
         supported on the ``prime_space_action`` path. Default: identity.
+    mode_factor_sizes : list of int, optional
+        Sizes ``[s_0, ..., s_{F-1}]`` (product ``== group_size``) of the
+        commuting cyclic factors the group decomposes into, with the mode
+        index a little-endian mixed-radix code
+        (``factor_f(g) = (g // prod(s_{<f})) % s_f``). When given,
+        :meth:`~DiscreteGroupMixtureFlowWrapper.update_mixture_weights`
+        estimates the ``F`` factor marginals independently -- each pooling
+        assignment counts over every other factor -- and sets the weights to
+        their product, which is much more robust to transient mode collapse
+        than the flat per-mode count (a starved joint mode keeps a non-zero
+        weight until a whole marginal slice empties). Default: flat per-mode
+        estimator.
 
     Notes
     -----
@@ -1230,6 +1372,11 @@ def make_group_mixture_flow(
         list(reflect_parameters) if reflect_parameters else None
     )
     CustomGroupMixtureFlowModel.canonical_transform = canonical_transform
+    CustomGroupMixtureFlowModel.mode_factor_sizes = (
+        [int(s) for s in mode_factor_sizes]
+        if mode_factor_sizes is not None
+        else None
+    )
     if in_fundamental_domain is not None:
         CustomGroupMixtureFlowModel.in_fundamental_domain = staticmethod(
             in_fundamental_domain
@@ -1334,6 +1481,26 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     @property
     def _min_canon_std(self):
         return self.experts[0]._min_canon_std
+
+    @property
+    def mode_factor_sizes(self):
+        return self.experts[0].mode_factor_sizes
+
+    @property
+    def _weight_empty_patience(self):
+        return self.experts[0]._weight_empty_patience
+
+    @property
+    def _factor_empty_rounds(self):
+        return self.experts[0]._factor_empty_rounds
+
+    @property
+    def _last_factor_marginals(self):
+        return self.experts[0]._last_factor_marginals
+
+    @property
+    def _last_factor_counts(self):
+        return self.experts[0]._last_factor_counts
 
     @property
     def weights(self):
@@ -2022,6 +2189,46 @@ class GroupFlowProposalMixin:
             f"Group-mixture weight entropy: {entropy:.3f} bits "
             f"({entropy / np.log2(n):.3f} normalised); weights: {weights}"
         )
+
+        # Factorised estimator: also report each generator's marginal, so a
+        # collapsing factor is visible before it drags a whole slice of joint
+        # weights to zero.
+        marginals = getattr(flow_model, "_last_factor_marginals", None)
+        counts = getattr(flow_model, "_last_factor_counts", None)
+        sizes = getattr(flow_model, "mode_factor_sizes", None)
+        if marginals is not None and sizes is not None:
+            patience = getattr(flow_model, "_weight_empty_patience", 3)
+            empty = getattr(flow_model, "_factor_empty_rounds", None)
+            offsets, off = [], 0
+            for s in sizes:
+                offsets.append(off)
+                off += s
+            for f, (size, m) in enumerate(zip(sizes, marginals)):
+                m = m.numpy()
+                ent = float(-(m * np.log2(np.clip(m, 1e-12, None))).sum())
+                c = (
+                    counts[f].numpy().astype(int).tolist()
+                    if counts is not None
+                    else None
+                )
+                dropped = []
+                if empty is not None:
+                    er = empty[offsets[f] : offsets[f] + size]
+                    dropped = (er >= patience).nonzero(as_tuple=True)[0]
+                    dropped = dropped.cpu().tolist()
+                logger.info(
+                    "  generator %d (Z%d): marginal %s%s%s "
+                    "[entropy %.3f / %.3f bits]",
+                    f,
+                    size,
+                    np.array2string(
+                        m, precision=3, separator=", ", suppress_small=True
+                    ),
+                    f", counts {c}" if c is not None else "",
+                    f", dropped values {dropped}" if dropped else "",
+                    ent,
+                    np.log2(size),
+                )
 
 
 class GroupFlowProposal(GroupFlowProposalMixin, FlowProposal):
