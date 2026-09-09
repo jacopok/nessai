@@ -2203,6 +2203,15 @@ class GroupFlowProposalMixin:
             for s in sizes:
                 offsets.append(off)
                 off += s
+            n_assigned = (
+                int(counts[0].sum()) if counts is not None else None
+            )
+            if n_assigned is not None:
+                logger.info(
+                    "  factorised weights from %d assigned live points "
+                    "(each generator's counts partition this same set):",
+                    n_assigned,
+                )
             for f, (size, m) in enumerate(zip(sizes, marginals)):
                 m = m.numpy()
                 ent = float(-(m * np.log2(np.clip(m, 1e-12, None))).sum())
