@@ -1868,9 +1868,8 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         sd = np.maximum(t.std(axis=0), 1e-9)
         ts = (t - mu) / sd
 
-        k_max = min(self.n_experts, n // max(self.min_cluster_size, 1))
-        k_want = self._choose_k(ts, k_max) if k_max >= 2 else 1
         k_cur = int(self._n_active.item())
+        k_want = self._k_want(t, ts, mu, sd)
 
         if not bool(self._clustering_seen):
             k = k_want
@@ -1906,52 +1905,9 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
                 + self._base_mu.detach().cpu().numpy()
             )
 
-        # Warm-start the GMM from the previous centroids so cluster membership
-        # is stable round to round -- a cold ``n_init=3`` fit hops between the
-        # ~equivalent local optima as the training data drifts by a few points.
-        means_init = None
-        if prev_raw is not None and k >= 2:
-            seed = (prev_raw - mu) / sd
-            if k > k_cur:
-                seed = np.vstack(
-                    [seed, _farthest_point_seeds(ts, seed, k - k_cur)]
-                )
-            means_init = seed[:k]
-        labels, centroids = self._fit_gmm(ts, k, means_init=means_init)
-
-        # Keep each cluster with the expert slot whose *previous-round* centroid
-        # it is nearest to (optimal assignment), so a physical sheet does not
-        # swap experts between rounds -- a swap attaches a trained flow and its
-        # per-cluster standardisation to the wrong sub-population and throws the
-        # mixture density off by hundreds of nats on the swapped fraction.
-        # Tightest-first only on the first clustering (no history yet).
-        if k >= 2:
-            spreads = np.array([
-                ts[labels == c].std() if np.any(labels == c) else np.inf
-                for c in range(k)
-            ])
-            if prev_raw is not None:
-                order = self._match_clusters(
-                    centroids, prev_raw, mu, sd, spreads
-                )
-            else:
-                order = np.argsort(spreads)
-            remap = {old: new for new, old in enumerate(order)}
-            labels = np.array([remap[c] for c in labels])
-            centroids = centroids[order]
-
-        # Smooth the routing centroids across rounds when k is unchanged, so
-        # points near a cluster boundary stop flip-flopping between experts.
-        if (
-            prev_raw is not None
-            and k == k_cur
-            and k >= 1
-            and 0.0 <= self.centroid_ema < 1.0
-        ):
-            b = self.centroid_ema
-            cent_raw = centroids * sd + mu
-            cent_raw = (1.0 - b) * prev_raw + b * cent_raw
-            centroids = (cent_raw - mu) / sd
+        labels, centroids = self._labels_for_k(
+            t, ts, mu, sd, k, k_cur, prev_raw
+        )
 
         with torch.no_grad():
             # warm-start any newly activated expert's *flow weights* from
@@ -1998,6 +1954,70 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
 
         lab_t = torch.as_tensor(labels, device=x.device, dtype=torch.long)
         self._cluster_cache = (key, lab_t)
+        self._log_cluster_round(k, k_cur, k_want, labels)
+        return lab_t
+
+    # -- clustering strategy hooks (overridable) --------------------------
+    def _k_want(self, t, ts, mu, sd):
+        """How many clusters the folded data wants this round, *before*
+        hysteresis.  ``t`` is the base-flow frame, ``ts`` its per-dim
+        standardisation, ``mu`` / ``sd`` the standardisation.  Default: the
+        GMM separation test :meth:`_choose_k`."""
+        n = ts.shape[0]
+        k_max = min(self.n_experts, n // max(self.min_cluster_size, 1))
+        return self._choose_k(ts, k_max) if k_max >= 2 else 1
+
+    def _labels_for_k(self, t, ts, mu, sd, k, k_cur, prev_raw):
+        """``(labels, centroids)`` for the (post-hysteresis) target ``k``:
+        per-row labels in ``[0, k)`` and the ``k`` centroids in the
+        *standardised* (``ts``) frame.  ``prev_raw`` is last round's centroids
+        in raw ``t`` units (``None`` on the first clustering).
+
+        Default: a GMM warm-started from ``prev_raw``, its components matched
+        to the previous centroids (:meth:`_match_clusters`) so a physical
+        sheet keeps its expert slot, and the routing centroids carried with
+        :attr:`centroid_ema` while ``k`` is unchanged.
+        """
+        if k >= 2:
+            means_init = None
+            if prev_raw is not None:
+                seed = (prev_raw - mu) / sd
+                if k > k_cur:
+                    seed = np.vstack(
+                        [seed, _farthest_point_seeds(ts, seed, k - k_cur)]
+                    )
+                means_init = seed[:k]
+            labels, centroids = self._fit_gmm(ts, k, means_init=means_init)
+            spreads = np.array([
+                ts[labels == c].std() if np.any(labels == c) else np.inf
+                for c in range(k)
+            ])
+            if prev_raw is not None:
+                order = self._match_clusters(
+                    centroids, prev_raw, mu, sd, spreads
+                )
+            else:
+                order = np.argsort(spreads)
+            remap = {old: new for new, old in enumerate(order)}
+            labels = np.array([remap[c] for c in labels])
+            centroids = centroids[order]
+        else:
+            labels = np.zeros(ts.shape[0], dtype=int)
+            centroids = ts.mean(0, keepdims=True)
+
+        if (
+            prev_raw is not None
+            and k == k_cur
+            and prev_raw.shape[0] == k
+            and 0.0 <= self.centroid_ema < 1.0
+        ):
+            b = self.centroid_ema
+            cent_raw = centroids * sd + mu
+            cent_raw = (1.0 - b) * prev_raw + b * cent_raw
+            centroids = (cent_raw - mu) / sd
+        return labels, centroids
+
+    def _log_cluster_round(self, k, k_cur, k_want, labels):
         if k != k_cur:
             logger.info(
                 "Clustered group mixture: k %d -> %d (want %d)",
@@ -2017,7 +2037,6 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             np.round(self.cluster_weights[:k].cpu().numpy(), 3).tolist(),
             np.bincount(labels, minlength=k).tolist(),
         )
-        return lab_t
 
     def _match_clusters(self, centroids_std, prev_raw, mu, sd, spreads):
         """``order`` (length ``k``): the new GMM component to place in each
@@ -2169,6 +2188,11 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
     # at ``k >= 2``).  0 -> no background expert (default; byte-identical to the
     # plain clustered mixture).
     bg_weight = 0.0
+    #: Wrapper class :meth:`get_model` builds for ``k >= 2``.  Subclasses set
+    #: this to a :class:`ClusteredGroupMixtureFlowWrapper` subclass that
+    #: overrides the clustering strategy (``_k_want`` / ``_labels_for_k``) --
+    #: e.g. a fixed rule-based split instead of the GMM.
+    wrapper_cls = ClusteredGroupMixtureFlowWrapper
 
     def train(self, samples, weights=None, conditional=None, plot=True,
               **kwargs):
@@ -2274,7 +2298,9 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
             if bg_weight > 0.0
             else None
         )
-        return ClusteredGroupMixtureFlowWrapper(
+        return getattr(
+            self, "wrapper_cls", ClusteredGroupMixtureFlowWrapper
+        )(
             experts,
             experts[0].num_features,
             cluster_method=getattr(self, "cluster_method", "gmm"),
