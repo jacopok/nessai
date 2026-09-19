@@ -900,6 +900,17 @@ def test_canon_std_ratio_cap_plumbed_through_factory():
     assert cls.canon_std_ratio_cap == 3.0
 
 
+def test_canon_mean_offset_cap_plumbed_through_factory():
+    cls = make_group_mixture_flow(
+        shift_group_action,
+        GROUP_SIZE,
+        PARAM_NAMES,
+        in_fundamental_domain,
+        canon_mean_offset_cap=2.0,
+    )
+    assert cls.canon_mean_offset_cap == 2.0
+
+
 def _branch_data(rng, k, n, y_std):
     """``n`` points whose ``x`` folds into branch ``k``'s fundamental domain
     (``shift_group_action``'s inverse for mode ``k`` maps them to ``[0, 1)``),
@@ -1012,6 +1023,100 @@ def test_update_base_standardisation_caps_std_ratio_to_average(
     # the average itself was protected from the outlier it produced.
     avg_after = float(w._canon_std_avg[1])
     assert avg_after < avg_before * 1.5
+
+
+def _branch_data_with_mean(rng, k, n, y_mean, y_std):
+    """Like ``_branch_data`` but with a per-call ``y`` mean offset."""
+    x = rng.uniform(0.0, 1.0, n) + k
+    y = rng.normal(y_mean, y_std, n)
+    return np.stack([x, y], axis=1)
+
+
+def test_update_base_standardisation_caps_mean_offset_to_average(
+    base_flow, caplog
+):
+    """A branch whose own measured mean is far off its symmetric siblings'
+    is capped to ``canon_mean_offset_cap`` cross-branch-average-std of the
+    cross-branch average instead of being trusted verbatim, with a one-off
+    warning -- mirroring the std-ratio cap."""
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=["x", "y"],
+        in_fundamental_domain=in_fundamental_domain,
+        canon_mean_offset_cap=2.0,
+    )
+    rng = np.random.default_rng(0)
+
+    # round 1: every branch centred at 0, establishing a stable average.
+    branches1 = [
+        _branch_data_with_mean(rng, k, 400, 0.0, 0.1)
+        for k in range(GROUP_SIZE)
+    ]
+    w.update_base_standardisation(
+        torch.tensor(np.concatenate(branches1), dtype=torch.float32)
+    )
+    avg_mean_before = float(w._canon_mean_avg[1])
+    avg_std_before = float(w._canon_std_avg[1])
+    mean3_before = float(w._canon_mean[3, 1])
+
+    # round 2: branch 3's mean shifts ~50 cross-branch-stds away, well past
+    # the 2-sigma cap; the others stay the same.
+    branches2 = [
+        _branch_data_with_mean(
+            rng, k, 400, 50 * avg_std_before if k == 3 else 0.0, 0.1
+        )
+        for k in range(GROUP_SIZE)
+    ]
+    with caplog.at_level("WARNING"):
+        w.update_base_standardisation(
+            torch.tensor(np.concatenate(branches2), dtype=torch.float32)
+        )
+    hits = sum(
+        "canonical mean capped" in r.getMessage() for r in caplog.records
+    )
+    assert hits == 1
+    branch3_y_mean = float(w._canon_mean[3, 1])
+    beta = float(w._canon_ema)
+    expected = (1 - beta) * mean3_before + beta * (
+        avg_mean_before + 2.0 * avg_std_before
+    )
+    assert branch3_y_mean == pytest.approx(expected, rel=1e-3)
+    # the average itself was protected from the outlier it produced.
+    avg_mean_after = float(w._canon_mean_avg[1])
+    assert abs(avg_mean_after - avg_mean_before) < 5 * avg_std_before
+
+
+def test_update_base_standardisation_zero_mean_cap_forces_shared_mean(
+    base_flow,
+):
+    """``canon_mean_offset_cap=0`` forces every branch's canonical mean to
+    exactly track the cross-branch average -- no per-branch mean offset
+    survives, even for a branch with a real, consistent mean shift."""
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=["x", "y"],
+        in_fundamental_domain=in_fundamental_domain,
+        canon_mean_offset_cap=0.0,
+    )
+    rng = np.random.default_rng(0)
+    y_means = [0.3 if k == 2 else 0.0 for k in range(GROUP_SIZE)]
+    branches = [
+        _branch_data_with_mean(rng, k, 400, y_means[k], 0.1)
+        for k in range(GROUP_SIZE)
+    ]
+    w.update_base_standardisation(
+        torch.tensor(np.concatenate(branches), dtype=torch.float32)
+    )
+    for k in range(GROUP_SIZE):
+        assert float(w._canon_mean[k, 1]) == pytest.approx(
+            float(w._canon_mean_avg[1]), abs=1e-6
+        )
 
 
 @pytest.mark.slow_integration_test

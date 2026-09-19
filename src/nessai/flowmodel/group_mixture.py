@@ -204,6 +204,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         prime_space_in_domain=None,
         min_canon_std=1e-6,
         canon_std_ratio_cap=5.0,
+        canon_mean_offset_cap=None,
         truncate_base_to_domain=True,
         reflect_parameters=None,
         canonical_transform=None,
@@ -421,6 +422,16 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             "_canon_has_delta", torch.zeros(group_size, dtype=torch.bool)
         )
         self._warned_canon_clamp = False
+        # Analogous cap on the *mean*: a branch's canonical mean is clamped
+        # to within ``canon_mean_offset_cap`` cross-branch-average standard
+        # deviations of the cross-branch average mean (default ``None`` --
+        # unconstrained, preserving the pre-existing behaviour). Setting this
+        # to ``0`` forces every branch's canonical mean to exactly track the
+        # average -- i.e. no per-branch mean offset at all -- for testing
+        # whether the per-branch mean freedom is needed or is itself a source
+        # of spurious canonicalisation asymmetry.
+        self._canon_mean_offset_cap = canon_mean_offset_cap
+        self._warned_canon_mean_clamp = False
         # Fraction of the last batch whose generative draw leaked out of the
         # canonical fundamental domain and so fell back from the single-branch
         # shortcut to the full mixture ``log_prob`` in
@@ -777,7 +788,11 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         else:
             had_avg = bool(self._canon_avg_seen)
             cap = self._canon_std_ratio_cap
+            mean_cap = self._canon_mean_offset_cap
             clamped = torch.zeros(
+                self.num_features, dtype=torch.bool, device=x.device
+            )
+            mean_clamped = torch.zeros(
                 self.num_features, dtype=torch.bool, device=x.device
             )
             # Cap each branch's *raw* estimate against a reference average:
@@ -794,11 +809,28 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 if had_avg
                 else torch.stack(branch_sk_raw).mean(dim=0)
             )
+            ref_mean = (
+                self._canon_mean_avg
+                if had_avg
+                else torch.stack(branch_mk).mean(dim=0)
+            )
             lo, hi = ref_std / cap, ref_std * cap
             branch_sk = []
             for sk in branch_sk_raw:
                 clamped |= (sk < lo) | (sk > hi)
                 branch_sk.append(sk.clamp(lo, hi))
+
+            if mean_cap is not None:
+                # Scale is in cross-branch-average-std units (not the
+                # branch's own, possibly-capped, std) so the bound is a
+                # stable reference independent of the std cap above.
+                lo_m = ref_mean - mean_cap * ref_std
+                hi_m = ref_mean + mean_cap * ref_std
+                branch_mk_capped = []
+                for mk in branch_mk:
+                    mean_clamped |= (mk < lo_m) | (mk > hi_m)
+                    branch_mk_capped.append(mk.clamp(lo_m, hi_m))
+                branch_mk = branch_mk_capped
 
             # -- shared cross-branch average: the unweighted mean of the
             # populated branches' own (already-capped) fresh estimates, not
@@ -855,20 +887,43 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 )
                 self._warned_canon_clamp = True
 
+            if bool(mean_clamped.any()) and not self._warned_canon_mean_clamp:
+                names = [
+                    self.param_names[i]
+                    for i in mean_clamped.nonzero(as_tuple=True)[0].tolist()
+                ]
+                logger.warning(
+                    "Group-mixture canonical mean capped at %g cross-branch "
+                    "std of the cross-branch average for %s: at least one "
+                    "branch's own measured centre there differs from its "
+                    "symmetric siblings by more than that. Raise "
+                    "canon_mean_offset_cap (or set it to None) if this "
+                    "triggers persistently for a genuinely asymmetric mode "
+                    "rather than sampling noise.",
+                    mean_cap,
+                    names,
+                )
+                self._warned_canon_mean_clamp = True
+
         # -- dormant branches (too few points this round to update from
         # their own data): keep tracking the moving average, offset by the
         # personal deviation last measured while they *were* populated. --
         avg_std = self._canon_std_avg
+        avg_mean = self._canon_mean_avg
         cap = self._canon_std_ratio_cap
+        mean_cap = self._canon_mean_offset_cap
         lo, hi = avg_std / cap, avg_std * cap
+        if mean_cap is not None:
+            lo_m, hi_m = avg_mean - mean_cap * avg_std, avg_mean + mean_cap * avg_std
         populated = set(branch_k)
         for k in range(self.group_size):
             if k in populated:
                 continue
             if bool(self._canon_has_delta[k]):
-                self._canon_mean[k].copy_(
-                    self._canon_mean_avg + self._canon_mean_delta[k]
-                )
+                mean_k = avg_mean + self._canon_mean_delta[k]
+                if mean_cap is not None:
+                    mean_k = mean_k.clamp(lo_m, hi_m)
+                self._canon_mean[k].copy_(mean_k)
                 self._canon_std[k].copy_(
                     (avg_std * self._canon_std_ratio[k]).clamp(lo, hi)
                 )
@@ -1285,6 +1340,7 @@ class GroupMixtureFlowModel(FlowModel):
     prime_space_in_domain = None
     min_canon_std = 1e-6
     canon_std_ratio_cap = 5.0
+    canon_mean_offset_cap = None
     truncate_base_to_domain = True
     reflect_parameters = None
     canonical_transform = None
@@ -1343,6 +1399,10 @@ class GroupMixtureFlowModel(FlowModel):
         canon_std_ratio_cap = config_clean.pop(
             "canon_std_ratio_cap", getattr(self, "canon_std_ratio_cap", 5.0)
         )
+        canon_mean_offset_cap = config_clean.pop(
+            "canon_mean_offset_cap",
+            getattr(self, "canon_mean_offset_cap", None),
+        )
         truncate_base_to_domain = config_clean.pop(
             "truncate_base_to_domain",
             getattr(self, "truncate_base_to_domain", True),
@@ -1380,6 +1440,7 @@ class GroupMixtureFlowModel(FlowModel):
             prime_space_in_domain=prime_space_in_domain,
             min_canon_std=min_canon_std,
             canon_std_ratio_cap=canon_std_ratio_cap,
+            canon_mean_offset_cap=canon_mean_offset_cap,
             truncate_base_to_domain=truncate_base_to_domain,
             reflect_parameters=reflect_parameters,
             canonical_transform=canonical_transform,
@@ -1396,6 +1457,7 @@ def make_group_mixture_flow(
     prime_space_in_domain=None,
     min_canon_std=1e-6,
     canon_std_ratio_cap=5.0,
+    canon_mean_offset_cap=None,
     truncate_base_to_domain=True,
     reflect_parameters=None,
     canonical_transform=None,
@@ -1457,6 +1519,17 @@ def make_group_mixture_flow(
         so a temporarily-empty branch stays consistent with its previous
         behaviour rather than snapping to the bare average or freezing in
         place.
+    canon_mean_offset_cap : float, optional
+        Analogous cap on the canonical *mean*: each branch's mean is clamped
+        to within this many cross-branch-average standard deviations
+        (``canon_std_avg``, not the branch's own std) of the cross-branch
+        average mean. Default ``None`` -- unconstrained, i.e. the mean cap is
+        off and only the std ratio cap applies. Set to ``0`` to force every
+        branch's canonical mean to exactly track the cross-branch average (no
+        per-branch mean offset at all) -- useful for testing whether the
+        per-branch mean freedom is itself a source of spurious asymmetry
+        between otherwise-symmetric modes. A one-off warning fires when the
+        cap binds, mirroring ``canon_std_ratio_cap``'s.
     truncate_base_to_domain : bool, optional
         If ``True``,
         :meth:`~DiscreteGroupMixtureFlowWrapper.sample_and_log_prob` rejects
@@ -1519,6 +1592,7 @@ def make_group_mixture_flow(
     CustomGroupMixtureFlowModel.param_names = param_names
     CustomGroupMixtureFlowModel.min_canon_std = min_canon_std
     CustomGroupMixtureFlowModel.canon_std_ratio_cap = canon_std_ratio_cap
+    CustomGroupMixtureFlowModel.canon_mean_offset_cap = canon_mean_offset_cap
     CustomGroupMixtureFlowModel.truncate_base_to_domain = (
         truncate_base_to_domain
     )
@@ -1685,6 +1759,10 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     @property
     def _canon_std_ratio_cap(self):
         return self.experts[0]._canon_std_ratio_cap
+
+    @property
+    def _canon_mean_offset_cap(self):
+        return self.experts[0]._canon_mean_offset_cap
 
     @property
     def mode_factor_sizes(self):
