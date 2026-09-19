@@ -202,7 +202,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         in_fundamental_domain=None,
         prime_space_action=None,
         prime_space_in_domain=None,
-        min_canon_std=1e-2,
+        min_canon_std=1e-6,
+        canon_std_ratio_cap=5.0,
         truncate_base_to_domain=True,
         reflect_parameters=None,
         canonical_transform=None,
@@ -362,26 +363,63 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         self._min_std_count = 16
         self._canon_ema = 0.3
         self._weight_empty_patience = 3
-        # Floor for the per-element canonical std. The canonical coordinates
-        # live in the flow's ~unit-scaled prime frame, so a per-element std
-        # far below 1 means that dimension carries almost no information for
-        # that mode (e.g. a parameter the run effectively fixes). Rescaling it
-        # to O(1) anyway divides by a near-zero number: ``_canon_log_det``
-        # blows up and ``sample_and_log_prob`` (which draws that dim with
-        # width ``_canon_std``) stops agreeing with ``log_prob`` (which sees
-        # the true, much narrower spread). Flooring keeps both paths finite
-        # and consistent; the residual sub-floor variance is modelled by the
-        # base flow instead.
-        #
-        # The default (1e-2) suits a ~unit-scaled prime frame. A run that
-        # z-scores a parameter far tighter than the prior resolves it (e.g. a
-        # GW ``geocent_time`` pinned to ~1e-4 s inside a 0.2 s prior) has a
-        # true prime spread orders of magnitude below the floor: the base flow
-        # is then asked to model a near-delta in that coordinate and
-        # ``sample_and_log_prob`` comes out over-dispersed there. Lower
-        # ``min_canon_std`` in that case; ``update_base_standardisation`` warns
-        # once when the floor actually binds.
+        # Pure numerical safety floor for a *single* branch's raw measured
+        # std, applied before anything else (a literal std of 0 -- e.g. a
+        # branch with a run of identical points -- would otherwise divide by
+        # zero downstream). This is NOT the main defence against an
+        # over-narrow canonicalisation: see ``_canon_std_ratio_cap`` below.
+        # It should stay many orders of magnitude below any real posterior
+        # width and essentially never bind; if it does, something upstream
+        # (e.g. a degenerate/duplicated batch) is wrong.
         self._min_canon_std = min_canon_std
+        # Every group element is a symmetric copy of the same underlying
+        # mode, so its canonical std, once enough points have visited it,
+        # should agree with every other element's -- up to real per-branch
+        # heterogeneity, not an arbitrary absolute scale. ``_canon_std_avg``
+        # (updated below, in ``update_base_standardisation``) tracks the
+        # *unweighted* mean of every currently-populated branch's own std
+        # (so a heavily-populated branch cannot dominate it), and each
+        # branch's std is clamped to within a factor of
+        # ``_canon_std_ratio_cap`` of that average -- a *relative* floor/
+        # ceiling that adapts to whatever the coordinate's natural scale
+        # happens to be, instead of the old fixed absolute floor (which
+        # either did nothing, when the coordinate's natural scale was far
+        # above the constant, or forced every branch narrower than it to the
+        # same absolute width regardless of how tightly the whole posterior
+        # legitimately resolves that dimension -- see git history for the
+        # previous ``min_canon_std``-only scheme this replaced).
+        self._canon_std_ratio_cap = canon_std_ratio_cap
+        self.register_buffer(
+            "_canon_mean_avg", torch.zeros(num_features)
+        )
+        self.register_buffer(
+            "_canon_std_avg", torch.ones(num_features)
+        )
+        self.register_buffer(
+            "_canon_avg_seen", torch.zeros((), dtype=torch.bool)
+        )
+        # Each branch's own last-measured deviation from the cross-branch
+        # average -- additive for the mean, multiplicative for the std --
+        # frozen at the point the branch was last populated. A branch with
+        # too few points to update from its own data this round keeps
+        # tracking the *current* (possibly still-moving) average offset by
+        # this frozen personal deviation, rather than either freezing at its
+        # last absolute value (drifts out of step with the moving average)
+        # or snapping to the bare average (discards real, previously
+        # measured, branch-specific information). A toy-model comparison of
+        # "snap to the average" vs "track the average with the frozen
+        # personal offset" found the latter ~3x more accurate immediately
+        # after a long dormancy and still modestly more accurate in steady
+        # state, so this is the default behaviour, not just a fallback.
+        self.register_buffer(
+            "_canon_mean_delta", torch.zeros(group_size, num_features)
+        )
+        self.register_buffer(
+            "_canon_std_ratio", torch.ones(group_size, num_features)
+        )
+        self.register_buffer(
+            "_canon_has_delta", torch.zeros(group_size, dtype=torch.bool)
+        )
         self._warned_canon_clamp = False
         # Fraction of the last batch whose generative draw leaked out of the
         # canonical fundamental domain and so fell back from the single-branch
@@ -679,10 +717,14 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     def update_base_standardisation(self, x, context=None):
         """Update the per-element canonical standardisation from assigned points.
 
-        Each element's canonical points are standardised by their own
-        mean/std, exponentially averaged across rounds. An element with too
-        few points this round keeps its last value; an element never yet
-        seen is bootstrapped from the pooled mean/std.
+        Each populated element's canonical points are standardised by their
+        own mean/std, exponentially averaged across rounds, with the std
+        clamped to within ``_canon_std_ratio_cap`` of the cross-branch
+        average (see the comment on ``_canon_std_ratio_cap`` in
+        ``__init__``). An element with too few points this round instead
+        tracks the *current* average using its own last-measured deviation
+        from it; an element never yet seen is bootstrapped from the bare
+        average.
         """
         b = x.shape[0]
         assigned, pre, claimed = self._assign_branch(x)
@@ -710,27 +752,10 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             std[idx] = rms
             return mean, std
 
-        gmean = canon.mean(dim=0)
-        raw_std = canon.std(dim=0)
-        gstd = raw_std.clamp_min(self._min_canon_std)
-        gmean, gstd = _pin_reflect(gmean, gstd, canon)
-        clamped = raw_std < self._min_canon_std
-        if bool(clamped.any()) and not self._warned_canon_clamp:
-            names = [
-                self.param_names[i]
-                for i in clamped.nonzero(as_tuple=True)[0].tolist()
-            ]
-            logger.warning(
-                "Group-mixture canonical std floored at %g for %s: the "
-                "posterior is far narrower than the prime frame there, so the "
-                "base flow must model a near-delta in that coordinate and "
-                "sample_and_log_prob may be over-dispersed. Lower "
-                "min_canon_std or use a tighter reparameterisation.",
-                self._min_canon_std,
-                names,
-            )
-            self._warned_canon_clamp = True
+        # -- per-branch raw estimates, for every branch with enough points
+        # this round to compute one from its own data. -------------------
         beta = self._canon_ema
+        branch_mk, branch_sk_raw, branch_k = [], [], []
         for k in range(self.group_size):
             sel = claimed & (assigned == k)
             if int(sel.sum()) >= self._min_std_count:
@@ -738,6 +763,60 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 mk = c.mean(dim=0)
                 sk = c.std(dim=0).clamp_min(self._min_canon_std)
                 mk, sk = _pin_reflect(mk, sk, c)
+                branch_mk.append(mk)
+                branch_sk_raw.append(sk)
+                branch_k.append(k)
+
+        if not branch_k:
+            # No branch had enough points this round; nothing new to
+            # standardise against (dormant branches are handled below only
+            # once an average exists at all).
+            if not bool(self._canon_avg_seen):
+                return
+            branch_sk = []
+        else:
+            had_avg = bool(self._canon_avg_seen)
+            cap = self._canon_std_ratio_cap
+            clamped = torch.zeros(
+                self.num_features, dtype=torch.bool, device=x.device
+            )
+            # Cap each branch's *raw* estimate against a reference average:
+            # the average as it stood *before* this round's update, once one
+            # exists, so a branch that is itself wildly off (or genuinely
+            # degenerate -- e.g. a literal std of 0) cannot drag the very
+            # average it is judged against towards itself. On the very first
+            # populated round there is no such reference yet, so this round's
+            # own (unprotected) raw average is used instead -- a one-off,
+            # self-referential bootstrap; from the next round on every cap is
+            # judged against an average an outlier could not have polluted.
+            ref_std = (
+                self._canon_std_avg
+                if had_avg
+                else torch.stack(branch_sk_raw).mean(dim=0)
+            )
+            lo, hi = ref_std / cap, ref_std * cap
+            branch_sk = []
+            for sk in branch_sk_raw:
+                clamped |= (sk < lo) | (sk > hi)
+                branch_sk.append(sk.clamp(lo, hi))
+
+            # -- shared cross-branch average: the unweighted mean of the
+            # populated branches' own (already-capped) fresh estimates, not
+            # of the pooled points, so neither a branch with many more
+            # currently-assigned points nor a capped outlier can dominate it
+            # -- every branch is meant to be an equivalent symmetric copy of
+            # the same mode. ---------------------------------------------
+            new_avg_mean = torch.stack(branch_mk).mean(dim=0)
+            new_avg_std = torch.stack(branch_sk).mean(dim=0)
+            if had_avg:
+                self._canon_mean_avg.mul_(1 - beta).add_(beta * new_avg_mean)
+                self._canon_std_avg.mul_(1 - beta).add_(beta * new_avg_std)
+            else:
+                self._canon_mean_avg.copy_(new_avg_mean)
+                self._canon_std_avg.copy_(new_avg_std)
+                self._canon_avg_seen.fill_(True)
+
+            for mk, sk, k in zip(branch_mk, branch_sk, branch_k):
                 if self._canon_seen[k]:
                     self._canon_mean[k].mul_(1 - beta).add_(beta * mk)
                     self._canon_std[k].mul_(1 - beta).add_(beta * sk)
@@ -745,9 +824,59 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                     self._canon_mean[k].copy_(mk)
                     self._canon_std[k].copy_(sk)
                     self._canon_seen[k] = True
-            elif not self._canon_seen[k]:
-                self._canon_mean[k].copy_(gmean)
-                self._canon_std[k].copy_(gstd)
+                # Remember this branch's personal deviation from the
+                # (now-updated) average -- additive for the mean,
+                # multiplicative for the std -- so a future dormant round
+                # can keep tracking the moving average with it instead of
+                # freezing or discarding it.
+                self._canon_mean_delta[k].copy_(
+                    self._canon_mean[k] - self._canon_mean_avg
+                )
+                self._canon_std_ratio[k].copy_(
+                    self._canon_std[k] / self._canon_std_avg
+                )
+                self._canon_has_delta[k] = True
+
+            if bool(clamped.any()) and not self._warned_canon_clamp:
+                names = [
+                    self.param_names[i]
+                    for i in clamped.nonzero(as_tuple=True)[0].tolist()
+                ]
+                logger.warning(
+                    "Group-mixture canonical std capped at %gx the "
+                    "cross-branch average for %s: at least one branch's own "
+                    "measured spread there differs from its symmetric "
+                    "siblings by more than that factor. Raise "
+                    "canon_std_ratio_cap if this triggers persistently for "
+                    "a genuinely asymmetric mode rather than sampling "
+                    "noise.",
+                    cap,
+                    names,
+                )
+                self._warned_canon_clamp = True
+
+        # -- dormant branches (too few points this round to update from
+        # their own data): keep tracking the moving average, offset by the
+        # personal deviation last measured while they *were* populated. --
+        avg_std = self._canon_std_avg
+        cap = self._canon_std_ratio_cap
+        lo, hi = avg_std / cap, avg_std * cap
+        populated = set(branch_k)
+        for k in range(self.group_size):
+            if k in populated:
+                continue
+            if bool(self._canon_has_delta[k]):
+                self._canon_mean[k].copy_(
+                    self._canon_mean_avg + self._canon_mean_delta[k]
+                )
+                self._canon_std[k].copy_(
+                    (avg_std * self._canon_std_ratio[k]).clamp(lo, hi)
+                )
+                self._canon_seen[k] = True
+            elif not bool(self._canon_seen[k]):
+                self._canon_mean[k].copy_(self._canon_mean_avg)
+                self._canon_std[k].copy_(avg_std)
+                self._canon_seen[k] = True
 
     @torch.no_grad()
     def update_mixture_weights(self, x, context=None, smoothing=1.0):
@@ -1154,7 +1283,8 @@ class GroupMixtureFlowModel(FlowModel):
     in_fundamental_domain = None
     prime_space_action = None
     prime_space_in_domain = None
-    min_canon_std = 1e-2
+    min_canon_std = 1e-6
+    canon_std_ratio_cap = 5.0
     truncate_base_to_domain = True
     reflect_parameters = None
     canonical_transform = None
@@ -1208,7 +1338,10 @@ class GroupMixtureFlowModel(FlowModel):
             getattr(self, "prime_space_in_domain", None),
         )
         min_canon_std = config_clean.pop(
-            "min_canon_std", getattr(self, "min_canon_std", 1e-2)
+            "min_canon_std", getattr(self, "min_canon_std", 1e-6)
+        )
+        canon_std_ratio_cap = config_clean.pop(
+            "canon_std_ratio_cap", getattr(self, "canon_std_ratio_cap", 5.0)
         )
         truncate_base_to_domain = config_clean.pop(
             "truncate_base_to_domain",
@@ -1246,6 +1379,7 @@ class GroupMixtureFlowModel(FlowModel):
             prime_space_action=prime_space_action,
             prime_space_in_domain=prime_space_in_domain,
             min_canon_std=min_canon_std,
+            canon_std_ratio_cap=canon_std_ratio_cap,
             truncate_base_to_domain=truncate_base_to_domain,
             reflect_parameters=reflect_parameters,
             canonical_transform=canonical_transform,
@@ -1260,7 +1394,8 @@ def make_group_mixture_flow(
     in_fundamental_domain=None,
     prime_space_action=None,
     prime_space_in_domain=None,
-    min_canon_std=1e-2,
+    min_canon_std=1e-6,
+    canon_std_ratio_cap=5.0,
     truncate_base_to_domain=True,
     reflect_parameters=None,
     canonical_transform=None,
@@ -1298,12 +1433,30 @@ def make_group_mixture_flow(
         Fundamental-domain predicate in prime coordinates; required with
         ``prime_space_action``.
     min_canon_std : float, optional
-        Floor on the per-element canonical standardisation std (default
-        ``1e-2``, tuned for a ~unit-scaled prime frame). Lower it when a
-        parameter is z-scored far tighter than the prior resolves it (e.g. a
-        GW ``geocent_time``), otherwise the base flow is forced to model a
-        near-delta in that coordinate and ``sample_and_log_prob`` is
-        over-dispersed there; a one-off warning fires when the floor binds.
+        Pure numerical-safety floor on a single branch's *raw* measured std
+        (default ``1e-6``), applied before anything else so a literal std of
+        0 cannot divide by zero downstream. This is not the main defence
+        against an over-narrow canonicalisation -- see
+        ``canon_std_ratio_cap`` -- and should essentially never bind; leave
+        it at the default unless a batch can be genuinely degenerate.
+    canon_std_ratio_cap : float, optional
+        Every group element is a symmetric copy of the same underlying
+        mode, so its canonical std should agree with every other element's
+        up to real per-branch heterogeneity, not an arbitrary absolute
+        scale. Each branch's std is clamped to within a factor of this cap
+        (default ``5.0``) of the cross-branch average (the unweighted mean
+        of every currently-populated branch's own std), so a genuinely
+        narrow coordinate (e.g. a GW ``geocent_time`` z-scored far tighter
+        than the prior resolves it) is never forced towards some arbitrary
+        absolute floor -- only branches that disagree with their own
+        symmetric siblings are clamped. A one-off warning fires when the
+        cap binds; raise it if that triggers persistently for a genuinely
+        asymmetric mode rather than sampling noise. A branch with too few
+        points to measure its own std this round instead tracks the
+        cross-branch average scaled by its own last-measured ratio to it,
+        so a temporarily-empty branch stays consistent with its previous
+        behaviour rather than snapping to the bare average or freezing in
+        place.
     truncate_base_to_domain : bool, optional
         If ``True``,
         :meth:`~DiscreteGroupMixtureFlowWrapper.sample_and_log_prob` rejects
@@ -1365,6 +1518,7 @@ def make_group_mixture_flow(
     CustomGroupMixtureFlowModel.group_size = group_size
     CustomGroupMixtureFlowModel.param_names = param_names
     CustomGroupMixtureFlowModel.min_canon_std = min_canon_std
+    CustomGroupMixtureFlowModel.canon_std_ratio_cap = canon_std_ratio_cap
     CustomGroupMixtureFlowModel.truncate_base_to_domain = (
         truncate_base_to_domain
     )
@@ -1527,6 +1681,10 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     @property
     def _min_canon_std(self):
         return self.experts[0]._min_canon_std
+
+    @property
+    def _canon_std_ratio_cap(self):
+        return self.experts[0]._canon_std_ratio_cap
 
     @property
     def mode_factor_sizes(self):
@@ -1927,6 +2085,33 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
                 self._pending_split_train.fill_(True)
             if k <= 1:
                 self._pending_split_train.fill_(False)
+                # Collapsing k_cur >= 2 experts back down to the single
+                # ``experts[0]`` slot: symmetric to the grow branch above,
+                # but for shrinking.  Without this, ``experts[0]`` keeps
+                # *its own* stale weights/canonical standardisation from
+                # whatever (possibly tiny, specialised) cluster it last
+                # owned -- if the surviving population was actually
+                # dominated by a different expert (e.g. expert 0 was the
+                # minority cluster that just died out), every downstream
+                # call (``log_prob``/``forward``/``sample_and_log_prob``,
+                # which all route unconditionally to ``experts[0]`` once
+                # ``act() == 1``) silently uses that poorly-fit flow for
+                # the *entire* now-unimodal population -- an acceptance
+                # cliff and bad reconstruction with no error or log line,
+                # since the collapse itself looks unremarkable.  Re-seed
+                # slot 0 from whichever expert actually carried the most
+                # weight before collapsing, so training resumes from a
+                # sane initialisation instead of a poor one.
+                if k_cur >= 2 and bool(self._clustering_seen):
+                    dominant = int(
+                        torch.argmax(self.cluster_weights[:k_cur]).item()
+                    )
+                    if dominant != 0:
+                        self.experts[0].load_state_dict(
+                            self.experts[dominant].state_dict()
+                        )
+                        self.experts[0]._canon_seen.zero_()
+                        self.experts[0]._domain_mass_seen = False
 
             dev = self.cluster_weights.device
             self._base_mu.copy_(torch.as_tensor(mu, dtype=self._base_mu.dtype))

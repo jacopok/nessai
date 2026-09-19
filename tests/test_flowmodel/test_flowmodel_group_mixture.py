@@ -889,8 +889,31 @@ def test_min_canon_std_plumbed_through_factory():
     assert cls.min_canon_std == 1e-5
 
 
-def test_update_base_standardisation_warns_when_floor_binds(base_flow, caplog):
-    """A prime dim far narrower than the floor triggers a one-off warning."""
+def test_canon_std_ratio_cap_plumbed_through_factory():
+    cls = make_group_mixture_flow(
+        shift_group_action,
+        GROUP_SIZE,
+        PARAM_NAMES,
+        in_fundamental_domain,
+        canon_std_ratio_cap=3.0,
+    )
+    assert cls.canon_std_ratio_cap == 3.0
+
+
+def _branch_data(rng, k, n, y_std):
+    """``n`` points whose ``x`` folds into branch ``k``'s fundamental domain
+    (``shift_group_action``'s inverse for mode ``k`` maps them to ``[0, 1)``),
+    with ``y ~ N(0, y_std)``."""
+    x = rng.uniform(0.0, 1.0, n) + k
+    y = rng.normal(0.0, y_std, n)
+    return np.stack([x, y], axis=1)
+
+
+def test_update_base_standardisation_tracks_cross_branch_average(base_flow):
+    """A branch with too few points this round to measure its own std
+    tracks the *current* cross-branch average, scaled by its own
+    last-measured ratio to it -- not frozen at an absolute value and not
+    snapped to the bare average, discarding that ratio."""
     w = DiscreteGroupMixtureFlowWrapper(
         base_flow=base_flow,
         num_features=2,
@@ -898,21 +921,97 @@ def test_update_base_standardisation_warns_when_floor_binds(base_flow, caplog):
         group_size=GROUP_SIZE,
         param_names=["x", "y"],
         in_fundamental_domain=in_fundamental_domain,
-        min_canon_std=1e-2,
     )
     rng = np.random.default_rng(0)
-    # ``y`` is pinned ~1e-6 wide, well below the 1e-2 floor.
-    data = np.stack(
-        [rng.uniform(0.0, 1.0, 400), rng.normal(0.0, 1e-6, 400)], axis=1
+    # every branch's y is a different (but within the default 5x cap)
+    # width -- nothing gets clamped, so the stored per-branch std should
+    # equal what each branch itself measured, and the average their mean.
+    y_stds_round1 = [0.1, 0.2, 0.2, 0.2]
+    branches = [
+        _branch_data(rng, k, 400, y_stds_round1[k]) for k in range(GROUP_SIZE)
+    ]
+    x_train = torch.tensor(np.concatenate(branches), dtype=torch.float32)
+    w.update_base_standardisation(x_train)
+
+    # ddof=1 to match torch's ``.std()`` default (unbiased), which is what
+    # the wrapper itself uses.
+    measured_std_y = np.array([b[:, 1].std(ddof=1) for b in branches])
+    assert float(w._canon_std_avg[1]) == pytest.approx(
+        measured_std_y.mean(), rel=1e-5
     )
-    x_train = torch.tensor(data, dtype=torch.float32)
+    for k in range(GROUP_SIZE):
+        assert float(w._canon_std[k, 1]) == pytest.approx(
+            measured_std_y[k], rel=1e-5
+        )
+    ratio0 = float(w._canon_std[0, 1] / w._canon_std_avg[1])
+
+    # branch 0 now goes dormant (too few points) while the average keeps
+    # moving from fresh data on the other branches -- it should keep
+    # tracking the average with its own frozen ratio, not freeze at its
+    # old absolute std and not snap to the bare (new) average either.
+    old_std0 = float(w._canon_std[0, 1])
+    branches2 = [_branch_data(rng, k, 400, 0.4) for k in range(1, GROUP_SIZE)]
+    x_train2 = torch.tensor(np.concatenate(branches2), dtype=torch.float32)
+    w.update_base_standardisation(x_train2)
+    new_avg = float(w._canon_std_avg[1])
+    new_std0 = float(w._canon_std[0, 1])
+    assert new_avg != pytest.approx(measured_std_y.mean(), rel=1e-3)
+    assert new_std0 != pytest.approx(old_std0, rel=1e-3)  # moved with the average
+    assert new_std0 == pytest.approx(new_avg * ratio0, rel=1e-5)
+    assert new_std0 != pytest.approx(new_avg, rel=0.1)  # didn't snap to bare average
+
+
+def test_update_base_standardisation_caps_std_ratio_to_average(
+    base_flow, caplog
+):
+    """A branch whose own measured std is far off its symmetric siblings'
+    is capped to ``canon_std_ratio_cap`` x the cross-branch average instead
+    of being trusted verbatim, with a one-off warning -- and the outlier
+    cannot drag the average used to judge it towards itself (it is capped
+    against the average as it stood *before* this round)."""
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=["x", "y"],
+        in_fundamental_domain=in_fundamental_domain,
+        canon_std_ratio_cap=5.0,
+    )
+    rng = np.random.default_rng(0)
+
+    # round 1: every branch close together, establishing a stable average.
+    branches1 = [_branch_data(rng, k, 400, 0.1) for k in range(GROUP_SIZE)]
+    w.update_base_standardisation(
+        torch.tensor(np.concatenate(branches1), dtype=torch.float32)
+    )
+    avg_before = float(w._canon_std_avg[1])
+    std3_before = float(w._canon_std[3, 1])
+
+    # round 2: branch 3 becomes a ~50x outlier relative to its siblings,
+    # well past the 5x cap; the others stay the same.
+    branches2 = [
+        _branch_data(rng, k, 400, 5.0 if k == 3 else 0.1)
+        for k in range(GROUP_SIZE)
+    ]
     with caplog.at_level("WARNING"):
-        w.update_base_standardisation(x_train)
-        w.update_base_standardisation(x_train)
+        w.update_base_standardisation(
+            torch.tensor(np.concatenate(branches2), dtype=torch.float32)
+        )
     hits = sum(
-        "canonical std floored" in r.getMessage() for r in caplog.records
+        "canonical std capped" in r.getMessage() for r in caplog.records
     )
     assert hits == 1
+    # branch 3 was already seen in round 1, so its stored std is the usual
+    # EMA blend of its old value with this round's -- capped -- fresh one,
+    # not a straight overwrite.
+    branch3_y_std = float(w._canon_std[3, 1])
+    beta = float(w._canon_ema)
+    expected = (1 - beta) * std3_before + beta * (avg_before * 5.0)
+    assert branch3_y_std == pytest.approx(expected, rel=1e-3)
+    # the average itself was protected from the outlier it produced.
+    avg_after = float(w._canon_std_avg[1])
+    assert avg_after < avg_before * 1.5
 
 
 @pytest.mark.slow_integration_test
