@@ -766,10 +766,11 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         # -- per-branch raw estimates, for every branch with enough points
         # this round to compute one from its own data. -------------------
         beta = self._canon_ema
-        branch_mk, branch_sk_raw, branch_k = [], [], []
+        branch_mk, branch_sk_raw, branch_k, branch_n = [], [], [], []
         for k in range(self.group_size):
             sel = claimed & (assigned == k)
-            if int(sel.sum()) >= self._min_std_count:
+            n_k = int(sel.sum())
+            if n_k >= self._min_std_count:
                 c = canon[sel]
                 mk = c.mean(dim=0)
                 sk = c.std(dim=0).clamp_min(self._min_canon_std)
@@ -777,6 +778,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 branch_mk.append(mk)
                 branch_sk_raw.append(sk)
                 branch_k.append(k)
+                branch_n.append(n_k)
 
         if not branch_k:
             # No branch had enough points this round; nothing new to
@@ -832,14 +834,27 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                     branch_mk_capped.append(mk.clamp(lo_m, hi_m))
                 branch_mk = branch_mk_capped
 
-            # -- shared cross-branch average: the unweighted mean of the
-            # populated branches' own (already-capped) fresh estimates, not
-            # of the pooled points, so neither a branch with many more
-            # currently-assigned points nor a capped outlier can dominate it
-            # -- every branch is meant to be an equivalent symmetric copy of
-            # the same mode. ---------------------------------------------
-            new_avg_mean = torch.stack(branch_mk).mean(dim=0)
-            new_avg_std = torch.stack(branch_sk).mean(dim=0)
+            # -- shared cross-branch average: a sample-count-weighted mean of
+            # the populated branches' own (already-capped) fresh estimates --
+            # equivalent to pooling every branch's folded points and taking
+            # one set of statistics, since a weighted mean with weight = a
+            # branch's point count reproduces the pooled mean exactly (and
+            # the pooled std closely, under the equal-mode assumption these
+            # branches are meant to satisfy). Not an *unweighted* mean of the
+            # branches' own separate estimates: that let a branch that has
+            # become nearly depopulated -- down to a handful of points,
+            # hence a noisy per-branch mean/std -- cast an equal vote
+            # against branches with hundreds of points, injecting that noise
+            # straight into the shared average every round. Weighting by
+            # count fixes that (a thin branch now contributes little) while
+            # still averaging the *capped* per-branch estimates rather than
+            # raw points, so a genuinely wild but well-populated outlier
+            # branch still cannot drag the average past the cap (see
+            # ``test_update_base_standardisation_caps_std_ratio_to_average``).
+            w = torch.tensor(branch_n, dtype=canon.dtype, device=canon.device)
+            w = (w / w.sum()).unsqueeze(-1)
+            new_avg_mean = (torch.stack(branch_mk) * w).sum(dim=0)
+            new_avg_std = (torch.stack(branch_sk) * w).sum(dim=0)
             if had_avg:
                 self._canon_mean_avg.mul_(1 - beta).add_(beta * new_avg_mean)
                 self._canon_std_avg.mul_(1 - beta).add_(beta * new_avg_std)
