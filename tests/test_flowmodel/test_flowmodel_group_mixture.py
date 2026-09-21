@@ -972,14 +972,19 @@ def test_update_base_standardisation_tracks_cross_branch_average(base_flow):
     assert new_std0 != pytest.approx(new_avg, rel=0.1)  # didn't snap to bare average
 
 
-def test_update_base_standardisation_caps_std_ratio_to_average(
-    base_flow, caplog
+def test_update_base_standardisation_std_ratio_cap_denoises_branch_not_average(
+    base_flow,
 ):
-    """A branch whose own measured std is far off its symmetric siblings'
-    is capped to ``canon_std_ratio_cap`` x the cross-branch average instead
-    of being trusted verbatim, with a one-off warning -- and the outlier
-    cannot drag the average used to judge it towards itself (it is capped
-    against the average as it stood *before* this round)."""
+    """The shared average is an honest, sample-count-weighted pool of every
+    branch's raw estimate -- equivalent to pooling the branches' points
+    directly -- so a well-populated branch's genuinely different spread
+    legitimately moves it, rather than being protected against. (Prior
+    behaviour capped every branch against the average *as it stood before
+    this round*, then averaged the capped values back in -- a fixed point
+    once ``canon_mean_offset_cap``/``canon_std_ratio_cap`` judged a fresh,
+    real shift in the live points against stale history forever. This test
+    replaces ``test_update_base_standardisation_caps_std_ratio_to_average``,
+    which asserted exactly that frozen-average behaviour.)"""
     w = DiscreteGroupMixtureFlowWrapper(
         base_flow=base_flow,
         num_features=2,
@@ -997,10 +1002,51 @@ def test_update_base_standardisation_caps_std_ratio_to_average(
         torch.tensor(np.concatenate(branches1), dtype=torch.float32)
     )
     avg_before = float(w._canon_std_avg[1])
-    std3_before = float(w._canon_std[3, 1])
 
-    # round 2: branch 3 becomes a ~50x outlier relative to its siblings,
-    # well past the 5x cap; the others stay the same.
+    # round 2: branch 3 becomes a genuinely wider mode (10x its siblings),
+    # comfortably inside the 5x cap once the pool includes it -- a real,
+    # well-populated change, not a glitch.
+    branches2 = [
+        _branch_data(rng, k, 400, 1.0 if k == 3 else 0.1)
+        for k in range(GROUP_SIZE)
+    ]
+    w.update_base_standardisation(
+        torch.tensor(np.concatenate(branches2), dtype=torch.float32)
+    )
+    measured_std_y = np.array([b[:, 1].std(ddof=1) for b in branches2])
+    new_avg_std = measured_std_y.mean()  # equal branch sizes here
+    # the shared average is stored directly, with no EMA smoothing -- it's
+    # already an honest, low-noise pool over the whole round's points, so
+    # `avg_before` plays no role in this round's value.
+    assert float(w._canon_std_avg[1]) == pytest.approx(new_avg_std, rel=0.05)
+    assert float(w._canon_std_avg[1]) != pytest.approx(avg_before, rel=0.1)
+
+
+def test_update_base_standardisation_std_ratio_cap_still_denoises_extreme_branch(
+    base_flow, caplog
+):
+    """A branch whose measured std is extreme enough to blow past even a
+    pool that includes it (e.g. a corrupted round for that branch, not a
+    genuinely wider physical mode) still gets its OWN tracked corrective
+    factor capped and warned about -- the cap now protects each branch's
+    personal value, not the shared average."""
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=["x", "y"],
+        in_fundamental_domain=in_fundamental_domain,
+        canon_std_ratio_cap=1.5,
+    )
+    rng = np.random.default_rng(0)
+    branches1 = [_branch_data(rng, k, 400, 0.1) for k in range(GROUP_SIZE)]
+    w.update_base_standardisation(
+        torch.tensor(np.concatenate(branches1), dtype=torch.float32)
+    )
+    std3_before = float(w._canon_std[3, 1])
+    avg_before = float(w._canon_std_avg[1])
+
     branches2 = [
         _branch_data(rng, k, 400, 5.0 if k == 3 else 0.1)
         for k in range(GROUP_SIZE)
@@ -1013,16 +1059,16 @@ def test_update_base_standardisation_caps_std_ratio_to_average(
         "canonical std capped" in r.getMessage() for r in caplog.records
     )
     assert hits == 1
-    # branch 3 was already seen in round 1, so its stored std is the usual
-    # EMA blend of its old value with this round's -- capped -- fresh one,
-    # not a straight overwrite.
-    branch3_y_std = float(w._canon_std[3, 1])
+
+    measured_std_y = np.array([b[:, 1].std(ddof=1) for b in branches2])
+    new_avg_std = measured_std_y.mean()  # equal branch sizes -> unweighted
     beta = float(w._canon_ema)
-    expected = (1 - beta) * std3_before + beta * (avg_before * 5.0)
-    assert branch3_y_std == pytest.approx(expected, rel=1e-3)
-    # the average itself was protected from the outlier it produced.
-    avg_after = float(w._canon_std_avg[1])
-    assert avg_after < avg_before * 1.5
+    expected_branch3 = (1 - beta) * std3_before + beta * (new_avg_std * 1.5)
+    assert float(w._canon_std[3, 1]) == pytest.approx(expected_branch3, rel=1e-3)
+    # the average itself is the honest pool, stored directly with no EMA
+    # smoothing, unmodified by the per-branch cap.
+    assert float(w._canon_std_avg[1]) == pytest.approx(new_avg_std, rel=1e-3)
+    assert float(w._canon_std_avg[1]) != pytest.approx(avg_before, rel=0.1)
 
 
 def _branch_data_with_mean(rng, k, n, y_mean, y_std):
@@ -1032,13 +1078,15 @@ def _branch_data_with_mean(rng, k, n, y_mean, y_std):
     return np.stack([x, y], axis=1)
 
 
-def test_update_base_standardisation_caps_mean_offset_to_average(
+def test_update_base_standardisation_mean_offset_cap_denoises_branch_not_average(
     base_flow, caplog
 ):
-    """A branch whose own measured mean is far off its symmetric siblings'
-    is capped to ``canon_mean_offset_cap`` cross-branch-average-std of the
-    cross-branch average instead of being trusted verbatim, with a one-off
-    warning -- mirroring the std-ratio cap."""
+    """Mirrors the std-ratio case: a branch whose mean is extreme enough to
+    blow past even a pool that includes it still gets its OWN corrective
+    factor capped, but the shared average is the honest, count-weighted
+    pool -- not protected from a real, well-populated shift. (Replaces
+    ``test_update_base_standardisation_caps_mean_offset_to_average``, which
+    asserted the average stayed pinned near its old value.)"""
     w = DiscreteGroupMixtureFlowWrapper(
         base_flow=base_flow,
         num_features=2,
@@ -1058,16 +1106,13 @@ def test_update_base_standardisation_caps_mean_offset_to_average(
     w.update_base_standardisation(
         torch.tensor(np.concatenate(branches1), dtype=torch.float32)
     )
-    avg_mean_before = float(w._canon_mean_avg[1])
-    avg_std_before = float(w._canon_std_avg[1])
     mean3_before = float(w._canon_mean[3, 1])
+    avg_mean_before = float(w._canon_mean_avg[1])
 
-    # round 2: branch 3's mean shifts ~50 cross-branch-stds away, well past
-    # the 2-sigma cap; the others stay the same.
+    # round 2: branch 3's mean shifts by 50 (a huge, corrupted-looking jump
+    # for a single branch); the others stay the same.
     branches2 = [
-        _branch_data_with_mean(
-            rng, k, 400, 50 * avg_std_before if k == 3 else 0.0, 0.1
-        )
+        _branch_data_with_mean(rng, k, 400, 50.0 if k == 3 else 0.0, 0.1)
         for k in range(GROUP_SIZE)
     ]
     with caplog.at_level("WARNING"):
@@ -1078,15 +1123,119 @@ def test_update_base_standardisation_caps_mean_offset_to_average(
         "canonical mean capped" in r.getMessage() for r in caplog.records
     )
     assert hits == 1
-    branch3_y_mean = float(w._canon_mean[3, 1])
+
+    measured_mean_y = np.array([b[:, 1].mean() for b in branches2])
+    measured_std_y = np.array([b[:, 1].std(ddof=1) for b in branches2])
+    new_avg_mean = measured_mean_y.mean()  # equal branch sizes
+    new_avg_std = measured_std_y.mean()
     beta = float(w._canon_ema)
-    expected = (1 - beta) * mean3_before + beta * (
-        avg_mean_before + 2.0 * avg_std_before
+    expected_branch3 = (1 - beta) * mean3_before + beta * (
+        new_avg_mean + 2.0 * new_avg_std
     )
-    assert branch3_y_mean == pytest.approx(expected, rel=1e-3)
-    # the average itself was protected from the outlier it produced.
-    avg_mean_after = float(w._canon_mean_avg[1])
-    assert abs(avg_mean_after - avg_mean_before) < 5 * avg_std_before
+    assert float(w._canon_mean[3, 1]) == pytest.approx(expected_branch3, rel=1e-3)
+    # the average itself is the honest pool, stored directly with no EMA
+    # smoothing -- it legitimately moves by roughly branch 3's share (1/4)
+    # of its 50-unit shift, unprotected.
+    assert float(w._canon_mean_avg[1]) == pytest.approx(new_avg_mean, rel=1e-3)
+    assert float(w._canon_mean_avg[1]) != pytest.approx(avg_mean_before, abs=1.0)
+    assert float(w._canon_mean_avg[1]) > 1.0
+
+
+def test_update_base_standardisation_tracks_unanimous_branch_shift(
+    base_flow,
+):
+    """The whole live-point population moving together between rounds --
+    the normal, expected behaviour as nested sampling contracts -- must
+    still move the shared average, even with ``canon_mean_offset_cap=0.0``
+    (replicating the exact v45/v44 configuration that triggered this bug).
+    Under the pre-fix implementation this average was a permanent fixed
+    point once first set: every branch's mean was clamped to a zero-width
+    band around old history, so the "new" average was forced to exactly
+    equal the old one, forever, regardless of how far the live points had
+    actually moved -- confirmed on the live v45 run, where every stored
+    global mean was bit-identical from the very first checkpoint
+    (it=17246) to the last (it=252071), spanning 230k+ iterations."""
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=["x", "y"],
+        in_fundamental_domain=in_fundamental_domain,
+        canon_mean_offset_cap=0.0,
+    )
+    rng = np.random.default_rng(0)
+
+    # round 1: establish an average near y=0.
+    branches1 = [
+        _branch_data_with_mean(rng, k, 400, 0.0, 0.1)
+        for k in range(GROUP_SIZE)
+    ]
+    w.update_base_standardisation(
+        torch.tensor(np.concatenate(branches1), dtype=torch.float32)
+    )
+    assert float(w._canon_mean_avg[1]) == pytest.approx(0.0, abs=0.05)
+
+    # round 2: EVERY branch's mean shifts together to y=5 -- the live
+    # points have genuinely moved, unlike a single misbehaving branch.
+    branches2 = [
+        _branch_data_with_mean(rng, k, 400, 5.0, 0.1)
+        for k in range(GROUP_SIZE)
+    ]
+    w.update_base_standardisation(
+        torch.tensor(np.concatenate(branches2), dtype=torch.float32)
+    )
+    # the shared average is stored directly (no EMA smoothing), so it
+    # tracks the whole-population shift in one round -- unlike the pre-fix
+    # bug, where it would stay pinned at 0.0 no matter how many further
+    # rounds or iterations elapsed.
+    assert float(w._canon_mean_avg[1]) == pytest.approx(5.0, abs=0.1)
+    # the per-branch trackers are still EMA-smoothed individually, so they
+    # only move 30% of the way (beta=_canon_ema, default 0.3) in one round.
+    for k in range(GROUP_SIZE):
+        assert float(w._canon_mean[k, 1]) > 1.0
+
+
+@pytest.mark.parametrize(
+    "branch_ns",
+    [
+        [400, 400, 400, 400],  # uniform branch weights
+        [1200, 20, 20, 20],  # one dominant branch, rest near min_std_count
+        [800, 400, 20, 20],  # an intermediate mix
+    ],
+    ids=["uniform", "one-dominant", "mixed"],
+)
+def test_update_base_standardisation_mean_matches_direct_pool(
+    base_flow, branch_ns
+):
+    """``_canon_mean_avg`` must equal a direct, un-decomposed pool of the
+    batch's canonical points for *any* distribution of branch weights --
+    all-equal, one branch holding nearly all the mass, or anything between
+    (this is what a sample-count-weighted average of per-branch means is
+    mathematically guaranteed to reproduce, exactly, regardless of how the
+    branches' own means differ from each other)."""
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=["x", "y"],
+        in_fundamental_domain=in_fundamental_domain,
+        canon_mean_offset_cap=0.0,  # v45's exact (bug-triggering) config
+    )
+    rng = np.random.default_rng(0)
+    y_means = rng.normal(0.0, 2.0, GROUP_SIZE)
+    branches = [
+        _branch_data_with_mean(rng, k, n, y_means[k], 0.5)
+        for k, n in enumerate(branch_ns)
+    ]
+    w.update_base_standardisation(
+        torch.tensor(np.concatenate(branches), dtype=torch.float32)
+    )
+    pooled_y = np.concatenate(branches)[:, 1]
+    assert float(w._canon_mean_avg[1]) == pytest.approx(
+        pooled_y.mean(), abs=1e-3
+    )
 
 
 def test_update_base_standardisation_zero_mean_cap_forces_shared_mean(

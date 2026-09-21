@@ -854,15 +854,25 @@ def run_looks_like_gw(run: ArchivedRun) -> bool:
 # augmentation is dropped (the group proposal has no augmented variant).
 
 
-def _group_reparameterisations(run: ArchivedRun) -> dict:
+def _group_reparameterisations(
+    run: ArchivedRun, phase_coordinates: str = "polarisation-phase"
+) -> dict:
     """Reparameterisations for the ``--group`` replay (see the note above).
 
     Delegates to :func:`nessai_gw.group_mixture.triangular_group_reparameterisations`.
+
+    ``phase_coordinates`` is passed straight through -- ``"polarisation-phase"``
+    (default) for the single ``delta_phase`` coordinate + a separate ``psi``, or
+    ``"arg-alpha-beta"`` for the two circular-polarisation phases ``arg_alpha =
+    (phase - psi)`` / ``arg_beta = (phase + psi)`` as flow axes.  It must match
+    the value handed to :func:`make_group_proposal_class`.
     """
     from nessai_gw.group_mixture import triangular_group_reparameterisations
 
     return triangular_group_reparameterisations(
-        list(run.names), _reference_time_from_run(run)
+        list(run.names),
+        _reference_time_from_run(run),
+        phase_coordinates=phase_coordinates,
     )
 
 
@@ -889,7 +899,9 @@ def _reference_time_from_run(run: ArchivedRun) -> float:
     )
 
 
-def make_group_proposal_class(run: ArchivedRun):
+def make_group_proposal_class(
+    run: ArchivedRun, phase_coordinates: str = "polarisation-phase"
+):
     """Build a ``FlowProposal`` wrapped in the ET-triangle group mixture.
 
     Delegates to ``nessai_gw.group_mixture.make_et_group_flow_proposal``, the
@@ -907,6 +919,7 @@ def make_group_proposal_class(run: ArchivedRun):
         reference_time=_reference_time_from_run(run),
         phase_reflection=True,
         boundary_reflection=True,
+        phase_coordinates=phase_coordinates,
     )
 
 

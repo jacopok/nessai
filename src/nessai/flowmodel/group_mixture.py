@@ -788,7 +788,6 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 return
             branch_sk = []
         else:
-            had_avg = bool(self._canon_avg_seen)
             cap = self._canon_std_ratio_cap
             mean_cap = self._canon_mean_offset_cap
             clamped = torch.zeros(
@@ -797,26 +796,40 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             mean_clamped = torch.zeros(
                 self.num_features, dtype=torch.bool, device=x.device
             )
-            # Cap each branch's *raw* estimate against a reference average:
-            # the average as it stood *before* this round's update, once one
-            # exists, so a branch that is itself wildly off (or genuinely
-            # degenerate -- e.g. a literal std of 0) cannot drag the very
-            # average it is judged against towards itself. On the very first
-            # populated round there is no such reference yet, so this round's
-            # own (unprotected) raw average is used instead -- a one-off,
-            # self-referential bootstrap; from the next round on every cap is
-            # judged against an average an outlier could not have polluted.
-            ref_std = (
-                self._canon_std_avg
-                if had_avg
-                else torch.stack(branch_sk_raw).mean(dim=0)
-            )
-            ref_mean = (
-                self._canon_mean_avg
-                if had_avg
-                else torch.stack(branch_mk).mean(dim=0)
-            )
-            lo, hi = ref_std / cap, ref_std * cap
+
+            # -- shared cross-branch average: an honest, sample-count-
+            # weighted pool of THIS round's raw (uncapped) per-branch
+            # estimates -- mathematically the same as pooling every
+            # populated branch's folded points directly and taking one set
+            # of statistics, for *any* distribution of branch weights (all
+            # equal, one branch holding nearly all the mass, or anything
+            # between: a near-empty branch's own weight already makes it
+            # contribute almost nothing, with no separate case needed).
+            #
+            # Deliberately NOT computed from capped estimates: an earlier
+            # version capped each branch against the average *as it stood
+            # before this round* (self._canon_mean_avg/_canon_std_avg) and
+            # then averaged those already-capped values into the new
+            # average. That is a self-referential fixed point -- with
+            # canon_mean_offset_cap=0 (a zero-width band) every branch's
+            # capped mean is forced to exactly equal the old average, so the
+            # "new" average becomes mathematically identical to the old one,
+            # forever, from the very first update onward, regardless of how
+            # far the live points have actually moved since. Verified
+            # against a live run: the stored global mean for every prime
+            # coordinate was bit-identical from the first checkpoint to the
+            # last, spanning 230k+ iterations, while a direct pool of the
+            # current live points differed by 40-100+ stored-sigma.
+            w = torch.tensor(branch_n, dtype=canon.dtype, device=canon.device)
+            w = (w / w.sum()).unsqueeze(-1)
+            new_avg_mean = (torch.stack(branch_mk) * w).sum(dim=0)
+            new_avg_std = (torch.stack(branch_sk_raw) * w).sum(dim=0)
+
+            # -- per-branch corrective factors: cap each branch's own raw
+            # estimate against THIS round's freshly-computed (correct)
+            # average, purely to denoise that one branch's own tracked
+            # value -- never fed back into new_avg_mean/new_avg_std above.
+            lo, hi = new_avg_std / cap, new_avg_std * cap
             branch_sk = []
             for sk in branch_sk_raw:
                 clamped |= (sk < lo) | (sk > hi)
@@ -826,42 +839,28 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 # Scale is in cross-branch-average-std units (not the
                 # branch's own, possibly-capped, std) so the bound is a
                 # stable reference independent of the std cap above.
-                lo_m = ref_mean - mean_cap * ref_std
-                hi_m = ref_mean + mean_cap * ref_std
+                lo_m = new_avg_mean - mean_cap * new_avg_std
+                hi_m = new_avg_mean + mean_cap * new_avg_std
                 branch_mk_capped = []
                 for mk in branch_mk:
                     mean_clamped |= (mk < lo_m) | (mk > hi_m)
                     branch_mk_capped.append(mk.clamp(lo_m, hi_m))
                 branch_mk = branch_mk_capped
 
-            # -- shared cross-branch average: a sample-count-weighted mean of
-            # the populated branches' own (already-capped) fresh estimates --
-            # equivalent to pooling every branch's folded points and taking
-            # one set of statistics, since a weighted mean with weight = a
-            # branch's point count reproduces the pooled mean exactly (and
-            # the pooled std closely, under the equal-mode assumption these
-            # branches are meant to satisfy). Not an *unweighted* mean of the
-            # branches' own separate estimates: that let a branch that has
-            # become nearly depopulated -- down to a handful of points,
-            # hence a noisy per-branch mean/std -- cast an equal vote
-            # against branches with hundreds of points, injecting that noise
-            # straight into the shared average every round. Weighting by
-            # count fixes that (a thin branch now contributes little) while
-            # still averaging the *capped* per-branch estimates rather than
-            # raw points, so a genuinely wild but well-populated outlier
-            # branch still cannot drag the average past the cap (see
-            # ``test_update_base_standardisation_caps_std_ratio_to_average``).
-            w = torch.tensor(branch_n, dtype=canon.dtype, device=canon.device)
-            w = (w / w.sum()).unsqueeze(-1)
-            new_avg_mean = (torch.stack(branch_mk) * w).sum(dim=0)
-            new_avg_std = (torch.stack(branch_sk) * w).sum(dim=0)
-            if had_avg:
-                self._canon_mean_avg.mul_(1 - beta).add_(beta * new_avg_mean)
-                self._canon_std_avg.mul_(1 - beta).add_(beta * new_avg_std)
-            else:
-                self._canon_mean_avg.copy_(new_avg_mean)
-                self._canon_std_avg.copy_(new_avg_std)
-                self._canon_avg_seen.fill_(True)
+            # Stored directly, with no EMA smoothing: each round's
+            # new_avg_mean/new_avg_std is already an honest, low-noise pool
+            # over every populated branch's points (typically thousands of
+            # live points combined), unlike the individual branch trackers
+            # below (which pool far fewer points each and do benefit from
+            # smoothing). Nested sampling posteriors can shrink faster than
+            # exponentially as a run converges (confirmed on a live ET run:
+            # round-over-round std ratios of 0.96, 0.88, ..., 0.74 for a
+            # well-measured timing parameter) -- a fixed-beta EMA here
+            # structurally cannot keep pace with an accelerating target and
+            # was measured lagging the true current spread by 6x.
+            self._canon_mean_avg.copy_(new_avg_mean)
+            self._canon_std_avg.copy_(new_avg_std)
+            self._canon_avg_seen.fill_(True)
 
             for mk, sk, k in zip(branch_mk, branch_sk, branch_k):
                 if self._canon_seen[k]:
