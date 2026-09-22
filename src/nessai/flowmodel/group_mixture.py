@@ -19,7 +19,7 @@ from .base import FlowModel
 logger = logging.getLogger(__name__)
 
 
-class CoordinateBridge:
+class ReparamBridge:
     """Map between the flow's ``prime`` coords and the user's ``physical`` coords.
 
     The group-mixture flow applies the *conjugated* action ``g_hat = T^-1 . g
@@ -29,48 +29,10 @@ class CoordinateBridge:
     prime_out`` is then ``L(prime_in) - L(prime_out)`` (the physical action
     ``g`` is assumed measure preserving).
 
-    Subclasses implement :meth:`to_physical` / :meth:`to_prime`. For an affine
-    ``T`` (:class:`AffineBridge`) ``L`` is constant and every conjugation
-    log-determinant vanishes; the general :class:`ReparamBridge` round-trips
-    through a nessai reparameterisation in numpy and carries the exact ``L``.
-    """
-
-    is_affine = False
-    #: prime-space dimension differs from physical (augmented reparams)
-    dimension_changing = False
-
-    def to_physical(self, prime):
-        """``prime [N, d_prime] -> (physical [N, d_phys], L [N], aux)``."""
-        raise NotImplementedError
-
-    def to_prime(self, physical, aux=None):
-        """``physical [N, d_phys] -> (prime [N, d_prime], L [N])``."""
-        raise NotImplementedError
-
-
-class AffineBridge(CoordinateBridge):
-    """Diagonal affine map ``physical = prime * scale + shift``."""
-
-    is_affine = True
-
-    def __init__(self, scale, shift):
-        self.scale = scale
-        self.shift = shift
-        self._logdet = torch.log(scale.abs()).sum()
-
-    def to_physical(self, prime):
-        phys = prime * self.scale + self.shift
-        L = self._logdet.expand(prime.shape[0])
-        return phys, L, None
-
-    def to_prime(self, physical, aux=None):
-        prime = (physical - self.shift) / self.scale
-        L = self._logdet.expand(physical.shape[0])
-        return prime, L
-
-
-class ReparamBridge(CoordinateBridge):
-    """General bridge round-tripping through a nessai reparameterisation.
+    Round-trips through a nessai reparameterisation in numpy and carries the
+    exact ``L``, whether or not the reparameterisation happens to be affine --
+    a single general implementation, at the cost of a per-batch numpy
+    round-trip even in the common (affine) case.
 
     ``forward_fn`` / ``inverse_fn`` are numpy callables taking a structured
     livepoint array and returning ``(structured_array, log_J)`` where ``log_J``
@@ -164,6 +126,22 @@ class ReparamBridge(CoordinateBridge):
         return prime_t, L
 
 
+def _identity_bridge(param_names, dtype, device):
+    """Identity :class:`ReparamBridge`, for standalone (no-proposal) use."""
+
+    def _identity(struct):
+        return struct, np.zeros(len(struct))
+
+    return ReparamBridge(
+        prime_names=param_names,
+        physical_names=param_names,
+        rescale_fn=_identity,
+        inverse_rescale_fn=_identity,
+        dtype=dtype,
+        device=device,
+    )
+
+
 class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     """Wrap a base flow with a discrete group-mixture transformation.
 
@@ -174,7 +152,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     in closed form by :meth:`update_mixture_weights`.
 
     The group action and fundamental-domain predicate are written by the user
-    in *physical* coordinates. A :class:`CoordinateBridge` (installed by the
+    in *physical* coordinates. A :class:`ReparamBridge` (installed by the
     proposal via :meth:`set_coordinate_bridge`) maps between physical and the
     flow's *prime* coordinates and supplies the conjugation log-Jacobian, so
     non-affine reparameterisations are handled exactly. Alternatively the user
@@ -203,8 +181,6 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         prime_space_action=None,
         prime_space_in_domain=None,
         min_canon_std=1e-6,
-        canon_std_ratio_cap=5.0,
-        canon_mean_offset_cap=None,
         truncate_base_to_domain=True,
         reflect_parameters=None,
         canonical_transform=None,
@@ -279,15 +255,11 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         ):
             canonical_transform.bind(self.param_names)
 
-        # Coordinate bridge; defaults to the identity affine map so the
-        # wrapper is usable without a proposal (e.g. in unit tests).
-        self._bridge = AffineBridge(
-            torch.ones(num_features), torch.zeros(num_features)
+        # Coordinate bridge; defaults to the identity map so the wrapper is
+        # usable without a proposal (e.g. in unit tests).
+        self._bridge = _identity_bridge(
+            self.param_names, dtype=torch.get_default_dtype(), device="cpu"
         )
-        # Affine scale/shift kept as buffers for backward compatibility and
-        # for the analytic canonical-buffer re-expression on the affine path.
-        self.register_buffer("_prime_scale", torch.ones(num_features))
-        self.register_buffer("_prime_shift", torch.zeros(num_features))
 
         # Mixture weights, set in closed form by ``update_mixture_weights``.
         self.register_buffer(
@@ -342,19 +314,19 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             self.register_buffer("_factor_empty_rounds", None)
             self._factor_offsets = None
 
-        # Per-element standardisation of the canonical coordinates seen by
-        # the base flow, refreshed by ``update_base_standardisation``. It
-        # rescales every mode's surviving region to a common size so a
-        # single ``q0`` shape fits them all.
-        self.register_buffer(
-            "_canon_mean", torch.zeros(group_size, num_features)
-        )
-        self.register_buffer(
-            "_canon_std", torch.ones(group_size, num_features)
-        )
-        self.register_buffer(
-            "_canon_seen", torch.zeros(group_size, dtype=torch.bool)
-        )
+        # Standardisation of the canonical coordinates seen by the base flow,
+        # refreshed by ``update_base_standardisation``. Every group element is
+        # a symmetric copy of the same underlying mode, so a single mean/std
+        # shared across all of them (rather than tracked per branch) rescales
+        # every mode's surviving region to a common size for a single ``q0``
+        # shape to fit -- this is exactly what the old per-branch scheme
+        # converged to once its cross-branch caps were tightened to force
+        # every branch to the shared average (see git history), so it is
+        # implemented directly rather than as a special case of a per-branch
+        # mechanism.
+        self.register_buffer("_canon_mean", torch.zeros(num_features))
+        self.register_buffer("_canon_std", torch.ones(num_features))
+        self.register_buffer("_canon_seen", torch.zeros((), dtype=torch.bool))
         # Consecutive rounds each element has been empty; an element empty
         # for ``_weight_empty_patience`` rounds is dropped (weight 0) until
         # points return to it.
@@ -364,74 +336,13 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         self._min_std_count = 16
         self._canon_ema = 0.3
         self._weight_empty_patience = 3
-        # Pure numerical safety floor for a *single* branch's raw measured
-        # std, applied before anything else (a literal std of 0 -- e.g. a
-        # branch with a run of identical points -- would otherwise divide by
-        # zero downstream). This is NOT the main defence against an
-        # over-narrow canonicalisation: see ``_canon_std_ratio_cap`` below.
-        # It should stay many orders of magnitude below any real posterior
-        # width and essentially never bind; if it does, something upstream
-        # (e.g. a degenerate/duplicated batch) is wrong.
+        # Pure numerical safety floor for the raw measured std, applied
+        # before anything else (a literal std of 0 -- e.g. a round with a run
+        # of identical points -- would otherwise divide by zero downstream).
+        # Should stay many orders of magnitude below any real posterior width
+        # and essentially never bind; if it does, something upstream (e.g. a
+        # degenerate/duplicated batch) is wrong.
         self._min_canon_std = min_canon_std
-        # Every group element is a symmetric copy of the same underlying
-        # mode, so its canonical std, once enough points have visited it,
-        # should agree with every other element's -- up to real per-branch
-        # heterogeneity, not an arbitrary absolute scale. ``_canon_std_avg``
-        # (updated below, in ``update_base_standardisation``) tracks the
-        # *unweighted* mean of every currently-populated branch's own std
-        # (so a heavily-populated branch cannot dominate it), and each
-        # branch's std is clamped to within a factor of
-        # ``_canon_std_ratio_cap`` of that average -- a *relative* floor/
-        # ceiling that adapts to whatever the coordinate's natural scale
-        # happens to be, instead of the old fixed absolute floor (which
-        # either did nothing, when the coordinate's natural scale was far
-        # above the constant, or forced every branch narrower than it to the
-        # same absolute width regardless of how tightly the whole posterior
-        # legitimately resolves that dimension -- see git history for the
-        # previous ``min_canon_std``-only scheme this replaced).
-        self._canon_std_ratio_cap = canon_std_ratio_cap
-        self.register_buffer(
-            "_canon_mean_avg", torch.zeros(num_features)
-        )
-        self.register_buffer(
-            "_canon_std_avg", torch.ones(num_features)
-        )
-        self.register_buffer(
-            "_canon_avg_seen", torch.zeros((), dtype=torch.bool)
-        )
-        # Each branch's own last-measured deviation from the cross-branch
-        # average -- additive for the mean, multiplicative for the std --
-        # frozen at the point the branch was last populated. A branch with
-        # too few points to update from its own data this round keeps
-        # tracking the *current* (possibly still-moving) average offset by
-        # this frozen personal deviation, rather than either freezing at its
-        # last absolute value (drifts out of step with the moving average)
-        # or snapping to the bare average (discards real, previously
-        # measured, branch-specific information). A toy-model comparison of
-        # "snap to the average" vs "track the average with the frozen
-        # personal offset" found the latter ~3x more accurate immediately
-        # after a long dormancy and still modestly more accurate in steady
-        # state, so this is the default behaviour, not just a fallback.
-        self.register_buffer(
-            "_canon_mean_delta", torch.zeros(group_size, num_features)
-        )
-        self.register_buffer(
-            "_canon_std_ratio", torch.ones(group_size, num_features)
-        )
-        self.register_buffer(
-            "_canon_has_delta", torch.zeros(group_size, dtype=torch.bool)
-        )
-        self._warned_canon_clamp = False
-        # Analogous cap on the *mean*: a branch's canonical mean is clamped
-        # to within ``canon_mean_offset_cap`` cross-branch-average standard
-        # deviations of the cross-branch average mean (default ``None`` --
-        # unconstrained, preserving the pre-existing behaviour). Setting this
-        # to ``0`` forces every branch's canonical mean to exactly track the
-        # average -- i.e. no per-branch mean offset at all -- for testing
-        # whether the per-branch mean freedom is needed or is itself a source
-        # of spurious canonicalisation asymmetry.
-        self._canon_mean_offset_cap = canon_mean_offset_cap
-        self._warned_canon_mean_clamp = False
         # Fraction of the last batch whose generative draw leaked out of the
         # canonical fundamental domain and so fell back from the single-branch
         # shortcut to the full mixture ``log_prob`` in
@@ -477,10 +388,10 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         a complete reset (``weights=True, permutations=True``) reconstructs a
         fresh wrapper via ``get_model``. ``--reset-flow`` exists to escape a
         poorly-fit canonical-space ``base_flow``; the mixture weights,
-        per-branch standardisation (``_canon_mean``/``_canon_std`` and their
-        EMA/delta-tracking buffers) and empty-round patience counters take
-        many rounds to accumulate and are unrelated to the base flow's own
-        parameters, so a reset should leave them untouched. Without this, the
+        the canonical standardisation (``_canon_mean``/``_canon_std``) and
+        empty-round patience counters take many rounds to accumulate and are
+        unrelated to the base flow's own parameters, so a reset should leave
+        them untouched. Without this, the
         freshly reset model re-derives all of that bookkeeping from a single
         round's live points with no smoothing or per-branch history to fall
         back on, which can mistake an ordinary transient branch-occupancy dip
@@ -500,29 +411,11 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 and old._factor_empty_rounds is not None
             ):
                 self._factor_empty_rounds.copy_(old._factor_empty_rounds)
-            # _canon_mean/_canon_std are stored in the prime frame recorded
-            # by _prime_scale/_prime_shift; carrying the former without the
-            # latter left a fresh reset's identity-default scale/shift as
-            # the "old" baseline the next set_affine_maps() call reframes
-            # from, corrupting the carried-over stats with a bogus affine
-            # correction (confirmed live: the freshly-trained post-reset
-            # flow's own canonical-space samples split into spurious
-            # disconnected modes far from any live point).
-            self._prime_scale.copy_(old._prime_scale)
-            self._prime_shift.copy_(old._prime_shift)
             self._canon_mean.copy_(old._canon_mean)
             self._canon_std.copy_(old._canon_std)
             self._canon_seen.copy_(old._canon_seen)
-            self._canon_mean_avg.copy_(old._canon_mean_avg)
-            self._canon_std_avg.copy_(old._canon_std_avg)
-            self._canon_avg_seen.copy_(old._canon_avg_seen)
-            self._canon_mean_delta.copy_(old._canon_mean_delta)
-            self._canon_std_ratio.copy_(old._canon_std_ratio)
-            self._canon_has_delta.copy_(old._canon_has_delta)
             self._log_domain_mass.copy_(old._log_domain_mass)
         self._domain_mass_seen = old._domain_mass_seen
-        self._warned_canon_clamp = old._warned_canon_clamp
-        self._warned_canon_mean_clamp = old._warned_canon_mean_clamp
         self._last_leakage_fraction = old._last_leakage_fraction
         self._last_leakage_fraction_domain = (
             old._last_leakage_fraction_domain
@@ -533,13 +426,38 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         self._last_factor_marginals = old._last_factor_marginals
         self._last_factor_counts = old._last_factor_counts
 
+    #: Buffer names from the removed per-branch canonicalisation scheme.
+    #: Dropped from an incoming checkpoint so an old checkpoint can still be
+    #: loaded ``strict=True`` (the shared ``_canon_mean``/``_canon_std``
+    #: buffers below simply re-bootstrap on the first post-load round).
+    _OBSOLETE_CANON_KEYS = (
+        "_prime_scale",
+        "_prime_shift",
+        "_canon_mean_avg",
+        "_canon_std_avg",
+        "_canon_avg_seen",
+        "_canon_mean_delta",
+        "_canon_std_ratio",
+        "_canon_has_delta",
+    )
+
     def load_state_dict(self, state_dict, strict=True, assign=False):
         # Forward compatibility: a checkpoint written before the factorised
         # weight estimator predates ``_mode_factor_index`` /
         # ``_factor_empty_rounds``. Fill any missing buffer with its current
         # (config-derived) default so ``strict=True`` resume still works.
-        sd = dict(state_dict)
-        for name, val in super().state_dict().items():
+        sd = {
+            k: v
+            for k, v in state_dict.items()
+            if k not in self._OBSOLETE_CANON_KEYS
+        }
+        current = super().state_dict()
+        for name in ("_canon_mean", "_canon_std", "_canon_seen"):
+            if name in sd and sd[name].shape != current[name].shape:
+                # Pre-simplification checkpoint: shape was [group_size, ...]
+                # per branch. No longer compatible; re-bootstrap instead.
+                del sd[name]
+        for name, val in current.items():
             sd.setdefault(name, val)
         return super().load_state_dict(sd, strict=strict, assign=assign)
 
@@ -577,46 +495,16 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             self._canonical_transform.bind(self.param_names)
 
     def set_coordinate_bridge(self, bridge):
-        """Install a :class:`CoordinateBridge`.
+        """Install a :class:`ReparamBridge`.
 
-        The canonical standardisation buffers live in prime coordinates. An
-        affine frame change re-expresses them analytically; a non-affine
-        change cannot, so the buffers are kept and left for
-        :meth:`update_base_standardisation` to re-adapt (a large shift resets
-        ``_canon_seen`` so modes re-bootstrap).
+        The canonical standardisation buffer lives in prime coordinates, so a
+        frame change invalidates it; it is reset here and left for
+        :meth:`update_base_standardisation` to re-bootstrap over the next
+        rounds.
         """
-        old = self._bridge
-        if isinstance(bridge, AffineBridge):
-            self.set_affine_maps(bridge.scale, bridge.shift)
-            return
-        if isinstance(old, AffineBridge) and bool(self._canon_seen.any()):
-            # Leaving the affine fast path: probe the frame shift on the
-            # stored canonical means and reset modes that moved a lot.
-            with torch.no_grad():
-                phys_old, _, _ = old.to_physical(self._canon_mean)
-                prime_new, _ = bridge.to_prime(phys_old)
-                shift = (prime_new - self._canon_mean).abs()
-                moved = (shift > 2.0 * self._canon_std).any(dim=-1)
-                self._canon_seen[moved] = False
+        if bool(self._canon_seen):
+            self._canon_seen.fill_(False)
         self._bridge = bridge
-
-    def set_affine_maps(self, scale, shift):
-        """Set the prime->physical affine map.
-
-        The canonical standardisation buffers are stored in prime
-        coordinates, so when the prime frame moves they are re-expressed in
-        the new frame.
-        """
-        scale = scale.to(self._prime_scale)
-        shift = shift.to(self._prime_shift)
-        if bool(self._canon_seen.any()):
-            ratio = self._prime_scale / scale
-            offset = (self._prime_shift - shift) / scale
-            self._canon_mean.mul_(ratio).add_(offset)
-            self._canon_std.mul_(ratio.abs())
-        self._prime_scale.copy_(scale)
-        self._prime_shift.copy_(shift)
-        self._bridge = AffineBridge(scale.clone(), shift.clone())
 
     def _to_physical(self, z):
         phys, _, _ = self._bridge.to_physical(z)
@@ -638,21 +526,21 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             return t, t.new_zeros(t.shape[0])
         return self._canonical_transform.inverse(t)
 
-    def _standardise(self, canon, modes):
-        return (canon - self._canon_mean[modes]) / self._canon_std[modes]
+    def _standardise(self, canon, modes=None):
+        return (canon - self._canon_mean) / self._canon_std
 
-    def _destandardise(self, u, modes):
-        return u * self._canon_std[modes] + self._canon_mean[modes]
+    def _destandardise(self, u, modes=None):
+        return u * self._canon_std + self._canon_mean
 
-    def _canon_log_det(self, modes):
-        return -torch.log(self._canon_std[modes]).sum(-1)
+    def _canon_log_det(self, modes=None):
+        return -torch.log(self._canon_std).sum()
 
     def _fold_reflect(self, canon):
         """Fold canonical coords back to the positive side of each reflect wall.
 
         ``update_base_standardisation`` pins ``_canon_mean = 0`` on the reflect
-        dims, so the wall at ``canon_i = 0`` is also the standardisation
-        centre; ``abs`` is the correct fold.
+        dims (shared across the whole mixture), so the wall at ``canon_i = 0``
+        is also the standardisation centre; ``abs`` is the correct fold.
         """
         if self._sign_patterns is None:
             return canon
@@ -787,228 +675,58 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         assigned = torch.where(claimed, in_dom.float().argmax(dim=0), 0)
         return assigned, pre, claimed
 
+    def _pin_reflect(self, mean, std, data):
+        # Reflect dims are symmetrised about their wall at 0, so the
+        # standardisation centre must be 0 and the scale the RMS about 0 (the
+        # second moment of the folded data), not the one-sided mean/std. This
+        # is what keeps _base_log_prob's sign-symmetrisation exactly
+        # normalised (it requires the standardisation mean to be exactly 0 on
+        # these dims; the std can be anything positive).
+        if self._sign_patterns is None:
+            return mean, std
+        idx = self._reflect_idx.to(data.device)
+        rms = (
+            data[:, idx].pow(2).mean(dim=0).clamp_min(
+                self._min_canon_std**2
+            ).sqrt()
+        )
+        mean = mean.clone()
+        std = std.clone()
+        mean[idx] = 0.0
+        std[idx] = rms
+        return mean, std
+
     @torch.no_grad()
     def update_base_standardisation(self, x, context=None):
-        """Update the per-element canonical standardisation from assigned points.
+        """Update the shared canonical standardisation from assigned points.
 
-        Each populated element's canonical points are standardised by their
-        own mean/std, exponentially averaged across rounds, with the std
-        clamped to within ``_canon_std_ratio_cap`` of the cross-branch
-        average (see the comment on ``_canon_std_ratio_cap`` in
-        ``__init__``). An element with too few points this round instead
-        tracks the *current* average using its own last-measured deviation
-        from it; an element never yet seen is bootstrapped from the bare
-        average.
+        Every group element is a symmetric copy of the same underlying mode,
+        so its canonical points are pooled across all of them (rather than
+        tracked per element) into one mean/std, exponentially averaged across
+        rounds. Skipped if too few points were claimed this round.
         """
         b = x.shape[0]
         assigned, pre, claimed = self._assign_branch(x)
         canon = pre[assigned, torch.arange(b, device=x.device)]
-        # The base flow (hence the standardisation buffers and the reflect
+        # The base flow (hence the standardisation buffer and the reflect
         # walls) lives in the transformed frame ``t``, not raw ``canon``.
         canon, _ = self._to_base(canon)
 
-        def _pin_reflect(mean, std, data):
-            # Reflect dims are symmetrised about their wall at 0, so the
-            # standardisation centre must be 0 and the scale the RMS about 0
-            # (the second moment of the folded data), not the one-sided
-            # mean/std.
-            if self._sign_patterns is None:
-                return mean, std
-            idx = self._reflect_idx.to(data.device)
-            rms = (
-                data[:, idx].pow(2).mean(dim=0).clamp_min(
-                    self._min_canon_std**2
-                ).sqrt()
-            )
-            mean = mean.clone()
-            std = std.clone()
-            mean[idx] = 0.0
-            std[idx] = rms
-            return mean, std
+        c = canon[claimed]
+        if c.shape[0] < self._min_std_count:
+            return
+        mean = c.mean(dim=0)
+        std = c.std(dim=0).clamp_min(self._min_canon_std)
+        mean, std = self._pin_reflect(mean, std, c)
 
-        # -- per-branch raw estimates, for every branch with enough points
-        # this round to compute one from its own data. -------------------
-        beta = self._canon_ema
-        branch_mk, branch_sk_raw, branch_k, branch_n = [], [], [], []
-        for k in range(self.group_size):
-            sel = claimed & (assigned == k)
-            n_k = int(sel.sum())
-            if n_k >= self._min_std_count:
-                c = canon[sel]
-                mk = c.mean(dim=0)
-                sk = c.std(dim=0).clamp_min(self._min_canon_std)
-                mk, sk = _pin_reflect(mk, sk, c)
-                branch_mk.append(mk)
-                branch_sk_raw.append(sk)
-                branch_k.append(k)
-                branch_n.append(n_k)
-
-        if not branch_k:
-            # No branch had enough points this round; nothing new to
-            # standardise against (dormant branches are handled below only
-            # once an average exists at all).
-            if not bool(self._canon_avg_seen):
-                return
-            branch_sk = []
+        if bool(self._canon_seen):
+            beta = self._canon_ema
+            self._canon_mean.mul_(1 - beta).add_(beta * mean)
+            self._canon_std.mul_(1 - beta).add_(beta * std)
         else:
-            cap = self._canon_std_ratio_cap
-            mean_cap = self._canon_mean_offset_cap
-            clamped = torch.zeros(
-                self.num_features, dtype=torch.bool, device=x.device
-            )
-            mean_clamped = torch.zeros(
-                self.num_features, dtype=torch.bool, device=x.device
-            )
-
-            # -- shared cross-branch average: an honest, sample-count-
-            # weighted pool of THIS round's raw (uncapped) per-branch
-            # estimates -- mathematically the same as pooling every
-            # populated branch's folded points directly and taking one set
-            # of statistics, for *any* distribution of branch weights (all
-            # equal, one branch holding nearly all the mass, or anything
-            # between: a near-empty branch's own weight already makes it
-            # contribute almost nothing, with no separate case needed).
-            #
-            # Deliberately NOT computed from capped estimates: an earlier
-            # version capped each branch against the average *as it stood
-            # before this round* (self._canon_mean_avg/_canon_std_avg) and
-            # then averaged those already-capped values into the new
-            # average. That is a self-referential fixed point -- with
-            # canon_mean_offset_cap=0 (a zero-width band) every branch's
-            # capped mean is forced to exactly equal the old average, so the
-            # "new" average becomes mathematically identical to the old one,
-            # forever, from the very first update onward, regardless of how
-            # far the live points have actually moved since. Verified
-            # against a live run: the stored global mean for every prime
-            # coordinate was bit-identical from the first checkpoint to the
-            # last, spanning 230k+ iterations, while a direct pool of the
-            # current live points differed by 40-100+ stored-sigma.
-            w = torch.tensor(branch_n, dtype=canon.dtype, device=canon.device)
-            w = (w / w.sum()).unsqueeze(-1)
-            new_avg_mean = (torch.stack(branch_mk) * w).sum(dim=0)
-            new_avg_std = (torch.stack(branch_sk_raw) * w).sum(dim=0)
-
-            # -- per-branch corrective factors: cap each branch's own raw
-            # estimate against THIS round's freshly-computed (correct)
-            # average, purely to denoise that one branch's own tracked
-            # value -- never fed back into new_avg_mean/new_avg_std above.
-            lo, hi = new_avg_std / cap, new_avg_std * cap
-            branch_sk = []
-            for sk in branch_sk_raw:
-                clamped |= (sk < lo) | (sk > hi)
-                branch_sk.append(sk.clamp(lo, hi))
-
-            if mean_cap is not None:
-                # Scale is in cross-branch-average-std units (not the
-                # branch's own, possibly-capped, std) so the bound is a
-                # stable reference independent of the std cap above.
-                lo_m = new_avg_mean - mean_cap * new_avg_std
-                hi_m = new_avg_mean + mean_cap * new_avg_std
-                branch_mk_capped = []
-                for mk in branch_mk:
-                    mean_clamped |= (mk < lo_m) | (mk > hi_m)
-                    branch_mk_capped.append(mk.clamp(lo_m, hi_m))
-                branch_mk = branch_mk_capped
-
-            # Stored directly, with no EMA smoothing: each round's
-            # new_avg_mean/new_avg_std is already an honest, low-noise pool
-            # over every populated branch's points (typically thousands of
-            # live points combined), unlike the individual branch trackers
-            # below (which pool far fewer points each and do benefit from
-            # smoothing). Nested sampling posteriors can shrink faster than
-            # exponentially as a run converges (confirmed on a live ET run:
-            # round-over-round std ratios of 0.96, 0.88, ..., 0.74 for a
-            # well-measured timing parameter) -- a fixed-beta EMA here
-            # structurally cannot keep pace with an accelerating target and
-            # was measured lagging the true current spread by 6x.
-            self._canon_mean_avg.copy_(new_avg_mean)
-            self._canon_std_avg.copy_(new_avg_std)
-            self._canon_avg_seen.fill_(True)
-
-            for mk, sk, k in zip(branch_mk, branch_sk, branch_k):
-                if self._canon_seen[k]:
-                    self._canon_mean[k].mul_(1 - beta).add_(beta * mk)
-                    self._canon_std[k].mul_(1 - beta).add_(beta * sk)
-                else:
-                    self._canon_mean[k].copy_(mk)
-                    self._canon_std[k].copy_(sk)
-                    self._canon_seen[k] = True
-                # Remember this branch's personal deviation from the
-                # (now-updated) average -- additive for the mean,
-                # multiplicative for the std -- so a future dormant round
-                # can keep tracking the moving average with it instead of
-                # freezing or discarding it.
-                self._canon_mean_delta[k].copy_(
-                    self._canon_mean[k] - self._canon_mean_avg
-                )
-                self._canon_std_ratio[k].copy_(
-                    self._canon_std[k] / self._canon_std_avg
-                )
-                self._canon_has_delta[k] = True
-
-            if bool(clamped.any()) and not self._warned_canon_clamp:
-                names = [
-                    self.param_names[i]
-                    for i in clamped.nonzero(as_tuple=True)[0].tolist()
-                ]
-                logger.warning(
-                    "Group-mixture canonical std capped at %gx the "
-                    "cross-branch average for %s: at least one branch's own "
-                    "measured spread there differs from its symmetric "
-                    "siblings by more than that factor. Raise "
-                    "canon_std_ratio_cap if this triggers persistently for "
-                    "a genuinely asymmetric mode rather than sampling "
-                    "noise.",
-                    cap,
-                    names,
-                )
-                self._warned_canon_clamp = True
-
-            if bool(mean_clamped.any()) and not self._warned_canon_mean_clamp:
-                names = [
-                    self.param_names[i]
-                    for i in mean_clamped.nonzero(as_tuple=True)[0].tolist()
-                ]
-                logger.warning(
-                    "Group-mixture canonical mean capped at %g cross-branch "
-                    "std of the cross-branch average for %s: at least one "
-                    "branch's own measured centre there differs from its "
-                    "symmetric siblings by more than that. Raise "
-                    "canon_mean_offset_cap (or set it to None) if this "
-                    "triggers persistently for a genuinely asymmetric mode "
-                    "rather than sampling noise.",
-                    mean_cap,
-                    names,
-                )
-                self._warned_canon_mean_clamp = True
-
-        # -- dormant branches (too few points this round to update from
-        # their own data): keep tracking the moving average, offset by the
-        # personal deviation last measured while they *were* populated. --
-        avg_std = self._canon_std_avg
-        avg_mean = self._canon_mean_avg
-        cap = self._canon_std_ratio_cap
-        mean_cap = self._canon_mean_offset_cap
-        lo, hi = avg_std / cap, avg_std * cap
-        if mean_cap is not None:
-            lo_m, hi_m = avg_mean - mean_cap * avg_std, avg_mean + mean_cap * avg_std
-        populated = set(branch_k)
-        for k in range(self.group_size):
-            if k in populated:
-                continue
-            if bool(self._canon_has_delta[k]):
-                mean_k = avg_mean + self._canon_mean_delta[k]
-                if mean_cap is not None:
-                    mean_k = mean_k.clamp(lo_m, hi_m)
-                self._canon_mean[k].copy_(mean_k)
-                self._canon_std[k].copy_(
-                    (avg_std * self._canon_std_ratio[k]).clamp(lo, hi)
-                )
-                self._canon_seen[k] = True
-            elif not bool(self._canon_seen[k]):
-                self._canon_mean[k].copy_(self._canon_mean_avg)
-                self._canon_std[k].copy_(avg_std)
-                self._canon_seen[k] = True
+            self._canon_mean.copy_(mean)
+            self._canon_std.copy_(std)
+            self._canon_seen.fill_(True)
 
     @torch.no_grad()
     def update_mixture_weights(self, x, context=None, smoothing=1.0):
@@ -1416,8 +1134,6 @@ class GroupMixtureFlowModel(FlowModel):
     prime_space_action = None
     prime_space_in_domain = None
     min_canon_std = 1e-6
-    canon_std_ratio_cap = 5.0
-    canon_mean_offset_cap = None
     truncate_base_to_domain = True
     reflect_parameters = None
     canonical_transform = None
@@ -1473,13 +1189,6 @@ class GroupMixtureFlowModel(FlowModel):
         min_canon_std = config_clean.pop(
             "min_canon_std", getattr(self, "min_canon_std", 1e-6)
         )
-        canon_std_ratio_cap = config_clean.pop(
-            "canon_std_ratio_cap", getattr(self, "canon_std_ratio_cap", 5.0)
-        )
-        canon_mean_offset_cap = config_clean.pop(
-            "canon_mean_offset_cap",
-            getattr(self, "canon_mean_offset_cap", None),
-        )
         truncate_base_to_domain = config_clean.pop(
             "truncate_base_to_domain",
             getattr(self, "truncate_base_to_domain", True),
@@ -1516,8 +1225,6 @@ class GroupMixtureFlowModel(FlowModel):
             prime_space_action=prime_space_action,
             prime_space_in_domain=prime_space_in_domain,
             min_canon_std=min_canon_std,
-            canon_std_ratio_cap=canon_std_ratio_cap,
-            canon_mean_offset_cap=canon_mean_offset_cap,
             truncate_base_to_domain=truncate_base_to_domain,
             reflect_parameters=reflect_parameters,
             canonical_transform=canonical_transform,
@@ -1533,8 +1240,6 @@ def make_group_mixture_flow(
     prime_space_action=None,
     prime_space_in_domain=None,
     min_canon_std=1e-6,
-    canon_std_ratio_cap=5.0,
-    canon_mean_offset_cap=None,
     truncate_base_to_domain=True,
     reflect_parameters=None,
     canonical_transform=None,
@@ -1572,41 +1277,11 @@ def make_group_mixture_flow(
         Fundamental-domain predicate in prime coordinates; required with
         ``prime_space_action``.
     min_canon_std : float, optional
-        Pure numerical-safety floor on a single branch's *raw* measured std
-        (default ``1e-6``), applied before anything else so a literal std of
-        0 cannot divide by zero downstream. This is not the main defence
-        against an over-narrow canonicalisation -- see
-        ``canon_std_ratio_cap`` -- and should essentially never bind; leave
-        it at the default unless a batch can be genuinely degenerate.
-    canon_std_ratio_cap : float, optional
-        Every group element is a symmetric copy of the same underlying
-        mode, so its canonical std should agree with every other element's
-        up to real per-branch heterogeneity, not an arbitrary absolute
-        scale. Each branch's std is clamped to within a factor of this cap
-        (default ``5.0``) of the cross-branch average (the unweighted mean
-        of every currently-populated branch's own std), so a genuinely
-        narrow coordinate (e.g. a GW ``geocent_time`` z-scored far tighter
-        than the prior resolves it) is never forced towards some arbitrary
-        absolute floor -- only branches that disagree with their own
-        symmetric siblings are clamped. A one-off warning fires when the
-        cap binds; raise it if that triggers persistently for a genuinely
-        asymmetric mode rather than sampling noise. A branch with too few
-        points to measure its own std this round instead tracks the
-        cross-branch average scaled by its own last-measured ratio to it,
-        so a temporarily-empty branch stays consistent with its previous
-        behaviour rather than snapping to the bare average or freezing in
-        place.
-    canon_mean_offset_cap : float, optional
-        Analogous cap on the canonical *mean*: each branch's mean is clamped
-        to within this many cross-branch-average standard deviations
-        (``canon_std_avg``, not the branch's own std) of the cross-branch
-        average mean. Default ``None`` -- unconstrained, i.e. the mean cap is
-        off and only the std ratio cap applies. Set to ``0`` to force every
-        branch's canonical mean to exactly track the cross-branch average (no
-        per-branch mean offset at all) -- useful for testing whether the
-        per-branch mean freedom is itself a source of spurious asymmetry
-        between otherwise-symmetric modes. A one-off warning fires when the
-        cap binds, mirroring ``canon_std_ratio_cap``'s.
+        Pure numerical-safety floor on the shared canonical standardisation's
+        raw measured std (default ``1e-6``), applied before anything else so
+        a literal std of 0 cannot divide by zero downstream. Should
+        essentially never bind; leave it at the default unless a batch can be
+        genuinely degenerate.
     truncate_base_to_domain : bool, optional
         If ``True``,
         :meth:`~DiscreteGroupMixtureFlowWrapper.sample_and_log_prob` rejects
@@ -1624,9 +1299,9 @@ def make_group_mixture_flow(
         ``x, y, z >= 0`` octant faces of a detector-frame sky decomposition.
         The base flow then models the sign-symmetric extension
         ``q0_sym(u) = sum_s q0(s . u)`` over the ``2**m`` sign patterns of
-        these dims (so it never has to represent the wall cliff), the
-        per-element standardisation of these dims is pinned to mean 0 / RMS
-        scale, and a generative draw is folded back with ``abs``. Only
+        these dims (so it never has to represent the wall cliff), the shared
+        standardisation of these dims is pinned to mean 0 / RMS scale, and a
+        generative draw is folded back with ``abs``. Only
         supported on the ``prime_space_action`` path. Default: no reflection.
     canonical_transform : object, optional
         Fixed analytic bijection between the canonical prime coordinates and
@@ -1655,10 +1330,9 @@ def make_group_mixture_flow(
     -----
     ``group_action_fn`` and ``in_fundamental_domain`` are defined in the
     physical parameter space, so the proposal class must use
-    :class:`GroupFlowProposalMixin`. For an affine reparameterisation this
-    is exact and free; for a non-affine one the mixin installs a
-    :class:`ReparamBridge` that round-trips through the reparameterisation
-    in numpy each batch and carries the exact conjugation Jacobian.
+    :class:`GroupFlowProposalMixin`, which installs a :class:`ReparamBridge`
+    that round-trips through the reparameterisation in numpy each batch and
+    carries the exact conjugation Jacobian.
     """
 
     class CustomGroupMixtureFlowModel(GroupMixtureFlowModel):
@@ -1668,8 +1342,6 @@ def make_group_mixture_flow(
     CustomGroupMixtureFlowModel.group_size = group_size
     CustomGroupMixtureFlowModel.param_names = param_names
     CustomGroupMixtureFlowModel.min_canon_std = min_canon_std
-    CustomGroupMixtureFlowModel.canon_std_ratio_cap = canon_std_ratio_cap
-    CustomGroupMixtureFlowModel.canon_mean_offset_cap = canon_mean_offset_cap
     CustomGroupMixtureFlowModel.truncate_base_to_domain = (
         truncate_base_to_domain
     )
@@ -1834,14 +1506,6 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         return self.experts[0]._min_canon_std
 
     @property
-    def _canon_std_ratio_cap(self):
-        return self.experts[0]._canon_std_ratio_cap
-
-    @property
-    def _canon_mean_offset_cap(self):
-        return self.experts[0]._canon_mean_offset_cap
-
-    @property
     def mode_factor_sizes(self):
         return self.experts[0].mode_factor_sizes
 
@@ -1880,10 +1544,6 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     def set_coordinate_bridge(self, bridge):
         for e in self._all_experts():
             e.set_coordinate_bridge(bridge)
-
-    def set_affine_maps(self, scale, shift):
-        for e in self._all_experts():
-            e.set_affine_maps(scale, shift)
 
     def _assign_branch(self, x):
         return self.experts[0]._assign_branch(x)
@@ -2735,11 +2395,9 @@ class GroupFlowProposalMixin:
 
     Keeps the group-mixture flow's ``group_action_fn`` /
     ``in_fundamental_domain`` in the physical parameter space by wiring the
-    proposal's reparameterisation into the flow as a
-    :class:`CoordinateBridge`. The bridge is refreshed whenever the
-    reparameterisation updates (e.g. data-driven z-score bounds). An affine
-    reparameterisation gets a free :class:`AffineBridge`; anything else gets
-    a :class:`ReparamBridge`.
+    proposal's reparameterisation into the flow as a :class:`ReparamBridge`.
+    The bridge is refreshed whenever the reparameterisation updates (e.g.
+    data-driven z-score bounds).
     """
 
     def _structured(self, array, names):
@@ -2755,11 +2413,10 @@ class GroupFlowProposalMixin:
     def _refresh_group_coordinate_bridge(self):
         """Recover the prime<->physical map and hand it to the flow.
 
-        For an affine reparameterisation ``physical = prime * scale + shift``;
-        ``scale`` and ``shift`` are recovered by probing ``inverse_rescale``
-        and an :class:`AffineBridge` installed. A non-affine (or
-        dimension-changing) reparameterisation gets a :class:`ReparamBridge`
-        that round-trips through ``rescale`` / ``inverse_rescale``.
+        Installs a :class:`ReparamBridge` that round-trips through
+        ``rescale`` / ``inverse_rescale`` in numpy and carries their exact
+        log-Jacobian, regardless of whether the reparameterisation happens to
+        be affine.
         """
         flow_model = getattr(self.flow, "model", None)
         if flow_model is None or not hasattr(
@@ -2772,28 +2429,6 @@ class GroupFlowProposalMixin:
         physical = list(self.parameters)
         dtype = flow_model.weights.dtype
         device = flow_model.weights.device
-
-        if len(prime) == len(physical):
-            d = len(prime)
-
-            def probe(value):
-                arr = np.full((1, d), value, dtype=float)
-                x, _ = self.inverse_rescale(self._structured(arr, prime))
-                return np.array([x[name][0] for name in physical])
-
-            p0, p1, phalf = probe(0.0), probe(1.0), probe(0.5)
-            scale = p1 - p0
-            shift = p0
-            if np.allclose(
-                phalf, shift + 0.5 * scale, rtol=1e-4, atol=1e-6
-            ):
-                flow_model.set_coordinate_bridge(
-                    AffineBridge(
-                        torch.as_tensor(scale, dtype=dtype),
-                        torch.as_tensor(shift, dtype=dtype),
-                    )
-                )
-                return
 
         flow_model.set_coordinate_bridge(
             ReparamBridge(
@@ -2834,13 +2469,13 @@ class GroupFlowProposalMixin:
 
         Reconstructs the exact tensor ``u`` that ``base_flow.log_prob`` is
         called on (see ``DiscreteGroupMixtureFlowWrapper._base_log_prob``:
-        ``t, log_j = self._to_base(canon); u = self._standardise(t,
-        modes)``) and logs its per-coordinate mean/std/min/max, plus the
-        pre-standardisation ``t`` and the cross-branch ``_canon_mean_avg``/
-        ``_canon_std_avg``. Added to directly inspect whether the actual
-        training input (not just the live-point branch counts) is stable,
-        correctly normalised, and varies smoothly across a --reset-flow
-        trigger, on the real run rather than a toy reproduction.
+        ``t, log_j = self._to_base(canon); u = self._standardise(t)``) and
+        logs its per-coordinate mean/std/min/max, plus the pre-standardisation
+        ``t`` and the shared ``_canon_mean``/``_canon_std``. Added to directly
+        inspect whether the actual training input (not just the live-point
+        branch counts) is stable, correctly normalised, and varies smoothly
+        across a --reset-flow trigger, on the real run rather than a toy
+        reproduction.
         """
         import os as _os
 
@@ -2851,10 +2486,10 @@ class GroupFlowProposalMixin:
             return
         # _assign_branch/_to_base are delegated to experts[0] by
         # ClusteredGroupMixtureFlowWrapper (fine while k==1, the only
-        # regime seen so far), but _standardise/_canon_mean_avg/
-        # _canon_std_avg live on the per-expert DiscreteGroupMixtureFlowWrapper
-        # itself, not the top-level clustered wrapper -- route to the same
-        # expert _assign_branch/_to_base actually used.
+        # regime seen so far), but _standardise/_canon_mean/_canon_std live
+        # on the per-expert DiscreteGroupMixtureFlowWrapper itself, not the
+        # top-level clustered wrapper -- route to the same expert
+        # _assign_branch/_to_base actually used.
         experts = getattr(model, "experts", None)
         standardise_model = experts[0] if experts else model
         try:
@@ -2863,15 +2498,11 @@ class GroupFlowProposalMixin:
                 n = x_prime.shape[0]
                 canon = pre[assigned, torch.arange(n, device=x_prime.device)]
                 t, _ = model._to_base(canon)
-                u = standardise_model._standardise(t, assigned)
+                u = standardise_model._standardise(t)
                 u_c = u[claimed]
                 t_c = t[claimed]
-                canon_mean_avg = getattr(
-                    standardise_model, "_canon_mean_avg", None
-                )
-                canon_std_avg = getattr(
-                    standardise_model, "_canon_std_avg", None
-                )
+                canon_mean = getattr(standardise_model, "_canon_mean", None)
+                canon_std = getattr(standardise_model, "_canon_std", None)
             logger.info(
                 "[baseflow-input %s] n_claimed=%d/%d u: mean=%s std=%s "
                 "min=%s max=%s",
@@ -2889,12 +2520,12 @@ class GroupFlowProposalMixin:
                 t_c.mean(0).cpu().numpy(),
                 t_c.std(0).cpu().numpy(),
             )
-            if canon_mean_avg is not None and canon_std_avg is not None:
+            if canon_mean is not None and canon_std is not None:
                 logger.info(
-                    "[baseflow-input %s] canon_mean_avg=%s canon_std_avg=%s",
+                    "[baseflow-input %s] canon_mean=%s canon_std=%s",
                     tag,
-                    canon_mean_avg.cpu().numpy(),
-                    canon_std_avg.cpu().numpy(),
+                    canon_mean.cpu().numpy(),
+                    canon_std.cpu().numpy(),
                 )
         except Exception:
             logger.exception("[baseflow-input %s] diagnostic dump failed", tag)
