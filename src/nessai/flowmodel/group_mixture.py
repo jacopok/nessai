@@ -470,6 +470,69 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     def uses_prime_space_action(self):
         return self.prime_space_action is not None
 
+    def _carry_over_group_state(self, old):
+        """Copy branch bookkeeping from a prior instance of this wrapper.
+
+        Called by :meth:`~nessai.flowmodel.base.FlowModel.reset_model` after
+        a complete reset (``weights=True, permutations=True``) reconstructs a
+        fresh wrapper via ``get_model``. ``--reset-flow`` exists to escape a
+        poorly-fit canonical-space ``base_flow``; the mixture weights,
+        per-branch standardisation (``_canon_mean``/``_canon_std`` and their
+        EMA/delta-tracking buffers) and empty-round patience counters take
+        many rounds to accumulate and are unrelated to the base flow's own
+        parameters, so a reset should leave them untouched. Without this, the
+        freshly reset model re-derives all of that bookkeeping from a single
+        round's live points with no smoothing or per-branch history to fall
+        back on, which can mistake an ordinary transient branch-occupancy dip
+        for the truth and permanently starve that branch (confirmed live: a
+        reset coinciding with a lean round for one factor value collapsed its
+        weight from ~1/32 to ~0.003 within one round and never recovered).
+        """
+        if not isinstance(old, DiscreteGroupMixtureFlowWrapper):
+            return
+        if old.group_size != self.group_size:
+            return
+        with torch.no_grad():
+            self.weights.copy_(old.weights)
+            self._empty_rounds.copy_(old._empty_rounds)
+            if (
+                self._factor_empty_rounds is not None
+                and old._factor_empty_rounds is not None
+            ):
+                self._factor_empty_rounds.copy_(old._factor_empty_rounds)
+            # _canon_mean/_canon_std are stored in the prime frame recorded
+            # by _prime_scale/_prime_shift; carrying the former without the
+            # latter left a fresh reset's identity-default scale/shift as
+            # the "old" baseline the next set_affine_maps() call reframes
+            # from, corrupting the carried-over stats with a bogus affine
+            # correction (confirmed live: the freshly-trained post-reset
+            # flow's own canonical-space samples split into spurious
+            # disconnected modes far from any live point).
+            self._prime_scale.copy_(old._prime_scale)
+            self._prime_shift.copy_(old._prime_shift)
+            self._canon_mean.copy_(old._canon_mean)
+            self._canon_std.copy_(old._canon_std)
+            self._canon_seen.copy_(old._canon_seen)
+            self._canon_mean_avg.copy_(old._canon_mean_avg)
+            self._canon_std_avg.copy_(old._canon_std_avg)
+            self._canon_avg_seen.copy_(old._canon_avg_seen)
+            self._canon_mean_delta.copy_(old._canon_mean_delta)
+            self._canon_std_ratio.copy_(old._canon_std_ratio)
+            self._canon_has_delta.copy_(old._canon_has_delta)
+            self._log_domain_mass.copy_(old._log_domain_mass)
+        self._domain_mass_seen = old._domain_mass_seen
+        self._warned_canon_clamp = old._warned_canon_clamp
+        self._warned_canon_mean_clamp = old._warned_canon_mean_clamp
+        self._last_leakage_fraction = old._last_leakage_fraction
+        self._last_leakage_fraction_domain = (
+            old._last_leakage_fraction_domain
+        )
+        self._last_leakage_fraction_roundtrip = (
+            old._last_leakage_fraction_roundtrip
+        )
+        self._last_factor_marginals = old._last_factor_marginals
+        self._last_factor_counts = old._last_factor_counts
+
     def load_state_dict(self, state_dict, strict=True, assign=False):
         # Forward compatibility: a checkpoint written before the factorised
         # weight estimator predates ``_mode_factor_index`` /
@@ -1828,6 +1891,35 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     def _to_base(self, canon):
         return self.experts[0]._to_base(canon)
 
+    def _carry_over_group_state(self, old):
+        """Copy per-expert branch bookkeeping and clustering state from a
+        prior instance -- see
+        :meth:`DiscreteGroupMixtureFlowWrapper._carry_over_group_state`.
+        Only the experts'/background's own ``base_flow`` parameters (reset by
+        ``get_model``) are meant to be discarded by ``--reset-flow``; the
+        routing/clustering state is separate bookkeeping with the same
+        argument for preserving it.
+        """
+        if not isinstance(old, ClusteredGroupMixtureFlowWrapper):
+            return
+        if len(self.experts) != len(old.experts):
+            return
+        for new_e, old_e in zip(self.experts, old.experts):
+            new_e._carry_over_group_state(old_e)
+        if self._bg_expert is not None and old._bg_expert is not None:
+            self._bg_expert._carry_over_group_state(old._bg_expert)
+        with torch.no_grad():
+            self.cluster_weights.copy_(old.cluster_weights)
+            self._n_active.copy_(old._n_active)
+            self._centroids.copy_(old._centroids)
+            self._base_mu.copy_(old._base_mu)
+            self._base_sd.copy_(old._base_sd)
+            self._k_shrink_streak.copy_(old._k_shrink_streak)
+            self._k_grow_streak.copy_(old._k_grow_streak)
+            self._clustering_seen.copy_(old._clustering_seen)
+            self._pending_split_train.copy_(old._pending_split_train)
+            self._bg_seen.copy_(old._bg_seen)
+
     # -- routing --------------------------------------------------------
     def _fold_to_base(self, x):
         e = self.experts[0]
@@ -2735,6 +2827,147 @@ class GroupFlowProposalMixin:
         model.update_mixture_weights(x_prime)
         model.update_base_standardisation(x_prime)
         self._log_group_weight_entropy()
+        self._dump_base_flow_input_stats(x_prime, "PRE")
+
+    def _dump_base_flow_input_stats(self, x_prime, tag):
+        """Diagnostic only, gated by NESSAI_DUMP_BASEFLOW_INPUT=1.
+
+        Reconstructs the exact tensor ``u`` that ``base_flow.log_prob`` is
+        called on (see ``DiscreteGroupMixtureFlowWrapper._base_log_prob``:
+        ``t, log_j = self._to_base(canon); u = self._standardise(t,
+        modes)``) and logs its per-coordinate mean/std/min/max, plus the
+        pre-standardisation ``t`` and the cross-branch ``_canon_mean_avg``/
+        ``_canon_std_avg``. Added to directly inspect whether the actual
+        training input (not just the live-point branch counts) is stable,
+        correctly normalised, and varies smoothly across a --reset-flow
+        trigger, on the real run rather than a toy reproduction.
+        """
+        import os as _os
+
+        if _os.environ.get("NESSAI_DUMP_BASEFLOW_INPUT") != "1":
+            return
+        model = getattr(self.flow, "model", None)
+        if model is None or not hasattr(model, "_assign_branch"):
+            return
+        # _assign_branch/_to_base are delegated to experts[0] by
+        # ClusteredGroupMixtureFlowWrapper (fine while k==1, the only
+        # regime seen so far), but _standardise/_canon_mean_avg/
+        # _canon_std_avg live on the per-expert DiscreteGroupMixtureFlowWrapper
+        # itself, not the top-level clustered wrapper -- route to the same
+        # expert _assign_branch/_to_base actually used.
+        experts = getattr(model, "experts", None)
+        standardise_model = experts[0] if experts else model
+        try:
+            with torch.no_grad():
+                assigned, pre, claimed = model._assign_branch(x_prime)
+                n = x_prime.shape[0]
+                canon = pre[assigned, torch.arange(n, device=x_prime.device)]
+                t, _ = model._to_base(canon)
+                u = standardise_model._standardise(t, assigned)
+                u_c = u[claimed]
+                t_c = t[claimed]
+                canon_mean_avg = getattr(
+                    standardise_model, "_canon_mean_avg", None
+                )
+                canon_std_avg = getattr(
+                    standardise_model, "_canon_std_avg", None
+                )
+            logger.info(
+                "[baseflow-input %s] n_claimed=%d/%d u: mean=%s std=%s "
+                "min=%s max=%s",
+                tag,
+                int(claimed.sum()),
+                n,
+                u_c.mean(0).cpu().numpy(),
+                u_c.std(0).cpu().numpy(),
+                u_c.min(0).values.cpu().numpy(),
+                u_c.max(0).values.cpu().numpy(),
+            )
+            logger.info(
+                "[baseflow-input %s] t: mean=%s std=%s",
+                tag,
+                t_c.mean(0).cpu().numpy(),
+                t_c.std(0).cpu().numpy(),
+            )
+            if canon_mean_avg is not None and canon_std_avg is not None:
+                logger.info(
+                    "[baseflow-input %s] canon_mean_avg=%s canon_std_avg=%s",
+                    tag,
+                    canon_mean_avg.cpu().numpy(),
+                    canon_std_avg.cpu().numpy(),
+                )
+        except Exception:
+            logger.exception("[baseflow-input %s] diagnostic dump failed", tag)
+
+    def _post_train_diagnostics(self, n_samples=4000):
+        """Flow self-consistency check, run right after every training round.
+
+        Draws ``n_samples`` fresh points from the just-(re)trained flow and
+        re-runs the same purely-geometric :meth:`_assign_branch` used for
+        ``update_mixture_weights`` on them. This is independent of the live
+        points entirely -- it tests whether the flow *itself* is healthy
+        right when training finished, rather than inferring flow health
+        indirectly from how the live-point population evolves over the
+        following (possibly many) iterations. Two distinct failure modes are
+        distinguishable this way:
+
+        * a **misshapen density**: the flow's own samples are already
+          skewed/collapsed onto a subset of branches (or a large fraction
+          fail the domain round-trip -- see ``frac_unclaimed`` below), right
+          out of training, before any live-point churn could be responsible.
+        * a **healthy flow, corrupted population**: the flow's own samples
+          look fine (balanced across branches, low leakage), which would
+          instead point at something in the birth/death acceptance loop
+          (using this same, apparently fine, flow) as the culprit.
+
+        Logged unconditionally (every round, not just after a
+        ``--reset-flow`` trigger) so there is a baseline to compare a
+        reset round against.
+        """
+        model = getattr(self.flow, "model", None)
+        if model is None or not hasattr(model, "update_mixture_weights"):
+            return
+        if getattr(self, "training_data", None) is not None:
+            x_prime = self._training_data_as_prime_tensor(self.training_data)
+            self._dump_base_flow_input_stats(x_prime, "POST")
+        try:
+            with torch.no_grad():
+                x, log_q = model.sample_and_log_prob(n_samples)
+                finite = torch.isfinite(log_q)
+                assigned, _, claimed = model._assign_branch(x[finite])
+        except Exception:
+            logger.exception(
+                "Group-mixture post-train diagnostic sampling failed"
+            )
+            return
+        n_finite = int(finite.sum())
+        n_claimed = int(claimed.sum())
+        frac_nonfinite = 1.0 - n_finite / max(n_samples, 1)
+        frac_unclaimed = (
+            1.0 - n_claimed / n_finite if n_finite else float("nan")
+        )
+        counts = torch.bincount(
+            assigned[claimed], minlength=model.group_size
+        ).float()
+        probs = counts / counts.sum() if n_claimed else counts
+        entropy = (
+            float(-(probs[probs > 0] * probs[probs > 0].log2()).sum())
+            if n_claimed
+            else float("nan")
+        )
+        max_entropy = float(np.log2(model.group_size))
+        logger.info(
+            "Group-mixture post-train self-consistency: drew %d samples, "
+            "%.3f non-finite log-prob, %.3f unclaimed (domain round-trip "
+            "failure) of the rest; own-sample branch entropy %.3f / %.3f "
+            "bits; own-sample counts: %s",
+            n_samples,
+            frac_nonfinite,
+            frac_unclaimed,
+            entropy,
+            max_entropy,
+            counts.to(torch.long).tolist(),
+        )
 
     def _log_group_weight_entropy(self):
         flow_model = getattr(self.flow, "model", None)

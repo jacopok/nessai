@@ -917,12 +917,25 @@ class BaseFlowProposal(RejectionProposal):
             output=block_output,
             plot=self._plot_training and plot,
         )
+        self._post_train_diagnostics()
 
         if self._plot_training and plot:
             self._plot_training_data(block_output)
 
         self.populated = False
         self.training_count += 1
+
+    def _post_train_diagnostics(self):
+        """Hook called immediately after :meth:`FlowModel.train` completes.
+
+        No-op by default; subclasses/mixins (e.g.
+        :class:`~nessai.flowmodel.group_mixture.GroupFlowProposalMixin`) can
+        override this to log flow-health checks that depend on the just
+        finished training round (e.g. a self-consistency check that samples
+        the flow and re-runs geometric assignment on its own output) right
+        when it's most informative -- before the next round's live-point
+        churn could otherwise be mistaken for the training round's effect.
+        """
 
     def reset_model_weights(self, **kwargs):
         """

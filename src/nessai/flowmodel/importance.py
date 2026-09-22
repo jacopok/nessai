@@ -70,6 +70,21 @@ class ImportanceFlowModel(FlowModel):
         """Initialise things"""
         self.initialised = True
 
+    def reset_model(self, weights=True, permutations=False):
+        """Not supported.
+
+        ``ImportanceFlowModel`` manages multiple flows via
+        :meth:`add_new_flow` (``self.model`` is a property that appends to
+        ``self.models`` rather than replacing a single model), which is
+        incompatible with the base class's ``reset_model`` -- use
+        ``reset_flow``/``add_new_flow`` on the importance proposal instead.
+        """
+        raise NotImplementedError(
+            "ImportanceFlowModel manages multiple flows via add_new_flow; "
+            "reset_model is not supported. Use `reset_flow`/`add_new_flow` "
+            "on the importance proposal instead."
+        )
+
     def reset_optimiser(self) -> None:
         """Reset the optimiser to point at current model.
 

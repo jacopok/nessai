@@ -115,13 +115,23 @@ def test_initialise(model):
     model.optimiser = "adam"
     model.training_config = dict(optimiser_kwargs={"weights": 0.1})
     mock_flow = MagicMock()
+    model.get_model = MagicMock(return_value=mock_flow)
+    FlowModel.initialise(model)
+    model.get_model.assert_called_once_with(model.flow_config)
+    model.get_optimiser.assert_called_once()
+    assert model.inference_device == torch.device("cpu")
+
+
+def test_get_model_default(model):
+    """Test that the default get_model delegates to configure_model"""
+    model.flow_config = dict(n_inputs=2)
+    mock_flow = MagicMock()
     with patch(
         "nessai.flowmodel.base.configure_model", return_value=mock_flow
     ) as mock:
-        FlowModel.initialise(model)
+        out = FlowModel.get_model(model, model.flow_config)
     mock.assert_called_once_with(model.flow_config)
-    model.get_optimiser.assert_called_once()
-    assert model.inference_device == torch.device("cpu")
+    assert out is mock_flow
 
 
 @pytest.mark.parametrize("optimiser", ["Adam", "AdamW", "SGD", None])
@@ -480,15 +490,14 @@ def test_reset_model(model, weights, perms):
     )
     model.training_config = dict(lr=0.1)
     model.optimiser_kwargs = dict(beta=0.9)
+    model.get_model = MagicMock(return_value=MagicMock())
 
-    with patch(
-        "nessai.flowmodel.base.configure_model",
-        return_value=MagicMock,
-    ) as mock:
-        FlowModel.reset_model(model, weights=weights, permutations=perms)
+    FlowModel.reset_model(model, weights=weights, permutations=perms)
 
     if weights and perms:
-        mock.assert_called_once()
+        model.get_model.assert_called_once_with(model.flow_config)
+    else:
+        model.get_model.assert_not_called()
     if any([weights, perms]):
         model.get_optimiser.assert_called_once()
     else:

@@ -1587,6 +1587,172 @@ def test_clustered_k1_returns_plain_wrapper():
     assert not isinstance(fm.model, ClusteredGroupMixtureFlowWrapper)
 
 
+def test_reset_model_preserves_group_mixture_wrapper():
+    """Regression test: ``reset_model(weights=True, permutations=True)``
+    (what a ``--reset-flow N`` trigger always calls) must reconstruct the
+    same specialised ``DiscreteGroupMixtureFlowWrapper``, not silently
+    degrade to a bare flow. Previously ``FlowModel.reset_model`` rebuilt
+    via the module-level ``configure_model`` directly, discarding the
+    group-mixture wrapper (branch folding, canonicalisation buffers)
+    entirely -- confirmed on a live run where, after the first
+    ``--reset-flow`` trigger, the saved checkpoint's state dict had zero
+    ``_canon_mean``/``experts.*`` keys left."""
+    fm = PeriodicGroupFlowModel(
+        flow_config={"n_inputs": 2, "ftype": "realnvp", "n_blocks": 2,
+                     "n_neurons": 4, "n_layers": 1,
+                     "batch_norm_between_layers": False},
+        training_config={"lr": 1e-3, "optimiser": "adam"},
+    )
+    fm.initialise()
+    assert isinstance(fm.model, DiscreteGroupMixtureFlowWrapper)
+    assert hasattr(fm.model, "_canon_mean")
+    assert hasattr(fm.model, "update_mixture_weights")
+
+    fm.reset_model(weights=True, permutations=True)
+
+    assert isinstance(fm.model, DiscreteGroupMixtureFlowWrapper)
+    assert hasattr(fm.model, "_canon_mean")
+    assert hasattr(fm.model, "update_mixture_weights")
+    # optimiser must still work against the freshly-reconstructed model
+    params = list(fm._optimiser.param_groups[0]["params"])
+    assert params
+    assert all(p in set(fm.model.parameters()) for p in params)
+
+
+def test_reset_model_preserves_clustered_wrapper():
+    """Same regression as above, for the clustered (``n_clusters_max>=1``)
+    variant actually exercised by the live bug -- must still be a
+    ``DiscreteGroupMixtureFlowWrapper`` (the k=1 shape) with its ``experts``
+    intact after a complete reset."""
+    cls = make_clustered_group_mixture_flow(
+        n_clusters_max=1,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=PARAM_NAMES,
+        in_fundamental_domain=in_fundamental_domain,
+    )
+    fm = cls(
+        flow_config={"n_inputs": 2, "ftype": "realnvp", "n_blocks": 2,
+                     "n_neurons": 4, "n_layers": 1,
+                     "batch_norm_between_layers": False},
+        training_config={"lr": 1e-3, "optimiser": "adam"},
+    )
+    fm.initialise()
+    assert isinstance(fm.model, DiscreteGroupMixtureFlowWrapper)
+    assert hasattr(fm.model, "_canon_mean")
+
+    fm.reset_model(weights=True, permutations=True)
+
+    assert isinstance(fm.model, DiscreteGroupMixtureFlowWrapper)
+    assert hasattr(fm.model, "_canon_mean")
+    assert hasattr(fm.model, "update_mixture_weights")
+    params = list(fm._optimiser.param_groups[0]["params"])
+    assert params
+    assert all(p in set(fm.model.parameters()) for p in params)
+
+
+def test_reset_model_carries_over_branch_state():
+    """``--reset-flow`` should only reset the canonical-space ``base_flow``;
+    branch weights and per-branch standardisation bookkeeping (accumulated
+    over many rounds) must survive a complete reset untouched. Previously
+    ``reset_model`` reconstructed a fresh wrapper via ``get_model`` with no
+    attempt to carry this state over, so every buffer silently snapped back
+    to its from-scratch default (uniform weights, zero mean/unit std, no
+    per-branch history) -- confirmed live: a reset coinciding with an
+    ordinary transient dip in one branch's occupancy then baked that dip in
+    with no smoothing/history to fall back on, permanently starving it."""
+    fm = PeriodicGroupFlowModel(
+        flow_config={"n_inputs": 2, "ftype": "realnvp", "n_blocks": 2,
+                     "n_neurons": 4, "n_layers": 1,
+                     "batch_norm_between_layers": False},
+        training_config={"lr": 1e-3, "optimiser": "adam"},
+    )
+    fm.initialise()
+    old = fm.model
+    n, d = old.group_size, old.num_features
+    with torch.no_grad():
+        w = torch.full((n,), 0.1)
+        w[0] = 1.0 - 0.1 * (n - 1)
+        old.weights.copy_(w)
+        old._empty_rounds.copy_(torch.arange(n, dtype=torch.long) % 3)
+        old._canon_mean.copy_(torch.arange(n * d, dtype=torch.float32).reshape(n, d))
+        old._canon_std.copy_(torch.full((n, d), 2.5))
+        old._canon_seen.fill_(True)
+        old._canon_mean_avg.copy_(torch.full((d,), 3.5))
+        old._canon_std_avg.copy_(torch.full((d,), 2.5))
+        old._canon_avg_seen.fill_(True)
+        old._canon_mean_delta.copy_(torch.full((n, d), 0.25))
+        old._canon_std_ratio.copy_(torch.full((n, d), 1.1))
+        old._canon_has_delta.fill_(True)
+        old._prime_scale.copy_(torch.full((d,), 1.7))
+        old._prime_shift.copy_(torch.full((d,), 0.4))
+    old._warned_canon_mean_clamp = True
+
+    fm.reset_model(weights=True, permutations=True)
+    new = fm.model
+
+    assert new is not old
+    assert torch.equal(new.weights, old.weights)
+    assert torch.equal(new._empty_rounds, old._empty_rounds)
+    assert torch.equal(new._prime_scale, old._prime_scale)
+    assert torch.equal(new._prime_shift, old._prime_shift)
+    assert torch.equal(new._canon_mean, old._canon_mean)
+    assert torch.equal(new._canon_std, old._canon_std)
+    assert torch.equal(new._canon_seen, old._canon_seen)
+    assert torch.equal(new._canon_mean_avg, old._canon_mean_avg)
+    assert torch.equal(new._canon_std_avg, old._canon_std_avg)
+    assert bool(new._canon_avg_seen)
+    assert torch.equal(new._canon_mean_delta, old._canon_mean_delta)
+    assert torch.equal(new._canon_std_ratio, old._canon_std_ratio)
+    assert torch.equal(new._canon_has_delta, old._canon_has_delta)
+    assert new._warned_canon_mean_clamp is True
+    # The base flow's own parameters are a fresh module -- not shared with
+    # the pre-reset instance.
+    assert new.base_flow is not old.base_flow
+
+
+def test_reset_model_carries_over_branch_state_clustered():
+    """Same as above for the clustered (``n_clusters_max>=1``) variant: each
+    expert's branch state, and the clustering/routing state itself, must
+    survive a complete reset."""
+    cls = make_clustered_group_mixture_flow(
+        n_clusters_max=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=PARAM_NAMES,
+        in_fundamental_domain=in_fundamental_domain,
+    )
+    fm = cls(
+        flow_config={"n_inputs": 2, "ftype": "realnvp", "n_blocks": 2,
+                     "n_neurons": 4, "n_layers": 1,
+                     "batch_norm_between_layers": False},
+        training_config={"lr": 1e-3, "optimiser": "adam"},
+    )
+    fm.initialise()
+    old = fm.model
+    n, d = old.experts[0].group_size, old.experts[0].num_features
+    with torch.no_grad():
+        w = torch.full((n,), 0.1)
+        w[0] = 1.0 - 0.1 * (n - 1)
+        old.experts[0].weights.copy_(w)
+        old.experts[0]._canon_mean.copy_(
+            torch.arange(n * d, dtype=torch.float32).reshape(n, d)
+        )
+        old._n_active.fill_(1)
+        old._clustering_seen.fill_(True)
+        old._centroids.copy_(torch.full_like(old._centroids, 3.0))
+
+    fm.reset_model(weights=True, permutations=True)
+    new = fm.model
+
+    assert new is not old
+    assert torch.equal(new.experts[0].weights, old.experts[0].weights)
+    assert torch.equal(new.experts[0]._canon_mean, old.experts[0]._canon_mean)
+    assert torch.equal(new._centroids, old._centroids)
+    assert bool(new._clustering_seen) == bool(old._clustering_seen)
+    assert new.experts[0].base_flow is not old.experts[0].base_flow
+
+
 def test_clustered_wrapper_defaults_to_first_expert():
     w = _clustered_wrapper(2)
     assert int(w._n_active.item()) == 1

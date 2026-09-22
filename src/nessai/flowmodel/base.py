@@ -145,6 +145,16 @@ class FlowModel:
     def optimiser(self) -> str:
         return self.training_config["optimiser"]
 
+    def get_model(self, config):
+        """Build the underlying normalising-flow model from a config dict.
+
+        Subclasses that build specialised/wrapped models (e.g. mixture or
+        clustered flows) should override this method rather than
+        ``initialise`` or ``reset_model``, so that both correctly
+        (re)construct the specialised model.
+        """
+        return configure_model(config)
+
     def initialise(self):
         """
         Initialise the model and optimiser.
@@ -157,7 +167,7 @@ class FlowModel:
             - Configuring the inference device
         """
         self.update_mask()
-        self.model = configure_model(self.flow_config)
+        self.model = self.get_model(self.flow_config)
         logger.debug("Flow model:")
         logger.debug(self.model)
         self.device = torch.device(
@@ -761,7 +771,17 @@ class FlowModel:
             return
         if weights and permutations:
             logger.debug("Complete reset of model")
-            self.model = configure_model(self.flow_config)
+            old_model = self.model
+            self.model = self.get_model(self.flow_config)
+            carry_over = getattr(self.model, "_carry_over_group_state", None)
+            if carry_over is not None:
+                # e.g. DiscreteGroupMixtureFlowWrapper /
+                # ClusteredGroupMixtureFlowWrapper: `--reset-flow` is meant
+                # to escape a poorly-fit canonical-space base flow, not to
+                # discard branch weights / per-branch standardisation
+                # bookkeeping accumulated over many rounds, so copy that
+                # state across into the freshly (re)constructed model.
+                carry_over(old_model)
         elif weights:
             self.model.apply(reset_weights)
             logger.debug("Reset weights")
