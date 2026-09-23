@@ -181,6 +181,38 @@ def test_reset_weights_other_module(caplog):
     assert "Could not reset" in caplog.text
 
 
+def test_reset_weights_applied_to_flow_is_quiet(caplog):
+    """Applying reset_weights to a whole flow only resets leaves and does not
+    warn about containers, parameter-free modules or LULinear."""
+    caplog.set_level(logging.WARNING)
+    flow = configure_model(
+        {
+            "n_inputs": 4,
+            "ftype": "realnvp",
+            "n_blocks": 2,
+            "n_neurons": 8,
+            "n_layers": 1,
+            "batch_norm_between_layers": True,
+            "linear_transform": "lu",
+        }
+    )
+    flow.apply(reset_weights)
+    assert "Could not reset" not in caplog.text
+
+
+def test_reset_weights_warns_for_unresettable_parameters(caplog):
+    """A module that owns parameters with no known reset still warns."""
+    caplog.set_level(logging.WARNING)
+
+    class Odd(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.zeros(2))
+
+    reset_weights(Odd())
+    assert "Could not reset" in caplog.text
+
+
 def test_weight_reset_permutation():
     """Test to make sure random permutation is reset correctly"""
     from glasflow.nflows.transforms.permutations import RandomPermutation
