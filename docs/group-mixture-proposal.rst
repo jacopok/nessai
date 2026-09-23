@@ -94,15 +94,13 @@ Requirements and assumptions
   coordinates via
   :class:`~nessai.flowmodel.group_mixture.GroupFlowProposalMixin`:
 
-  * *Affine* reparameterisations (``null``, ``scale``, ``zscore``/z-score,
-    shift) get an :class:`~nessai.flowmodel.group_mixture.AffineBridge` -
-    exact and free; the conjugation Jacobian is identically zero.
-  * *Non-affine* same-dimension reparameterisations (``logit``, ``log``,
-    ``probit``, ``z-score-logit``, ...) get a
+  * Any same-dimension reparameterisation (``null``, ``scale``,
+    ``zscore``/z-score, shift, ``logit``, ``log``, ``probit``,
+    ``z-score-logit``, ...) gets a
     :class:`~nessai.flowmodel.group_mixture.ReparamBridge`, which round-trips
     each batch through ``rescale`` / ``inverse_rescale`` in NumPy and carries
-    the exact per-sample Jacobian. This adds a small host-side cost per
-    training step.
+    the exact per-sample Jacobian, whether or not the reparameterisation
+    happens to be affine. This adds a small host-side cost per training step.
   * *Dimension-changing / augmented* reparameterisations (``Angle``,
     ``AnglePair``, rotations) cannot be round-tripped automatically. Pass
     ``prime_space_action`` (and ``prime_space_in_domain``) to
