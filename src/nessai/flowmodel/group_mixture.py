@@ -185,6 +185,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         reflect_parameters=None,
         canonical_transform=None,
         mode_factor_sizes=None,
+        base_reparam=None,
     ):
         super().__init__()
         self.base_flow = base_flow
@@ -254,6 +255,41 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             canonical_transform, "bind"
         ):
             canonical_transform.bind(self.param_names)
+
+        # Optional *per-wrapper, data-adaptive* bijection ``canon -> canon~``
+        # of the canonical prime coordinates, applied before the canonical
+        # transform and the standardisation, so each expert of a clustered
+        # mixture can pick its own fundamental domain (e.g. move the fold
+        # seams off its posterior mass). The shared routing frame
+        # (``_to_base`` of the unmodified canonical point) is unaffected. An
+        # ``nn.Module`` (its state lives in buffers, so it checkpoints with
+        # the flow) exposing:
+        #   forward(canon)   -> canon~   unit Jacobian
+        #   inverse(canon~)  -> canon    inputs outside the image of the
+        #                                fundamental domain must map to a
+        #                                point failing the domain predicate
+        #                                (so truncation rejects them instead
+        #                                of aliasing mass)
+        #   update(canon)    -> bool     refit on this round's claimed
+        #                                canonical points; True when the frame
+        #                                changed (the base flow is then
+        #                                re-initialised -- its fit is void)
+        #   bind(param_names)            optional
+        # Unit Jacobian keeps ``_canon_log_det`` unchanged.
+        if base_reparam is not None:
+            if prime_space_action is None:
+                raise ValueError(
+                    "base_reparam is only supported on the "
+                    "prime_space_action path."
+                )
+            if self.reflect_parameters:
+                raise ValueError(
+                    "base_reparam cannot be combined with reflect_parameters "
+                    "(the sign-symmetrisation acts on the standardised frame)."
+                )
+            if hasattr(base_reparam, "bind"):
+                base_reparam.bind(self.param_names)
+        self.base_reparam = base_reparam
 
         # Coordinate bridge; defaults to the identity map so the wrapper is
         # usable without a proposal (e.g. in unit tests).
@@ -415,6 +451,13 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             self._canon_std.copy_(old._canon_std)
             self._canon_seen.copy_(old._canon_seen)
             self._log_domain_mass.copy_(old._log_domain_mass)
+            if (
+                self.base_reparam is not None
+                and getattr(old, "base_reparam", None) is not None
+            ):
+                self.base_reparam.load_state_dict(
+                    old.base_reparam.state_dict()
+                )
         self._domain_mass_seen = old._domain_mass_seen
         self._last_leakage_fraction = old._last_leakage_fraction
         self._last_leakage_fraction_domain = (
@@ -493,6 +536,10 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             self._canonical_transform, "bind"
         ):
             self._canonical_transform.bind(self.param_names)
+        if self.base_reparam is not None and hasattr(
+            self.base_reparam, "bind"
+        ):
+            self.base_reparam.bind(self.param_names)
 
     def set_coordinate_bridge(self, bridge):
         """Install a :class:`ReparamBridge`.
@@ -526,8 +573,29 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             return t, t.new_zeros(t.shape[0])
         return self._canonical_transform.inverse(t)
 
-    def _standardise(self, canon, modes=None):
-        return (canon - self._canon_mean) / self._canon_std
+    def _canon_to_base(self, canon):
+        """Canonical (fundamental-domain) prime coords -> base frame ``t``
+        through this wrapper's ``base_reparam`` (if any) and the canonical
+        transform; returns ``(t, log|det dt/dcanon|)``."""
+        if self.base_reparam is not None:
+            canon = self.base_reparam.forward(canon)
+        return self._to_base(canon)
+
+    def _base_to_canon(self, t):
+        """Inverse of :meth:`_canon_to_base`."""
+        canon, log_j = self._from_base(t)
+        if self.base_reparam is not None:
+            canon = self.base_reparam.inverse(canon)
+        return canon, log_j
+
+    def canonical_to_standardised(self, canon):
+        """Canonical prime coords -> the standardised coordinates the base
+        flow models (for diagnostics)."""
+        t, _ = self._canon_to_base(canon)
+        return self._standardise(t)
+
+    def _standardise(self, t, modes=None):
+        return (t - self._canon_mean) / self._canon_std
 
     def _destandardise(self, u, modes=None):
         return u * self._canon_std + self._canon_mean
@@ -563,7 +631,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         its ``log|det dt/dcanon|`` folded into the return value, and the
         standardisation / reflection then act on ``t``.
         """
-        t, log_j = self._to_base(canon)
+        t, log_j = self._canon_to_base(canon)
         u = self._standardise(t, modes)
         if self._sign_patterns is None:
             return self.base_flow.log_prob(u, context=context) + log_j
@@ -708,13 +776,30 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         b = x.shape[0]
         assigned, pre, claimed = self._assign_branch(x)
         canon = pre[assigned, torch.arange(b, device=x.device)]
-        # The base flow (hence the standardisation buffer and the reflect
-        # walls) lives in the transformed frame ``t``, not raw ``canon``.
-        canon, _ = self._to_base(canon)
 
         c = canon[claimed]
         if c.shape[0] < self._min_std_count:
             return
+        if self.base_reparam is not None:
+            if self.base_reparam.update(c):
+                # The frame the base flow was fit in no longer exists:
+                # re-initialise it and re-bootstrap the standardisation (an
+                # EMA across two different frames is meaningless). This runs
+                # before the round's training, so populate() never sees the
+                # untrained flow.
+                from ..flows import reset_permutations, reset_weights
+
+                self.base_flow.apply(reset_weights)
+                self.base_flow.apply(reset_permutations)
+                self._canon_seen.fill_(False)
+                self._domain_mass_seen = False
+                logger.info(
+                    "Group mixture: base_reparam frame changed -- base flow "
+                    "re-initialised"
+                )
+        # The base flow (hence the standardisation buffer and the reflect
+        # walls) lives in the transformed frame ``t``, not raw ``canon``.
+        c, _ = self._canon_to_base(c)
         mean = c.mean(dim=0)
         std = c.std(dim=0).clamp_min(self._min_canon_std)
         mean, std = self._pin_reflect(mean, std, c)
@@ -977,7 +1062,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         u = self.base_flow.sample(num_samples, context=context)
         modes = Categorical(probs=self.weights).sample((num_samples,))
         t = self._fold_reflect(self._destandardise(u, modes))
-        canon, _ = self._from_base(t)
+        canon, _ = self._base_to_canon(t)
         x, fwd_logdet = self._apply_group_action(
             canon, modes, inverse=False
         )
@@ -1013,7 +1098,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             u = self.base_flow.sample(n_draw, context=context)
             modes = Categorical(probs=self.weights).sample((n_draw,))
             t = self._fold_reflect(self._destandardise(u, modes))
-            canon, _ = self._from_base(t)
+            canon, _ = self._base_to_canon(t)
             in_dom = self._in_domain(canon)
             n_drawn_tot += n_draw
             n_kept_tot += int(in_dom.sum())
@@ -1063,7 +1148,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         """
         assigned, pre, _ = self._assign_branch(x)
         canon = pre[assigned, torch.arange(x.shape[0], device=x.device)]
-        t, _ = self._to_base(canon)
+        t, _ = self._canon_to_base(canon)
         return self.base_flow.forward(
             self._standardise(t, assigned), context=context
         )
@@ -1079,7 +1164,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
 
         u, _ = self.base_flow.inverse(z, context=context)
         t = self._fold_reflect(self._destandardise(u, modes))
-        canon, _ = self._from_base(t)
+        canon, _ = self._base_to_canon(t)
         x, fwd_logdet = self._apply_group_action(
             canon, modes, inverse=False
         )
@@ -1138,6 +1223,9 @@ class GroupMixtureFlowModel(FlowModel):
     reflect_parameters = None
     canonical_transform = None
     mode_factor_sizes = None
+    #: Zero-argument callable building a fresh ``base_reparam`` module for
+    #: each wrapper (so every expert owns independent state), or ``None``.
+    base_reparam_factory = None
 
     def initialise(self):
         """Initialise the model and optimiser via :meth:`get_model`."""
@@ -1205,6 +1293,10 @@ class GroupMixtureFlowModel(FlowModel):
         )
         if not isinstance(mode_factor_sizes, (list, tuple)):
             mode_factor_sizes = None
+        base_reparam_factory = config_clean.pop(
+            "base_reparam_factory",
+            getattr(self, "base_reparam_factory", None),
+        )
 
         if group_action_fn is None or group_size is None:
             raise ValueError(
@@ -1229,6 +1321,9 @@ class GroupMixtureFlowModel(FlowModel):
             reflect_parameters=reflect_parameters,
             canonical_transform=canonical_transform,
             mode_factor_sizes=mode_factor_sizes,
+            base_reparam=(
+                base_reparam_factory() if base_reparam_factory else None
+            ),
         )
 
 
@@ -1244,6 +1339,7 @@ def make_group_mixture_flow(
     reflect_parameters=None,
     canonical_transform=None,
     mode_factor_sizes=None,
+    base_reparam_factory=None,
 ):
     """Factory constructing a ``GroupMixtureFlowModel`` bound to a specific group.
 
@@ -1325,6 +1421,13 @@ def make_group_mixture_flow(
         than the flat per-mode count (a starved joint mode keeps a non-zero
         weight until a whole marginal slice empties). Default: flat per-mode
         estimator.
+    base_reparam_factory : callable, optional
+        Zero-argument callable returning a fresh per-wrapper ``base_reparam``
+        module (see :class:`DiscreteGroupMixtureFlowWrapper`): a data-adaptive,
+        unit-Jacobian bijection between the base frame and the standardised
+        frame, refit every round and owned separately by each expert of a
+        clustered mixture. Only supported on the ``prime_space_action`` path
+        and without ``reflect_parameters``. Default: identity.
 
     Notes
     -----
@@ -1354,6 +1457,10 @@ def make_group_mixture_flow(
         if mode_factor_sizes is not None
         else None
     )
+    if base_reparam_factory is not None:
+        CustomGroupMixtureFlowModel.base_reparam_factory = staticmethod(
+            base_reparam_factory
+        )
     if in_fundamental_domain is not None:
         CustomGroupMixtureFlowModel.in_fundamental_domain = staticmethod(
             in_fundamental_domain

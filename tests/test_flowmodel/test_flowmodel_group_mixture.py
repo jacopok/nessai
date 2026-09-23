@@ -135,6 +135,7 @@ def test_get_model_builds_wrapper():
     model.group_size = GROUP_SIZE
     model.param_names = PARAM_NAMES
     model.in_fundamental_domain = staticmethod(in_fundamental_domain)
+    model.base_reparam_factory = None
     config = {
         "n_inputs": 2,
         "ftype": "realnvp",
@@ -331,6 +332,7 @@ def test_factory_plumbs_mode_factor_sizes(base_flow):
     model.param_names = PARAM_NAMES
     model.in_fundamental_domain = staticmethod(in_fundamental_domain)
     model.mode_factor_sizes = FACTOR_SIZES
+    model.base_reparam_factory = None
     flow = GroupMixtureFlowModel.get_model(
         model,
         {
@@ -1851,3 +1853,194 @@ def test_sampling_with_clustered_group_mixture_flow(tmp_path):
             model.cluster_weights[: int(model._n_active.item())]
             .detach().cpu().numpy().sum(), 1.0)
     assert np.isfinite(fs.log_evidence)
+
+
+# --------------------------------------------------------------------------
+# base_reparam: per-wrapper, data-adaptive bijection before standardisation
+
+
+def _prime_shift(point_dict, modes, inverse=False):
+    return shift_group_action(point_dict, modes, inverse=inverse)
+
+
+class _CircleShift(torch.nn.Module):
+    """``x in [0, 1) -> (x + c) mod 1``: re-chooses the representative on the
+    circle (unit Jacobian); out-of-image inputs to ``inverse`` go to
+    ``x = -5`` (outside the domain). ``update`` switches on (``c = 0.5``) on
+    its first call and reports a frame change exactly then."""
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("_c", torch.zeros(()))
+        self.register_buffer("_on", torch.zeros((), dtype=torch.bool))
+        self.bound_to = None
+
+    def bind(self, names):
+        self.bound_to = list(names)
+
+    def forward(self, t):
+        if not bool(self._on):
+            return t
+        out = t.clone()
+        out[:, 0] = torch.remainder(t[:, 0] + self._c, 1.0)
+        return out
+
+    def inverse(self, t):
+        if not bool(self._on):
+            return t
+        out = t.clone()
+        valid = (t[:, 0] >= 0) & (t[:, 0] < 1)
+        x = torch.remainder(t[:, 0] - self._c, 1.0)
+        out[:, 0] = torch.where(valid, x, torch.full_like(x, -5.0))
+        return out
+
+    def update(self, t):
+        if bool(self._on):
+            return False
+        self._on.fill_(True)
+        self._c.fill_(0.5)
+        return True
+
+
+def _reparam_wrapper(base_flow, **kw):
+    return DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=None,
+        group_size=GROUP_SIZE,
+        param_names=PARAM_NAMES,
+        prime_space_action=_prime_shift,
+        prime_space_in_domain=in_fundamental_domain,
+        base_reparam=_CircleShift(),
+        **kw,
+    )
+
+
+def _wrapped_data(rng, n=2000):
+    # canonical x concentrated across the x = 0 / 1 seam: bimodal in the
+    # default domain, unimodal after the half-period shift.
+    x = np.mod(rng.normal(0.0, 0.08, n), 1.0) + rng.integers(0, GROUP_SIZE, n)
+    y = rng.normal(0.0, 1.0, n)
+    return torch.tensor(np.stack([x, y], axis=1), dtype=torch.float32)
+
+
+def test_base_reparam_requires_prime_space_path(base_flow):
+    with pytest.raises(ValueError, match="prime_space_action"):
+        DiscreteGroupMixtureFlowWrapper(
+            base_flow=base_flow,
+            num_features=2,
+            group_action_fn=shift_group_action,
+            group_size=GROUP_SIZE,
+            param_names=PARAM_NAMES,
+            in_fundamental_domain=in_fundamental_domain,
+            base_reparam=_CircleShift(),
+        )
+
+
+def test_base_reparam_rejects_reflect_parameters(base_flow):
+    with pytest.raises(ValueError, match="reflect_parameters"):
+        _reparam_wrapper(base_flow, reflect_parameters=["y"])
+
+
+def test_base_reparam_bound_and_rebound(base_flow):
+    w = _reparam_wrapper(base_flow)
+    assert w.base_reparam.bound_to == PARAM_NAMES
+    w.set_param_names(["y2", "x2"])
+    assert w.base_reparam.bound_to == ["y2", "x2"]
+
+
+def test_base_reparam_factory_builds_independent_instances():
+    cls = make_group_mixture_flow(
+        _prime_shift,
+        GROUP_SIZE,
+        PARAM_NAMES,
+        prime_space_action=_prime_shift,
+        prime_space_in_domain=in_fundamental_domain,
+        base_reparam_factory=_CircleShift,
+    )
+    fm = cls.__new__(cls)
+    config = {
+        "n_inputs": 2, "ftype": "realnvp", "n_blocks": 2, "n_neurons": 4,
+        "n_layers": 1,
+    }
+    a, b = fm.get_model(config), fm.get_model(config)
+    assert isinstance(a.base_reparam, _CircleShift)
+    assert a.base_reparam is not b.base_reparam
+    assert "base_reparam._c" in a.state_dict()
+
+
+def test_base_reparam_frame_change_resets_flow_and_restandardises(
+    base_flow, rng
+):
+    w = _reparam_wrapper(base_flow)
+    x = _wrapped_data(rng)
+    before = [p.detach().clone() for p in w.base_flow.parameters()]
+    w.update_base_standardisation(x)
+    assert bool(w.base_reparam._on)
+    after = list(w.base_flow.parameters())
+    assert any(not torch.equal(a, b) for a, b in zip(before, after))
+    # standardisation is measured in the reparametrised frame: the shifted
+    # canonical x is unimodal around 0.5 with a small spread.
+    assert w._canon_mean[0].item() == pytest.approx(0.5, abs=0.02)
+    assert w._canon_std[0].item() < 0.12
+    # a second round leaves the frame (and the flow) alone
+    snap = [p.detach().clone() for p in w.base_flow.parameters()]
+    w.update_base_standardisation(x)
+    assert all(
+        torch.equal(a, b) for a, b in zip(snap, w.base_flow.parameters())
+    )
+
+
+def test_base_reparam_standardise_round_trip(base_flow, rng):
+    w = _reparam_wrapper(base_flow)
+    w.update_base_standardisation(_wrapped_data(rng))
+    t = torch.tensor(
+        np.stack([rng.uniform(0, 1, 500), rng.normal(0, 1, 500)], axis=1),
+        dtype=torch.float32,
+    )
+    u = w.canonical_to_standardised(t)
+    back, _ = w._base_to_canon(w._destandardise(u))
+    assert torch.allclose(back, t, atol=1e-5)
+    # the reparam is part of the path: u is centred on the shifted frame
+    assert abs(float(u[:, 0].mean()) - float(
+        ((torch.remainder(t[:, 0] + 0.5, 1.0) - w._canon_mean[0])
+         / w._canon_std[0]).mean())) < 1e-4
+
+
+def test_base_reparam_truncated_sampling_is_consistent(base_flow, rng):
+    """With the reparam active, out-of-image base draws are rejected (not
+    aliased) and the sampler's log q equals log_prob on its own draws."""
+    w = _reparam_wrapper(base_flow)
+    w.update_mixture_weights(_wrapped_data(rng))
+    w.update_base_standardisation(_wrapped_data(rng))
+    # widen the standardised frame so an untrained base flow puts real mass
+    # outside the reparam's image [0, 1)
+    w._canon_std[0] = 0.6
+    w.eval()
+    torch.manual_seed(0)
+    x, log_q = w.sample_and_log_prob(3000)
+    _, _, claimed = w._assign_branch(x)
+    assert claimed.all()
+    lp = w.log_prob(x)
+    assert torch.std(log_q - lp).item() < 1e-3
+    # log Z matches the base mass that lands inside the reparam's image
+    torch.manual_seed(1)
+    u = w.base_flow.sample(20000)
+    canon, _ = w._base_to_canon(w._destandardise(u))
+    emp = w._in_domain(canon).float().mean().item()
+    assert emp < 0.9
+    assert w._log_domain_mass.exp().item() == pytest.approx(emp, abs=0.05)
+
+
+def test_base_reparam_state_carried_over(base_flow, rng):
+    old = _reparam_wrapper(base_flow)
+    old.update_base_standardisation(_wrapped_data(rng))
+    new = _reparam_wrapper(
+        configure_model(
+            {"n_inputs": 2, "ftype": "realnvp", "n_blocks": 2,
+             "n_neurons": 4, "n_layers": 1}
+        )
+    )
+    new._carry_over_group_state(old)
+    assert bool(new.base_reparam._on)
+    assert new.base_reparam._c.item() == pytest.approx(0.5)
