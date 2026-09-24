@@ -1697,6 +1697,11 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         self.freeze_min_size = (
             None if freeze_min_size is None else int(freeze_min_size)
         )
+        # Number of leading rows of the data passed to the next clustering
+        # that are unique live points; boundary inversion with duplication
+        # appends mirror copies after them.  Set by the proposal around
+        # ``check_state``; ``None`` treats every row as unique.
+        self.n_unique_rows = None
         # Draw / score the experts with weights proportional to the prior
         # mass of each one's support (estimated after every populate by
         # :meth:`update_proposal_weights`) instead of the live-point
@@ -2358,7 +2363,14 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
                 self.cluster_weights.div_(self.cluster_weights.sum())
             self._n_active.fill_(k)
             self._clustering_seen.fill_(True)
-            self._update_frozen(counts[:k])
+            n_u = self.n_unique_rows
+            if n_u is not None and 0 < n_u < n:
+                counts_unique = np.bincount(
+                    labels[:n_u], minlength=self.n_experts
+                ).astype(float)
+            else:
+                counts_unique = counts
+            self._update_frozen(counts_unique[:k])
 
         lab_t = torch.as_tensor(labels, device=x.device, dtype=torch.long)
         self._cluster_cache = (key, lab_t)
@@ -2366,9 +2378,10 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         return lab_t
 
     def _update_frozen(self, counts):
-        """Freeze an expert once its routed population drops below
-        :attr:`freeze_min_size`; thaw it if the population recovers to twice
-        that.  Only at ``k >= 2`` and outside a pending split."""
+        """Freeze an expert once its routed population of unique live points
+        drops below :attr:`freeze_min_size`; thaw it if the population
+        recovers to twice that.  Only at ``k >= 2`` and outside a pending
+        split."""
         if (
             self.freeze_min_size is None
             or len(counts) < 2
@@ -2380,16 +2393,16 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             if not frozen and n_j < self.freeze_min_size:
                 self._frozen[j] = True
                 logger.info(
-                    "Clustered group mixture: expert %d frozen at %d routed "
-                    "points (< %d): no further retraining, kept until its "
+                    "Clustered group mixture: expert %d frozen at %d unique "
+                    "routed points (< %d): no further retraining, kept until its "
                     "population is gone",
                     j, int(n_j), self.freeze_min_size,
                 )
             elif frozen and n_j >= 2 * self.freeze_min_size:
                 self._frozen[j] = False
                 logger.info(
-                    "Clustered group mixture: expert %d thawed at %d routed "
-                    "points", j, int(n_j),
+                    "Clustered group mixture: expert %d thawed at %d unique "
+                    "routed points", j, int(n_j),
                 )
 
     def is_frozen(self, j):
@@ -2909,8 +2922,18 @@ class GroupFlowProposalMixin:
         # the current data: the base flow is then never asked to score a
         # point that sits in a (currently) zero-weight element.
         x_prime = self._training_data_as_prime_tensor(x)
-        model.update_mixture_weights(x_prime)
-        model.update_base_standardisation(x_prime)
+        # Rescaling may append mirror copies (boundary inversion with
+        # duplication) after the ``len(x)`` original rows; the freeze
+        # threshold counts unique live points only.
+        has_unique = hasattr(model, "n_unique_rows")
+        if has_unique:
+            model.n_unique_rows = len(x)
+        try:
+            model.update_mixture_weights(x_prime)
+            model.update_base_standardisation(x_prime)
+        finally:
+            if has_unique:
+                model.n_unique_rows = None
         self._log_group_weight_entropy()
         self._dump_base_flow_input_stats(x_prime, "PRE")
 

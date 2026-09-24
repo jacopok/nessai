@@ -2090,6 +2090,19 @@ def test_freeze_min_size_freezes_and_thaws():
     assert not w.is_frozen(j)
 
 
+@pytest.mark.parametrize("n_unique, frozen", [(None, False), (800, True)])
+def test_freeze_counts_unique_rows(n_unique, frozen):
+    # Duplicated rows (boundary inversion) double the small cluster's routed
+    # count to 120 >= 100; only its 60 unique rows should count.
+    w = _clustered_wrapper(2, freeze_min_size=100, max_cluster_overlap=0.1)
+    rng = np.random.default_rng(0)
+    data = _lopsided(800, 60, rng)
+    w.n_unique_rows = n_unique
+    _split_then(w, rng, torch.cat([data, data]))
+    assert int(w._n_active.item()) == 2
+    assert w.is_frozen(_small_expert(w, data)) is frozen
+
+
 def test_freeze_off_by_default():
     w = _clustered_wrapper(2, max_cluster_overlap=0.1)
     rng = np.random.default_rng(0)
@@ -2165,7 +2178,9 @@ def _k2(w, weights=(0.5, 0.5)):
 def test_update_proposal_weights_is_mean_responsibility():
     w = _k2(_clustered_wrapper(2, importance_weights=True), (0.9, 0.1))
     x = points_in_element(0, 400, np.random.default_rng(2))
-    w.update_proposal_weights(x)
+    # min_points=1: the responsibility split depends on the random flow
+    # initialisation, so an expert may otherwise get < 50 effective points
+    w.update_proposal_weights(x, min_points=1)
     # the experts' element weights are updated first; the expert weights are
     # the mean responsibility under the updated experts
     assert all(bool(e._proposal_weights_seen) for e in w.experts)
