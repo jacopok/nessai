@@ -186,6 +186,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         canonical_transform=None,
         mode_factor_sizes=None,
         base_reparam=None,
+        importance_weights=False,
     ):
         super().__init__()
         self.base_flow = base_flow
@@ -301,6 +302,31 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         self.register_buffer(
             "weights", torch.full((group_size,), 1.0 / group_size)
         )
+        # Weights of the generative / density path when
+        # ``importance_weights`` is set: each element's share of the prior
+        # mass of the proposal's support, estimated from the populated pool
+        # by :meth:`update_proposal_weights`.  ``weights`` (the live-point
+        # fractions) still decides which elements are active.  Rejection
+        # sampling is exact for any weights, so this only changes the
+        # efficiency: every element's support is a copy of the same base
+        # flow, so an element holding few live points has a support as large
+        # as a well-populated one, and at its (small) live-point weight it
+        # sets the rejection bound for all the others.
+        self.importance_weights = bool(importance_weights)
+        self.register_buffer(
+            "_proposal_weights", torch.full((group_size,), 1.0 / group_size)
+        )
+        self.register_buffer(
+            "_proposal_weights_seen", torch.zeros((), dtype=torch.bool)
+        )
+        # Per-element pool mass accumulated over every populate since the
+        # last :meth:`update_mixture_weights` (i.e. since the last retrain;
+        # the flow, and so its support, is fixed in between) and the pool
+        # size it came from.
+        self.register_buffer("_pool_mass", torch.zeros(group_size))
+        self.register_buffer("_pool_n", torch.zeros(()))
+        # Summary of the latest importance estimate, logged at retrain.
+        self._last_importance_summary = None
 
         # Optional factorisation of the group into commuting cyclic factors
         # (``mode_factor_sizes = [s_0, ..., s_{F-1}]``, ``prod = group_size``),
@@ -441,6 +467,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             return
         with torch.no_grad():
             self.weights.copy_(old.weights)
+            self._proposal_weights.copy_(old._proposal_weights)
+            self._proposal_weights_seen.copy_(old._proposal_weights_seen)
             self._empty_rounds.copy_(old._empty_rounds)
             if (
                 self._factor_empty_rounds is not None
@@ -831,6 +859,10 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         per factor *value*, so a starved joint mode is only zeroed when a
         whole marginal slice empties -- a much rarer event.
         """
+        # a new training round: the flow's support changes, so the pool mass
+        # accumulated for the importance weights starts over
+        self._pool_mass.zero_()
+        self._pool_n.zero_()
         assigned, _, claimed = self._assign_branch(x)
         a = assigned[claimed]
 
@@ -895,6 +927,108 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 ),
             )
 
+    @property
+    def proposal_weights(self):
+        """Element weights of the generative / density path.
+
+        The live-point fractions ``weights`` unless ``importance_weights`` is
+        set and an estimate exists; then the importance estimates restricted
+        to the elements ``weights`` keeps active.  An element that has just
+        (re)gained live points, and so has no estimate yet, enters at its
+        live-point weight until the next pool measures it.
+        """
+        if not (self.importance_weights and bool(self._proposal_weights_seen)):
+            return self.weights
+        active = self.weights > 0
+        pw = torch.where(
+            active & (self._proposal_weights <= 0),
+            self.weights,
+            torch.where(
+                active, self._proposal_weights,
+                torch.zeros_like(self._proposal_weights),
+            ),
+        )
+        total = pw.sum()
+        if not bool(total > 0):
+            return self.weights
+        return pw / total
+
+    @torch.no_grad()
+    def update_proposal_weights(
+        self, x, sample_weights=None, floor=1e-4, min_points=50
+    ):
+        """Set the element proposal weights to each element's share of the
+        prior mass of the proposal's support, estimated from the pools.
+
+        The pool ``x`` (prime space) is the prior restricted to the
+        proposal's support, so the (``sample_weights``-weighted)
+        responsibility of element ``g`` summed over it estimates the prior
+        mass of ``g``'s copy of the support.  Weights proportional to it
+        equalise the importance weights across elements.  ``sample_weights``
+        restricts the estimate to the part of the pool this wrapper is
+        responsible for (the expert responsibilities of a clustered mixture).
+
+        The masses are summed over every pool since the last retrain (the
+        support is fixed in between), and with ``mode_factor_sizes`` the
+        weights are the product of the per-factor marginals of that mass,
+        exactly as for the live-point weights of
+        :meth:`update_mixture_weights`.  Until the accumulated (effective)
+        pool size reaches ``min_points`` the previous estimate is kept.
+        """
+        if not self.importance_weights or x.shape[0] == 0:
+            return
+        lps = self._branch_log_probs(x)
+        total = torch.logsumexp(lps, dim=0)
+        ok = torch.isfinite(total)
+        sw = (
+            torch.ones(x.shape[0], dtype=lps.dtype, device=lps.device)
+            if sample_weights is None
+            else sample_weights.to(lps)
+        )[ok]
+        resp = torch.exp(lps[:, ok] - total[ok])
+        self._pool_mass.add_((resp * sw).sum(dim=1).to(self._pool_mass))
+        self._pool_n.add_(float(sw.sum()))
+        n_eff = float(self._pool_n)
+        if n_eff < min_points:
+            return
+        mass = self._pool_mass / n_eff
+        active = self.weights > 0
+        if self.mode_factor_sizes is not None:
+            log_w = torch.zeros_like(mass)
+            for f, size in enumerate(self.mode_factor_sizes):
+                fac_of_mode = self._mode_factor_index[:, f]
+                m_f = torch.zeros(size, dtype=mass.dtype, device=mass.device)
+                m_f.index_add_(0, fac_of_mode, mass)
+                if not bool(m_f.sum() > 0):
+                    return
+                m_f = m_f / m_f.sum()
+                log_w = log_w + torch.log(m_f[fac_of_mode].clamp_min(1e-300))
+            share = torch.softmax(log_w, dim=0)
+        else:
+            share = mass
+        share = torch.where(
+            active, share.clamp_min(floor), torch.zeros_like(share)
+        )
+        if not bool(share.sum() > 0):
+            return
+        share = share / share.sum()
+        self._proposal_weights.copy_(share.to(self._proposal_weights))
+        self._proposal_weights_seen.fill_(True)
+
+        def _ent(p):
+            p = p[p > 0]
+            return float(-(p * torch.log2(p)).sum())
+
+        ratio = share[active] / self.weights[active]
+        self._last_importance_summary = dict(
+            n_pool=n_eff,
+            entropy=_ent(share),
+            entropy_live=_ent(self.weights),
+            n_active=int(active.sum()),
+            ratio_min=float(ratio.min()),
+            ratio_max=float(ratio.max()),
+        )
+
     def _branch_log_probs(self, x, context=None):
         """Return ``base_lp(g_k^-1 x) + log pi_k`` for every group element: ``[K, B]``.
 
@@ -906,7 +1040,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         """
         k, b = self.group_size, x.shape[0]
         pre, conj_logdet = self._preimages(x)
-        log_pi = torch.log(self.weights).unsqueeze(1).expand(k, b)
+        log_pi = torch.log(self.proposal_weights).unsqueeze(1).expand(k, b)
         flat_pre = pre.reshape(k * b, -1)
         flat_modes = torch.arange(k, device=x.device).repeat_interleave(b)
         flat_conj = conj_logdet.reshape(k * b)
@@ -998,7 +1132,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         """
         base_lp = self._base_log_prob(canon, modes, context=context)
         log_q = (
-            torch.log(self.weights[modes])
+            torch.log(self.proposal_weights[modes])
             + base_lp
             + self._canon_log_det(modes)
             + conj_logdet
@@ -1060,7 +1194,9 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         if self._truncate:
             return self._sample_and_log_prob_truncated(num_samples, context)
         u = self.base_flow.sample(num_samples, context=context)
-        modes = Categorical(probs=self.weights).sample((num_samples,))
+        modes = Categorical(probs=self.proposal_weights).sample(
+            (num_samples,)
+        )
         t = self._fold_reflect(self._destandardise(u, modes))
         canon, _ = self._base_to_canon(t)
         x, fwd_logdet = self._apply_group_action(
@@ -1096,7 +1232,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 )
             n_draw = int(math.ceil(need / z_guess * 1.3)) + 32
             u = self.base_flow.sample(n_draw, context=context)
-            modes = Categorical(probs=self.weights).sample((n_draw,))
+            modes = Categorical(probs=self.proposal_weights).sample((n_draw,))
             t = self._fold_reflect(self._destandardise(u, modes))
             canon, _ = self._base_to_canon(t)
             in_dom = self._in_domain(canon)
@@ -1160,7 +1296,9 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         # Jacobian: the *physical* group action is assumed measure
         # preserving, and the prime-space conjugation Jacobian is carried in
         # ``fwd_logdet``.
-        modes = Categorical(probs=self.weights).sample((z.shape[0],))
+        modes = Categorical(probs=self.proposal_weights).sample(
+            (z.shape[0],)
+        )
 
         u, _ = self.base_flow.inverse(z, context=context)
         t = self._fold_reflect(self._destandardise(u, modes))
@@ -1226,6 +1364,8 @@ class GroupMixtureFlowModel(FlowModel):
     #: Zero-argument callable building a fresh ``base_reparam`` module for
     #: each wrapper (so every expert owns independent state), or ``None``.
     base_reparam_factory = None
+    #: See :class:`DiscreteGroupMixtureFlowWrapper` ``importance_weights``.
+    importance_weights = False
 
     def initialise(self):
         """Initialise the model and optimiser via :meth:`get_model`."""
@@ -1324,6 +1464,7 @@ class GroupMixtureFlowModel(FlowModel):
             base_reparam=(
                 base_reparam_factory() if base_reparam_factory else None
             ),
+            importance_weights=bool(getattr(self, "importance_weights", False)),
         )
 
 
@@ -1340,6 +1481,7 @@ def make_group_mixture_flow(
     canonical_transform=None,
     mode_factor_sizes=None,
     base_reparam_factory=None,
+    importance_weights=False,
 ):
     """Factory constructing a ``GroupMixtureFlowModel`` bound to a specific group.
 
@@ -1428,6 +1570,13 @@ def make_group_mixture_flow(
         frame, refit every round and owned separately by each expert of a
         clustered mixture. Only supported on the ``prime_space_action`` path
         and without ``reflect_parameters``. Default: identity.
+    importance_weights : bool, optional
+        Draw / score the group elements with weights proportional to the
+        prior mass of each element's copy of the proposal support, re-estimated
+        from every populated pool
+        (:meth:`~DiscreteGroupMixtureFlowWrapper.update_proposal_weights`),
+        instead of the live-point fractions. The live-point fractions still
+        decide which elements are active. Default ``False``.
 
     Notes
     -----
@@ -1452,6 +1601,7 @@ def make_group_mixture_flow(
         list(reflect_parameters) if reflect_parameters else None
     )
     CustomGroupMixtureFlowModel.canonical_transform = canonical_transform
+    CustomGroupMixtureFlowModel.importance_weights = bool(importance_weights)
     CustomGroupMixtureFlowModel.mode_factor_sizes = (
         [int(s) for s in mode_factor_sizes]
         if mode_factor_sizes is not None
@@ -1534,9 +1684,27 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         centroid_ema=None,
         bg_expert=None,
         bg_weight=0.0,
+        freeze_min_size=None,
+        importance_weights=False,
     ):
         super().__init__()
         self.experts = torch.nn.ModuleList(experts)
+        # An expert whose routed population drops below this is frozen: no
+        # retraining, re-standardisation or group-weight update, but it keeps
+        # proposing until its population is gone.  A flow fitted to a few
+        # dozen points is far broader than their contour, and its draws then
+        # dominate the (prior-restricted) pool.  ``None`` disables it.
+        self.freeze_min_size = (
+            None if freeze_min_size is None else int(freeze_min_size)
+        )
+        # Draw / score the experts with weights proportional to the prior
+        # mass of each one's support (estimated after every populate by
+        # :meth:`update_proposal_weights`) instead of the live-point
+        # fractions.  Rejection sampling is exact for any weights, so this
+        # only changes efficiency: it stops an expert whose support is broad
+        # relative to its live population from setting the rejection bound
+        # for all the others.
+        self.importance_weights = bool(importance_weights)
         self.n_experts = len(experts)
         # Optional always-on "background" expert: a full group-mixture flow
         # trained every round on *all* the data (not routed), blended into the
@@ -1550,6 +1718,10 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             "_bg_weight", torch.tensor(float(bg_weight))
         )
         self.register_buffer("_bg_seen", torch.zeros((), dtype=torch.bool))
+        # one switch for both levels: the experts' group-element weights
+        # follow the same rule as the expert weights
+        for e in self._all_experts():
+            e.importance_weights = self.importance_weights
         self.num_features = int(num_features)
         self.group_size = experts[0].group_size
         self.cluster_method = cluster_method
@@ -1601,6 +1773,17 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         self.register_buffer(
             "_pending_split_train", torch.zeros((), dtype=torch.bool)
         )
+        self.register_buffer(
+            "_frozen", torch.zeros(self.n_experts, dtype=torch.bool)
+        )
+        self.register_buffer("_proposal_weights", w0.clone())
+        self.register_buffer(
+            "_proposal_weights_seen", torch.zeros((), dtype=torch.bool)
+        )
+        self._last_importance_summary = None
+        # Set by a ``_k_want`` override to apply its answer this round,
+        # bypassing the k hysteresis (e.g. an expert with no points left).
+        self._k_now = False
         self._cluster_cache = None  # (data_ptr, n, labels tensor)
 
     # -- pass-throughs the proposal / diagnostics expect ----------------
@@ -1671,8 +1854,12 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             return
         if len(self.experts) != len(old.experts):
             return
-        for new_e, old_e in zip(self.experts, old.experts):
+        for j, (new_e, old_e) in enumerate(zip(self.experts, old.experts)):
             new_e._carry_over_group_state(old_e)
+            if bool(old._frozen[j]):
+                # a frozen expert is never retrained, so a reset must not
+                # discard its flow: carry it over whole
+                new_e.load_state_dict(old_e.state_dict())
         if self._bg_expert is not None and old._bg_expert is not None:
             self._bg_expert._carry_over_group_state(old._bg_expert)
         with torch.no_grad():
@@ -1686,6 +1873,9 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             self._clustering_seen.copy_(old._clustering_seen)
             self._pending_split_train.copy_(old._pending_split_train)
             self._bg_seen.copy_(old._bg_seen)
+            self._frozen.copy_(old._frozen)
+            self._proposal_weights.copy_(old._proposal_weights)
+            self._proposal_weights_seen.copy_(old._proposal_weights_seen)
 
     # -- routing --------------------------------------------------------
     def _fold_to_base(self, x):
@@ -1762,11 +1952,20 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             fg_log_prob + math.log1p(-w), bg + math.log(w)
         )
 
+    @property
+    def proposal_weights(self):
+        """Weights of the generative / density path: the importance
+        estimates once available (see :attr:`importance_weights`), else the
+        live-point fractions ``cluster_weights``."""
+        if self.importance_weights and bool(self._proposal_weights_seen):
+            return self._proposal_weights
+        return self.cluster_weights
+
     def log_prob(self, x, context=None):
         act = self._active()
         if act == 1:
             return self.experts[0].log_prob(x, context=context)
-        lw = torch.log(self.cluster_weights[:act].clamp_min(1e-38))
+        lw = torch.log(self.proposal_weights[:act].clamp_min(1e-38))
         lps = torch.stack(
             [
                 self.experts[j].log_prob(x, context=context) + lw[j]
@@ -1785,9 +1984,75 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     # -- generative --------------------------------------------------
     def _draw_assignments(self, n, device):
         act = self._active()
-        w = self.cluster_weights[:act]
+        w = self.proposal_weights[:act]
         return torch.multinomial(w / w.sum(), int(n), replacement=True).to(
             device
+        )
+
+    @torch.no_grad()
+    def update_proposal_weights(self, x, floor=1e-4, min_points=50):
+        """Set the proposal weights to each expert's share of the prior mass
+        of the mixture's support, estimated from a freshly populated pool.
+
+        The pool ``x`` (prime space) is the prior restricted to the
+        proposal's support, so the mean responsibility of expert ``j`` over
+        it estimates ``int p r_j / int p``, the prior mass attributable to
+        ``j``.  Weights proportional to it equalise the importance weights
+        across experts (no expert sets the rejection bound for the others).
+        Iterated round to round this is the fixed point ``w_j ∝ int p r_j``.
+
+        Each expert's group-element weights are updated first, the same way
+        (:meth:`DiscreteGroupMixtureFlowWrapper.update_proposal_weights`),
+        on the pool weighted by that expert's responsibility; the expert
+        responsibilities are then recomputed with them.
+        """
+        if not self.importance_weights or x.shape[0] < min_points:
+            return
+        act = self._active()
+        if self._bg_on():
+            # the background expert covers all the data: the whole pool
+            self._bg_expert.update_proposal_weights(
+                x, floor=floor, min_points=min_points
+            )
+        if act < 2:
+            self.experts[0].update_proposal_weights(
+                x, floor=floor, min_points=min_points
+            )
+            return
+
+        def _resp():
+            lw = torch.log(self.proposal_weights[:act].clamp_min(1e-38))
+            lps = torch.stack(
+                [self.experts[j].log_prob(x) + lw[j] for j in range(act)],
+                dim=0,
+            )
+            total = torch.logsumexp(lps, dim=0)
+            ok = torch.isfinite(total)
+            r = torch.zeros_like(lps)
+            r[:, ok] = torch.exp(lps[:, ok] - total[ok])
+            return r, ok
+
+        r, ok = _resp()
+        if int(ok.sum()) < min_points:
+            return
+        for j in range(act):
+            self.experts[j].update_proposal_weights(
+                x, sample_weights=r[j], floor=floor, min_points=min_points
+            )
+        r, ok = _resp()
+        if int(ok.sum()) < min_points:
+            return
+        resp = r[:, ok].mean(dim=1)
+        resp = resp.clamp_min(floor)
+        resp = resp / resp.sum()
+        self._proposal_weights.zero_()
+        self._proposal_weights[:act] = resp.to(self._proposal_weights.dtype)
+        self._proposal_weights_seen.fill_(True)
+        # logged at the next retrain (``_log_group_weight_entropy``)
+        self._last_importance_summary = dict(
+            weights=np.round(resp.cpu().numpy(), 4).tolist(),
+            live=np.round(self.cluster_weights[:act].cpu().numpy(), 4).tolist(),
+            n_pool=int(ok.sum()),
         )
 
     def sample_and_log_prob(self, num_samples, context=None):
@@ -1978,10 +2243,13 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         ts = (t - mu) / sd
 
         k_cur = int(self._n_active.item())
+        self._k_now = False
         k_want = self._k_want(t, ts, mu, sd)
 
-        if not bool(self._clustering_seen):
+        if not bool(self._clustering_seen) or self._k_now:
             k = k_want
+            self._k_shrink_streak.zero_()
+            self._k_grow_streak.zero_()
         elif k_want > k_cur:
             self._k_grow_streak += 1
             self._k_shrink_streak.zero_()
@@ -2081,17 +2349,51 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             )
             if not bool(self._clustering_seen) or k != k_cur:
                 self.cluster_weights.copy_(w)
+                self._proposal_weights.copy_(w)
+                self._proposal_weights_seen.fill_(False)
+                self._frozen.zero_()
             else:
                 beta = self.weight_ema
                 self.cluster_weights.mul_(1 - beta).add_(beta * w)
                 self.cluster_weights.div_(self.cluster_weights.sum())
             self._n_active.fill_(k)
             self._clustering_seen.fill_(True)
+            self._update_frozen(counts[:k])
 
         lab_t = torch.as_tensor(labels, device=x.device, dtype=torch.long)
         self._cluster_cache = (key, lab_t)
         self._log_cluster_round(k, k_cur, k_want, labels)
         return lab_t
+
+    def _update_frozen(self, counts):
+        """Freeze an expert once its routed population drops below
+        :attr:`freeze_min_size`; thaw it if the population recovers to twice
+        that.  Only at ``k >= 2`` and outside a pending split."""
+        if (
+            self.freeze_min_size is None
+            or len(counts) < 2
+            or bool(self._pending_split_train.item())
+        ):
+            return
+        for j, n_j in enumerate(counts):
+            frozen = bool(self._frozen[j])
+            if not frozen and n_j < self.freeze_min_size:
+                self._frozen[j] = True
+                logger.info(
+                    "Clustered group mixture: expert %d frozen at %d routed "
+                    "points (< %d): no further retraining, kept until its "
+                    "population is gone",
+                    j, int(n_j), self.freeze_min_size,
+                )
+            elif frozen and n_j >= 2 * self.freeze_min_size:
+                self._frozen[j] = False
+                logger.info(
+                    "Clustered group mixture: expert %d thawed at %d routed "
+                    "points", j, int(n_j),
+                )
+
+    def is_frozen(self, j):
+        return bool(self._frozen[j]) and self._n_active_experts() >= 2
 
     # -- clustering strategy hooks (overridable) --------------------------
     def _k_want(self, t, ts, mu, sd):
@@ -2284,6 +2586,8 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             # pre-split single flow); the new experts bootstrap on their
             # cluster so the next training can specialise them in the right
             # frame.
+            if self.is_frozen(j):
+                continue
             xj = x if (pending and j == 0) else x[labels == j]
             if xj.shape[0]:
                 self.experts[j].update_mixture_weights(
@@ -2300,6 +2604,8 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         labels = self._cluster(x)
         pending = bool(self._pending_split_train.item())
         for j in range(self._n_active_experts()):
+            if self.is_frozen(j):
+                continue
             xj = x if (pending and j == 0) else x[labels == j]
             if xj.shape[0]:
                 self.experts[j].update_base_standardisation(
@@ -2320,6 +2626,10 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
     k_shrink_patience = 3
     k_grow_patience = 2
     centroid_ema = None
+    #: See :class:`ClusteredGroupMixtureFlowWrapper` ``freeze_min_size`` /
+    #: ``importance_weights``.
+    freeze_min_size = None
+    importance_weights = False
     # Weight of an always-on background expert (trained on all data, blended in
     # at ``k >= 2``).  0 -> no background expert (default; byte-identical to the
     # plain clustered mixture).
@@ -2372,6 +2682,13 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
         try:
             for j in range(k):
                 sub = np.ascontiguousarray(samples[labels == j])
+                if model.is_frozen(j):
+                    logger.info(
+                        "Clustered group mixture: expert %d frozen (%d "
+                        "routed points) -- not retrained",
+                        j, sub.shape[0],
+                    )
+                    continue
                 if sub.shape[0] < 2:
                     logger.warning(
                         "Clustered group mixture: expert %d has %d routed "
@@ -2447,6 +2764,8 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
             centroid_ema=getattr(self, "centroid_ema", None),
             bg_expert=bg_expert,
             bg_weight=bg_weight,
+            freeze_min_size=getattr(self, "freeze_min_size", None),
+            importance_weights=getattr(self, "importance_weights", False),
         )
 
 
@@ -2460,6 +2779,8 @@ def make_clustered_group_mixture_flow(
     k_grow_patience=2,
     centroid_ema=None,
     bg_weight=0.0,
+    freeze_min_size=None,
+    importance_weights=False,
     **kwargs,
 ):
     """:func:`make_group_mixture_flow` with a clustered base flow.
@@ -2476,8 +2797,14 @@ def make_clustered_group_mixture_flow(
     (``k_grow_patience`` / ``k_shrink_patience`` consecutive rounds).  The
     clustering is warm-started from the previous round and the cluster<->expert
     identity is held by centroid matching + ``centroid_ema`` smoothing, so
-    routing does not jitter round to round.  All other keyword arguments are
-    passed straight through.
+    routing does not jitter round to round.
+
+    ``freeze_min_size``: an expert whose routed population falls below this
+    stops being retrained (and re-standardised) but keeps proposing until its
+    population reaches zero.  ``importance_weights``: draw the experts with
+    weights proportional to the prior mass of their supports, re-estimated
+    after every populate, instead of the live-point fractions.  All other
+    keyword arguments are passed straight through.
     """
     base_cls = make_group_mixture_flow(**kwargs)
 
@@ -2494,6 +2821,10 @@ def make_clustered_group_mixture_flow(
         None if centroid_ema is None else float(centroid_ema)
     )
     ClusteredCustom.bg_weight = float(bg_weight)
+    ClusteredCustom.freeze_min_size = (
+        None if freeze_min_size is None else int(freeze_min_size)
+    )
+    ClusteredCustom.importance_weights = bool(importance_weights)
     return ClusteredCustom
 
 
@@ -2555,6 +2886,18 @@ class GroupFlowProposalMixin:
         return torch.as_tensor(
             arr, dtype=model.weights.dtype, device=model.weights.device
         )
+
+    def populate(self, worst_point, *args, **kwargs):
+        super().populate(worst_point, *args, **kwargs)
+        model = getattr(self.flow, "model", None)
+        if (
+            getattr(model, "importance_weights", False)
+            and getattr(self, "samples", None) is not None
+            and len(self.samples)
+        ):
+            model.update_proposal_weights(
+                self._training_data_as_prime_tensor(self.samples)
+            )
 
     def check_state(self, x):
         super().check_state(x)
@@ -2707,6 +3050,41 @@ class GroupFlowProposalMixin:
             counts.to(torch.long).tolist(),
         )
 
+    @staticmethod
+    def _log_importance_summaries(flow_model):
+        """Log the importance-weight estimates the populates since the last
+        retrain produced (once per retrain, not per populate)."""
+        s = getattr(flow_model, "_last_importance_summary", None)
+        if s is not None and "live" in s:
+            logger.info(
+                "Clustered group mixture: importance expert weights %s "
+                "(live-point weights %s) from %d pool points",
+                s["weights"], s["live"], s["n_pool"],
+            )
+        experts = getattr(flow_model, "experts", None)
+        if experts is None:
+            parts = [("", flow_model)]
+        else:
+            parts = [
+                (f" expert {j}", experts[j])
+                for j in range(flow_model._n_active_experts())
+            ]
+            if getattr(flow_model, "_bg_on", lambda: False)():
+                parts.append((" (background)", flow_model._bg_expert))
+        for tag, e in parts:
+            s = getattr(e, "_last_importance_summary", None)
+            if s is None:
+                continue
+            logger.info(
+                "Group mixture%s: importance element weights from %.0f pool "
+                "points; entropy %.3f bits (live-point weights %.3f, uniform "
+                "over %d active %.3f); importance/live-point weight ratio "
+                "%.3g..%.3g",
+                tag, s["n_pool"], s["entropy"], s["entropy_live"],
+                s["n_active"], math.log2(max(s["n_active"], 1)),
+                s["ratio_min"], s["ratio_max"],
+            )
+
     def _log_group_weight_entropy(self):
         flow_model = getattr(self.flow, "model", None)
         p = getattr(flow_model, "weights", None)
@@ -2740,6 +3118,7 @@ class GroupFlowProposalMixin:
 
         if not logger.isEnabledFor(logging.INFO):
             return
+        self._log_importance_summaries(flow_model)
         p = p.detach()
         entropy = float(-(p * torch.log2(p.clamp_min(1e-12))).sum())
         n = p.numel()

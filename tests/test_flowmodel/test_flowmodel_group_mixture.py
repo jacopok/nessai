@@ -2,7 +2,8 @@
 Test the discrete group-mixture flow model.
 """
 
-from unittest.mock import create_autospec
+import logging
+from unittest.mock import MagicMock, create_autospec
 
 import numpy as np
 import pytest
@@ -2044,3 +2045,478 @@ def test_base_reparam_state_carried_over(base_flow, rng):
     new._carry_over_group_state(old)
     assert bool(new.base_reparam._on)
     assert new.base_reparam._c.item() == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Dying clusters: freezing and importance-estimated proposal weights
+# ---------------------------------------------------------------------------
+def _lopsided(n, n_small, rng):
+    """Folded data with a big blob at y=+3 and a small one (n_small) at -3."""
+    y = np.concatenate([rng.normal(3, 0.4, n - n_small),
+                        rng.normal(-3, 0.4, n_small)])
+    return torch.tensor(
+        np.stack([rng.uniform(0, 1, n), y], 1), dtype=torch.float32
+    )
+
+
+def _split_then(w, rng, data):
+    """Activate k=2 on balanced data, finish the pending split, then run one
+    clustering round on ``data``."""
+    w._cluster(_bimodal(800, rng))
+    assert int(w._n_active.item()) == 2
+    w.finalise()
+    w._cluster(data)
+    return w._route(data).numpy()
+
+
+def _small_expert(w, data):
+    r = w._route(data).numpy()
+    y = data[:, 1].numpy()
+    return int(np.argmin([y[r == 0].mean(), y[r == 1].mean()]))
+
+
+def test_freeze_min_size_freezes_and_thaws():
+    w = _clustered_wrapper(2, freeze_min_size=100, max_cluster_overlap=0.1)
+    rng = np.random.default_rng(0)
+    data = _lopsided(800, 40, rng)
+    _split_then(w, rng, data)
+    assert int(w._n_active.item()) == 2
+    j = _small_expert(w, data)
+    assert w.is_frozen(j) and not w.is_frozen(1 - j)
+    # still frozen at 150 (< 2 x 100), thawed at 300
+    w._cluster(_lopsided(800, 150, rng))
+    assert w.is_frozen(j)
+    w._cluster(_lopsided(800, 300, rng))
+    assert not w.is_frozen(j)
+
+
+def test_freeze_off_by_default():
+    w = _clustered_wrapper(2, max_cluster_overlap=0.1)
+    rng = np.random.default_rng(0)
+    _split_then(w, rng, _lopsided(800, 40, rng))
+    assert not bool(w._frozen.any())
+
+
+def test_frozen_expert_keeps_its_standardisation_and_group_weights():
+    w = _clustered_wrapper(2, freeze_min_size=100, max_cluster_overlap=0.1)
+    rng = np.random.default_rng(1)
+    data = _lopsided(800, 40, rng)
+    _split_then(w, rng, data)
+    w.update_base_standardisation(data)
+    j = _small_expert(w, data)
+    assert w.is_frozen(j)
+    mean_j = w.experts[j]._canon_mean.clone()
+    gw_j = w.experts[j].weights.clone()
+    mean_o = w.experts[1 - j]._canon_mean.clone()
+    moved = data.clone()
+    moved[:, 1] += 0.5
+    w.update_mixture_weights(moved)
+    w.update_base_standardisation(moved)
+    assert torch.equal(w.experts[j]._canon_mean, mean_j)
+    assert torch.equal(w.experts[j].weights, gw_j)
+    assert not torch.equal(w.experts[1 - j]._canon_mean, mean_o)
+
+
+_ClusteredFreezeFlowModel = make_clustered_group_mixture_flow(
+    n_clusters_max=2, min_cluster_size=10, max_cluster_overlap=0.15,
+    k_grow_patience=1, freeze_min_size=100,
+    group_action_fn=shift_group_action, group_size=N_PERIODS,
+    param_names=["x", "y"], in_fundamental_domain=in_fundamental_domain,
+)
+
+
+def test_frozen_expert_is_not_retrained(tmp_path):
+    fm = _ClusteredFreezeFlowModel(
+        flow_config={"n_inputs": 2, "model": "realnvp", "n_blocks": 2,
+                     "n_neurons": 8},
+        training_config={"max_epochs": 5, "patience": 5, "batch_size": 200},
+        output=str(tmp_path),
+    )
+    fm.initialise()
+    model = fm.model
+    assert model.freeze_min_size == 100
+    rng = np.random.default_rng(0)
+    model.update_mixture_weights(_bimodal(1200, rng))
+    model.finalise()
+    data = _lopsided(1200, 50, rng)
+    model.update_mixture_weights(data)
+    model.update_base_standardisation(data)
+    j = _small_expert(model, data)
+    assert model.is_frozen(j)
+    before = [{k: v.clone() for k, v in e.base_flow.state_dict().items()}
+              for e in model.experts]
+    history = fm.train(data.numpy())
+    assert len(history["loss"]) == 1
+    after = [e.base_flow.state_dict() for e in model.experts]
+    assert all(torch.equal(after[j][k], before[j][k]) for k in before[j])
+    assert any(not torch.equal(after[1 - j][k], before[1 - j][k])
+               for k in before[1 - j])
+
+
+def _k2(w, weights=(0.5, 0.5)):
+    with torch.no_grad():
+        w._n_active.fill_(2)
+        w._clustering_seen.fill_(True)
+        w.cluster_weights.copy_(torch.tensor(weights))
+        w._centroids[:2].copy_(torch.tensor([[0.0, -2.0], [0.0, 2.0]]))
+    return w
+
+
+def test_update_proposal_weights_is_mean_responsibility():
+    w = _k2(_clustered_wrapper(2, importance_weights=True), (0.9, 0.1))
+    x = points_in_element(0, 400, np.random.default_rng(2))
+    w.update_proposal_weights(x)
+    # the experts' element weights are updated first; the expert weights are
+    # the mean responsibility under the updated experts
+    assert all(bool(e._proposal_weights_seen) for e in w.experts)
+    lps = torch.stack([w.experts[0].log_prob(x) + np.log(0.9),
+                       w.experts[1].log_prob(x) + np.log(0.1)])
+    expected = torch.softmax(lps, dim=0).mean(1)
+    expected = expected / expected.sum()
+    assert bool(w._proposal_weights_seen)
+    assert torch.allclose(w.proposal_weights[:2], expected, atol=1e-5)
+    # the training-side weights are untouched ...
+    assert torch.allclose(w.cluster_weights[:2], torch.tensor([0.9, 0.1]))
+    # ... and the density now uses the importance weights
+    ref = torch.logsumexp(torch.stack([
+        w.experts[0].log_prob(x) + torch.log(expected[0]),
+        w.experts[1].log_prob(x) + torch.log(expected[1]),
+    ]), dim=0)
+    assert torch.allclose(w.log_prob(x), ref, atol=1e-5)
+
+
+def test_update_proposal_weights_inert_when_disabled():
+    w = _k2(_clustered_wrapper(2), (0.9, 0.1))
+    w.update_proposal_weights(points_in_element(0, 400, np.random.default_rng(2)))
+    assert not bool(w._proposal_weights_seen)
+    assert w.proposal_weights is w.cluster_weights
+
+
+def test_update_proposal_weights_needs_enough_points():
+    w = _k2(_clustered_wrapper(2, importance_weights=True))
+    w.update_proposal_weights(points_in_element(0, 10, np.random.default_rng(2)))
+    assert not bool(w._proposal_weights_seen)
+
+
+def test_proposal_weights_reset_when_k_changes():
+    w = _clustered_wrapper(2, importance_weights=True, k_shrink_patience=1,
+                           max_cluster_overlap=0.1)
+    rng = np.random.default_rng(4)
+    w._cluster(_bimodal(800, rng))
+    w.finalise()
+    w.update_proposal_weights(points_in_element(0, 400, rng))
+    assert bool(w._proposal_weights_seen)
+    w._cluster(_unimodal(800, rng))
+    assert int(w._n_active.item()) == 1
+    assert not bool(w._proposal_weights_seen)
+
+
+def test_k_now_bypasses_shrink_hysteresis():
+    class _Collapse(ClusteredGroupMixtureFlowWrapper):
+        collapse = False
+
+        def _k_want(self, t, ts, mu, sd):
+            if self.collapse:
+                self._k_now = True
+                return 1
+            return super()._k_want(t, ts, mu, sd)
+
+    w = _Collapse([_expert() for _ in range(2)], num_features=2,
+                  min_cluster_size=10, max_cluster_overlap=0.1,
+                  k_shrink_patience=3, k_grow_patience=1)
+    rng = np.random.default_rng(5)
+    w._cluster(_bimodal(800, rng))
+    assert int(w._n_active.item()) == 2
+    w.collapse = True
+    w._cluster(_bimodal(800, rng))
+    assert int(w._n_active.item()) == 1
+
+
+def test_clustered_load_state_dict_tolerates_missing_freeze_buffers():
+    w = _clustered_wrapper(2)
+    new = ("_frozen", "_proposal_weights", "_proposal_weights_seen")
+    sd = {k: v for k, v in w.state_dict().items() if k not in new}
+    w2 = _clustered_wrapper(2)
+    w2.load_state_dict(sd)
+    assert not bool(w2._frozen.any())
+
+
+def test_group_proposal_populate_updates_proposal_weights():
+    class _Base:
+        def populate(self, worst_point, n_samples=10):
+            self.samples = np.zeros(n_samples)
+
+    class _Prop(GroupFlowProposalMixin, _Base):
+        pass
+
+    prop = _Prop()
+    model = MagicMock(importance_weights=True)
+    prop.flow = MagicMock(model=model)
+    prop._training_data_as_prime_tensor = MagicMock(return_value="x_prime")
+    prop.populate(None, n_samples=5)
+    model.update_proposal_weights.assert_called_once_with("x_prime")
+
+    model.importance_weights = False
+    model.update_proposal_weights.reset_mock()
+    prop.populate(None, n_samples=5)
+    model.update_proposal_weights.assert_not_called()
+
+
+def test_complete_reset_keeps_frozen_expert_flow(tmp_path):
+    """``--reset-flow`` rebuilds every expert; a frozen one is never
+    retrained afterwards, so its flow must survive the rebuild intact."""
+    fm = _ClusteredFreezeFlowModel(
+        flow_config={"n_inputs": 2, "model": "realnvp", "n_blocks": 2,
+                     "n_neurons": 8},
+        training_config={"max_epochs": 2, "patience": 2, "batch_size": 200},
+        output=str(tmp_path),
+    )
+    fm.initialise()
+    rng = np.random.default_rng(0)
+    fm.model.update_mixture_weights(_bimodal(1200, rng))
+    fm.model.finalise()
+    data = _lopsided(1200, 50, rng)
+    fm.model.update_mixture_weights(data)
+    j = _small_expert(fm.model, data)
+    assert fm.model.is_frozen(j)
+    old = {k: v.clone() for k, v in fm.model.experts[j].state_dict().items()}
+    old_other = {k: v.clone()
+                 for k, v in fm.model.experts[1 - j].base_flow.state_dict().items()}
+    fm.reset_model(weights=True, permutations=True)
+    new = fm.model.experts[j].state_dict()
+    assert fm.model.is_frozen(j)
+    assert all(torch.equal(new[k], old[k]) for k in old)
+    other = fm.model.experts[1 - j].base_flow.state_dict()
+    assert any(not torch.equal(other[k], old_other[k]) for k in old_other)
+
+
+# -- importance-estimated group-element weights -----------------------------
+def _imp_wrapper():
+    w = _expert()
+    w.importance_weights = True
+    w.eval()
+    return w
+
+
+def _pool(counts, rng):
+    return torch.cat([points_in_element(k, n, rng)
+                      for k, n in enumerate(counts) if n])
+
+
+def test_element_proposal_weights_are_pool_shares():
+    w = _imp_wrapper()
+    rng = np.random.default_rng(0)
+    w.update_proposal_weights(_pool([300, 100, 0, 0], rng), floor=1e-3)
+    expected = torch.tensor([0.75, 0.25, 1e-3, 1e-3])
+    expected = expected / expected.sum()
+    assert bool(w._proposal_weights_seen)
+    assert torch.allclose(w.proposal_weights, expected, atol=1e-5)
+    # the live-point weights (training / active set) are untouched
+    assert torch.allclose(w.weights, torch.full((GROUP_SIZE,), 0.25))
+
+
+def test_element_proposal_weights_drive_density_and_sampling():
+    w = _imp_wrapper()
+    rng = np.random.default_rng(1)
+    x = points_in_element(0, 16, rng)
+    before = w.log_prob(x)
+    w.update_proposal_weights(_pool([300, 100, 0, 0], rng), floor=1e-3)
+    pw = w.proposal_weights
+    # a tiling group scores a point with its single branch: log pi shifts
+    assert torch.allclose(w.log_prob(x) - before,
+                          torch.log(pw[0] / 0.25).expand(16), atol=1e-5)
+    torch.manual_seed(0)
+    xs, log_q = w.sample_and_log_prob(4000)
+    elem = torch.floor(xs[:, 0]).long()
+    frac = torch.bincount(elem, minlength=GROUP_SIZE).float() / len(elem)
+    assert abs(float(frac[0]) - float(pw[0])) < 0.03
+    assert abs(float(frac[1]) - float(pw[1])) < 0.03
+    assert torch.allclose(log_q, w.log_prob(xs), atol=1e-4)
+
+
+def test_element_proposal_weights_inert_when_disabled():
+    w = _expert()
+    w.update_proposal_weights(_pool([300, 100, 0, 0], np.random.default_rng(2)))
+    assert not bool(w._proposal_weights_seen)
+    assert w.proposal_weights is w.weights
+
+
+def test_element_proposal_weights_need_enough_points():
+    w = _imp_wrapper()
+    rng = np.random.default_rng(3)
+    w.update_proposal_weights(_pool([30, 10, 0, 0], rng))
+    assert not bool(w._proposal_weights_seen)
+    # the effective count is the sum of the sample weights
+    w = _imp_wrapper()
+    x = _pool([300, 100, 0, 0], rng)
+    w.update_proposal_weights(x, sample_weights=torch.full((400,), 0.1))
+    assert not bool(w._proposal_weights_seen)
+
+
+def test_element_proposal_weights_follow_sample_weights():
+    w = _imp_wrapper()
+    rng = np.random.default_rng(4)
+    x = _pool([200, 200, 0, 0], rng)
+    sw = torch.cat([torch.ones(200), torch.zeros(200)])
+    w.update_proposal_weights(x, sample_weights=sw, floor=1e-3)
+    assert float(w.proposal_weights[0]) > 0.99
+
+
+def test_element_proposal_weights_respect_active_set():
+    w = _imp_wrapper()
+    rng = np.random.default_rng(5)
+    w.update_proposal_weights(_pool([300, 100, 0, 0], rng), floor=1e-3)
+    with torch.no_grad():
+        # the live-point estimator drops element 1 ...
+        w.weights.copy_(torch.tensor([0.5, 0.0, 0.25, 0.25]))
+    pw = w.proposal_weights
+    assert float(pw[1]) == 0.0
+    assert float(pw.sum()) == pytest.approx(1.0)
+    # ... is inactive in the pool-share update too ...
+    w.update_proposal_weights(_pool([300, 0, 50, 50], rng), floor=1e-3)
+    assert float(w._proposal_weights[1]) == 0.0
+    # ... and when it regains live points it enters at its live-point weight
+    with torch.no_grad():
+        w.weights.copy_(torch.tensor([0.4, 0.2, 0.2, 0.2]))
+    pw = w.proposal_weights
+    ref = w._proposal_weights.clone()
+    ref[1] = 0.2
+    assert torch.allclose(pw, ref / ref.sum())
+
+
+def test_element_proposal_weights_carried_over():
+    old = _imp_wrapper()
+    old.update_proposal_weights(_pool([300, 100, 0, 0], np.random.default_rng(6)))
+    new = _imp_wrapper()
+    new._carry_over_group_state(old)
+    assert bool(new._proposal_weights_seen)
+    assert torch.equal(new._proposal_weights, old._proposal_weights)
+
+
+def test_element_proposal_weights_load_without_buffers():
+    w = _expert()
+    sd = {k: v for k, v in w.state_dict().items()
+          if k not in ("_proposal_weights", "_proposal_weights_seen")}
+    w2 = _expert()
+    w2.load_state_dict(sd)
+    assert not bool(w2._proposal_weights_seen)
+
+
+def test_factory_plumbs_element_importance_weights():
+    cls = make_group_mixture_flow(
+        shift_group_action, GROUP_SIZE, PARAM_NAMES, in_fundamental_domain,
+        importance_weights=True,
+    )
+    fm = cls(flow_config={"n_inputs": 2, "model": "realnvp", "n_blocks": 2,
+                          "n_neurons": 4})
+    fm.initialise()
+    assert fm.model.importance_weights
+    ccls = make_clustered_group_mixture_flow(
+        group_action_fn=shift_group_action, group_size=GROUP_SIZE,
+        param_names=PARAM_NAMES, in_fundamental_domain=in_fundamental_domain,
+        n_clusters_max=2, importance_weights=True,
+    )
+    cfm = ccls(flow_config={"n_inputs": 2, "model": "realnvp", "n_blocks": 2,
+                            "n_neurons": 4})
+    cfm.initialise()
+    assert cfm.model.importance_weights
+    assert all(e.importance_weights for e in cfm.model.experts)
+
+
+def test_clustered_flag_propagates_to_experts():
+    w = _clustered_wrapper(2, importance_weights=True)
+    assert all(e.importance_weights for e in w.experts)
+    w = _clustered_wrapper(2)
+    assert not any(e.importance_weights for e in w.experts)
+
+
+def test_clustered_k1_updates_expert_element_weights():
+    w = _clustered_wrapper(2, importance_weights=True)
+    w.update_proposal_weights(_pool([300, 100, 0, 0], np.random.default_rng(7)))
+    assert bool(w.experts[0]._proposal_weights_seen)
+    assert not bool(w.experts[1]._proposal_weights_seen)
+    assert not bool(w._proposal_weights_seen)
+
+
+def test_clustered_expert_element_weights_use_responsibilities():
+    w = _k2(_clustered_wrapper(2, importance_weights=True), (0.5, 0.5))
+    rng = np.random.default_rng(8)
+    x = _pool([300, 100, 0, 0], rng)
+    calls = {}
+    for j, e in enumerate(w.experts):
+        orig = e.update_proposal_weights
+
+        def spy(x_, sample_weights=None, _j=j, _orig=orig, **kw):
+            calls[_j] = sample_weights.clone()
+            return _orig(x_, sample_weights=sample_weights, **kw)
+
+        e.update_proposal_weights = spy
+    lps = torch.stack([w.experts[j].log_prob(x) + np.log(0.5)
+                       for j in range(2)])
+    resp = torch.softmax(lps, dim=0)
+    w.update_proposal_weights(x)
+    assert set(calls) == {0, 1}
+    for j in range(2):
+        assert torch.allclose(calls[j], resp[j], atol=1e-5)
+
+
+def test_element_pool_mass_accumulates_until_retrain():
+    w = _imp_wrapper()
+    rng = np.random.default_rng(9)
+    w.update_proposal_weights(_pool([30, 10, 0, 0], rng))
+    assert not bool(w._proposal_weights_seen)
+    # the second pool tops the accumulated count up past min_points
+    w.update_proposal_weights(_pool([0, 40, 0, 0], rng), floor=1e-3)
+    assert bool(w._proposal_weights_seen)
+    expected = torch.tensor([30.0, 50.0, 0.08, 0.08])
+    assert torch.allclose(w.proposal_weights, expected / expected.sum(),
+                          atol=1e-5)
+    # a retrain (update_mixture_weights) starts the accumulation over
+    w.update_mixture_weights(_pool([100, 100, 100, 100], rng))
+    assert float(w._pool_n) == 0.0
+    w.update_proposal_weights(_pool([0, 0, 60, 0], rng), floor=1e-3)
+    assert float(w.proposal_weights[2]) > 0.99
+
+
+def test_factorised_element_proposal_weights_are_product_of_marginals(
+    factor_wrapper, rng
+):
+    w = factor_wrapper
+    w.importance_weights = True
+    sizes = w.mode_factor_sizes
+    idx = w._mode_factor_index
+    # pool mass per joint mode: arbitrary, deliberately non-product
+    counts = rng.integers(20, 200, size=w.group_size)
+    lps = torch.full((w.group_size, int(counts.sum())), -float("inf"))
+    col = 0
+    for g, c in enumerate(counts):
+        lps[g, col:col + c] = 0.0
+        col += c
+    w._branch_log_probs = lambda x, context=None: lps
+    w.update_proposal_weights(torch.zeros(lps.shape[1], 2), floor=1e-6)
+    mass = torch.as_tensor(counts, dtype=torch.float32)
+    joint = torch.ones(w.group_size)
+    for f, size in enumerate(sizes):
+        m_f = torch.zeros(size).index_add_(0, idx[:, f], mass)
+        joint = joint * (m_f / m_f.sum())[idx[:, f]]
+    assert torch.allclose(w.proposal_weights, joint / joint.sum(), atol=1e-5)
+
+
+def test_element_importance_estimate_is_not_logged_per_populate(caplog):
+    w = _imp_wrapper()
+    with caplog.at_level(logging.INFO, logger="nessai.flowmodel.group_mixture"):
+        w.update_proposal_weights(_pool([300, 100, 0, 0],
+                                        np.random.default_rng(10)))
+    assert "importance" not in caplog.text
+    with caplog.at_level(logging.INFO, logger="nessai.flowmodel.group_mixture"):
+        GroupFlowProposalMixin._log_importance_summaries(w)
+    assert "importance element weights from 400 pool points" in caplog.text
+
+
+def test_clustered_importance_summaries_logged_at_retrain(caplog):
+    w = _k2(_clustered_wrapper(2, importance_weights=True), (0.5, 0.5))
+    w.update_proposal_weights(_pool([300, 100, 0, 0],
+                                    np.random.default_rng(11)))
+    with caplog.at_level(logging.INFO, logger="nessai.flowmodel.group_mixture"):
+        GroupFlowProposalMixin._log_importance_summaries(w)
+    assert "importance expert weights" in caplog.text
