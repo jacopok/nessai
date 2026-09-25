@@ -2103,6 +2103,36 @@ def test_freeze_counts_unique_rows(n_unique, frozen):
     assert w.is_frozen(_small_expert(w, data)) is frozen
 
 
+def test_untrained_expert_is_not_frozen():
+    """A split born with a side already below ``freeze_min_size`` must not
+    freeze that side's freshly initialised expert: the trainer skips frozen
+    experts, so it would never be trained.  It freezes only after its first
+    training pass."""
+    w = _clustered_wrapper(2, freeze_min_size=100, max_cluster_overlap=0.1)
+    rng = np.random.default_rng(0)
+    data = _lopsided(800, 40, rng)
+    w._cluster(data)
+    assert int(w._n_active.item()) == 2
+    assert not bool(w._frozen.any())
+    j = _small_expert(w, data)
+    w.finalise()  # end of the first training pass
+    assert bool(w._trained[j])
+    w._cluster(_lopsided(800, 40, rng))
+    assert w.is_frozen(j)
+
+
+def test_complete_reset_marks_unfrozen_experts_untrained():
+    w = _clustered_wrapper(2, freeze_min_size=100, max_cluster_overlap=0.1)
+    rng = np.random.default_rng(0)
+    data = _lopsided(800, 40, rng)
+    _split_then(w, rng, data)
+    j = _small_expert(w, data)
+    assert w.is_frozen(j) and bool(w._trained.all())
+    w2 = _clustered_wrapper(2, freeze_min_size=100, max_cluster_overlap=0.1)
+    w2._carry_over_group_state(w)
+    assert bool(w2._trained[j]) and not bool(w2._trained[1 - j])
+
+
 def test_freeze_off_by_default():
     w = _clustered_wrapper(2, max_cluster_overlap=0.1)
     rng = np.random.default_rng(0)
@@ -2249,7 +2279,8 @@ def test_k_now_bypasses_shrink_hysteresis():
 
 def test_clustered_load_state_dict_tolerates_missing_freeze_buffers():
     w = _clustered_wrapper(2)
-    new = ("_frozen", "_proposal_weights", "_proposal_weights_seen")
+    new = ("_frozen", "_trained", "_proposal_weights",
+           "_proposal_weights_seen")
     sd = {k: v for k, v in w.state_dict().items() if k not in new}
     w2 = _clustered_wrapper(2)
     w2.load_state_dict(sd)

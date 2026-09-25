@@ -1781,6 +1781,13 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         self.register_buffer(
             "_frozen", torch.zeros(self.n_experts, dtype=torch.bool)
         )
+        # Experts that have completed a training pass since their weights
+        # were last (re)initialised.  Only a trained expert may be frozen:
+        # freezing keeps a fitted flow proposing while its mode drains, and
+        # an untrained one has nothing worth keeping.
+        self.register_buffer(
+            "_trained", torch.zeros(self.n_experts, dtype=torch.bool)
+        )
         self.register_buffer("_proposal_weights", w0.clone())
         self.register_buffer(
             "_proposal_weights_seen", torch.zeros((), dtype=torch.bool)
@@ -1879,6 +1886,9 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             self._pending_split_train.copy_(old._pending_split_train)
             self._bg_seen.copy_(old._bg_seen)
             self._frozen.copy_(old._frozen)
+            # only the frozen experts' flows are carried over whole; the
+            # rest are fresh and need a training pass before they may freeze
+            self._trained.copy_(old._trained & old._frozen)
             self._proposal_weights.copy_(old._proposal_weights)
             self._proposal_weights_seen.copy_(old._proposal_weights_seen)
 
@@ -2167,6 +2177,11 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     def finalise(self):
         for e in self._all_experts():
             e.finalise()
+        # A training pass has just completed: every active expert the
+        # trainer did not skip (frozen ones are) has now been trained.
+        for j in range(self._n_active_experts()):
+            if not bool(self._frozen[j]):
+                self._trained[j] = True
         # A full training pass at the new k has just completed: the
         # per-cluster loss has specialised the experts, so release the
         # standardisation freeze and let subsequent rounds track each
@@ -2306,6 +2321,7 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
                     self.experts[j].load_state_dict(src)
                     self.experts[j]._canon_seen.zero_()
                     self.experts[j]._domain_mass_seen = False
+                    self._trained[j] = False
                 self._pending_split_train.fill_(True)
             if k <= 1:
                 self._pending_split_train.fill_(False)
@@ -2334,6 +2350,7 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
                         self.experts[0].load_state_dict(
                             self.experts[dominant].state_dict()
                         )
+                        self._trained[0] = self._trained[dominant]
                         self.experts[0]._canon_seen.zero_()
                         self.experts[0]._domain_mass_seen = False
 
@@ -2380,8 +2397,11 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     def _update_frozen(self, counts):
         """Freeze an expert once its routed population of unique live points
         drops below :attr:`freeze_min_size`; thaw it if the population
-        recovers to twice that.  Only at ``k >= 2`` and outside a pending
-        split."""
+        recovers to twice that.  Only at ``k >= 2``, outside a pending split,
+        and never for an expert that has not been trained yet (see
+        :attr:`_trained`): a split born with a side below the freeze size
+        would otherwise freeze a freshly initialised flow, which the trainer
+        then skips forever."""
         if (
             self.freeze_min_size is None
             or len(counts) < 2
@@ -2391,6 +2411,14 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         for j, n_j in enumerate(counts):
             frozen = bool(self._frozen[j])
             if not frozen and n_j < self.freeze_min_size:
+                if not bool(self._trained[j]):
+                    logger.info(
+                        "Clustered group mixture: expert %d has %d unique "
+                        "routed points (< %d) but has not been trained yet "
+                        "-- not freezing it before its first training",
+                        j, int(n_j), self.freeze_min_size,
+                    )
+                    continue
                 self._frozen[j] = True
                 logger.info(
                     "Clustered group mixture: expert %d frozen at %d unique "
