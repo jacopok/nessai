@@ -912,11 +912,15 @@ class BaseFlowProposal(RejectionProposal):
             x_prime, self.prime_parameters, copy=True
         )
 
-        self.flow.train(
+        history = self.flow.train(
             x_prime_array,
             output=block_output,
             plot=self._plot_training and plot,
         )
+        if isinstance(history, dict) and "loss" in history:
+            self.last_training_epochs = len(history["loss"])
+        else:
+            self.last_training_epochs = None
         self._post_train_diagnostics()
 
         if self._plot_training and plot:
@@ -1182,8 +1186,12 @@ class BaseFlowProposal(RejectionProposal):
             self.populating = True
             if self.update_poolsize:
                 self.update_poolsize_scale(self.ns_acceptance)
+            n_samples = self.poolsize
+            if getattr(self, "max_next_poolsize", None):
+                n_samples = min(n_samples, self.max_next_poolsize)
+                self.max_next_poolsize = None
             while not self.populated:
-                self.populate(worst_point, n_samples=self.poolsize)
+                self.populate(worst_point, n_samples=n_samples)
             self.populating = False
         # new sample is drawn randomly from proposed points
         # popping from right end is faster

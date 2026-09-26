@@ -12,4 +12,5 @@ def sampler(model, rng):
     s.model = model
     s.store_live_points = False
     s.rng = rng
+    s.retrain_decision = None
     return s
