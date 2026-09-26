@@ -1,0 +1,22 @@
+\begin{table}[htbp]\centering
+\caption{Time ratio to default per problem (geometric mean over 6 seeds).}
+\label{tab:perproblem}
+\begin{tabular}{llccc}
+\toprule
+$t_L$ [s] & policy & Gaussian 8D & Rosenbrock 4D & bimodal 4D \\
+\midrule
+0 & decision & 0.90 & 0.86 & 0.77 \\
+0 & decision + reset & 0.90 & 0.87 & 0.79 \\
+0 & fixed (1000 it) & 0.86 & 0.94 & 0.84 \\
+0.0001 & decision & 1.00 & 0.91 & 0.91 \\
+0.0001 & decision + reset & 1.00 & 0.97 & 0.89 \\
+0.0001 & fixed (1000 it) & 1.07 & 1.06 & 1.01 \\
+0.001 & decision & 0.92 & 1.07 & 0.98 \\
+0.001 & decision + reset & 0.97 & 0.98 & 0.83 \\
+0.001 & fixed (1000 it) & 1.48 & 1.39 & 1.35 \\
+0.01 & decision & 0.74 & 0.90 & 0.85 \\
+0.01 & decision + reset & 0.79 & 0.81 & 0.62 \\
+0.01 & fixed (1000 it) & 1.64 & 1.58 & 1.49 \\
+\bottomrule
+\end{tabular}
+\end{table}

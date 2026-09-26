@@ -146,7 +146,29 @@ one differs from the provided value by more than 2×, and
 
 ## Results
 
-RESULTS_PLACEHOLDER
+Full write-up with derivations: `report/retrain_decision.pdf`.
+
+3 problems (Gaussian 8D, Rosenbrock 4D, bimodal 4D) × 6 seeds, `nlive=1000`.
+Run time is relative to the default schedule, paired by problem and seed
+(geometric mean, 95% bootstrap interval). An emulated likelihood cost `t_L`
+is added to the real run time.
+
+| t_L [s] | fixed 1000 it | decision | decision (measured costs) | decision + reset | trainings (default → decision) |
+|---|---|---|---|---|---|
+| 0     | 0.88 [0.83, 0.93] | **0.84 [0.78, 0.90]** | 0.82 [0.77, 0.88] | 0.85 [0.79, 0.91] | 27 → 11 |
+| 1e-4  | 1.05 [1.01, 1.08] | **0.94 [0.90, 0.99]** | – | 0.95 [0.88, 1.01] | 27 → 15 |
+| 1e-3  | 1.41 [1.34, 1.47] | 0.99 [0.94, 1.04] | – | 0.92 [0.81, 1.03] | 27 → 26 |
+| 1e-2  | 1.57 [1.48, 1.65] | **0.83 [0.78, 0.87]** | – | **0.73 [0.63, 0.84]** | 27 → 60 |
+
+* The rule is never significantly worse than the default. At `t_L ≈ 1e-3`,
+  `τ*` happens to match the default pool length, so train-on-empty is already
+  near-optimal.
+* At `t_L = 1e-2` the gain comes from pool planning: without it, the rule
+  reproduces the default schedule exactly.
+* Resets help on the bimodal problem, where warm-started lineages sometimes
+  degrade (0.62 vs 0.85 at `t_L = 1e-2`), and are neutral elsewhere.
+* `logZ` is unaffected: Gaussian -16.61 ± 0.10 (analytic -16.614), bimodal
+  -10.59 ± 0.09 (analytic -10.604), for all policies.
 
 ## Reproducing
 
@@ -154,6 +176,7 @@ RESULTS_PLACEHOLDER
     python compare.py <outdir> -p               # paired comparison
     python calibrate_block.py <outdir>
     python calibrate_fresh.py "<outdir>/default_*.json"
+    python make_results.py; python plot_compare.py  # tables/figure for the report
 
 `harness.py` monkeypatches the sampler to record draws per iteration,
 populations and trainings. A virtual likelihood cost `t_L` is applied

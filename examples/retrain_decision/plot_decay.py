@@ -17,4 +17,4 @@ xx=np.linspace(0,3,10); ax.plot(xx,-xx,color="#555",ls="--",lw=2,label="slope âˆ
 ax.set_xlabel("iterations since training / nlive"); ax.set_ylabel("log acceptance (offset per episode)")
 ax.set_title("Acceptance decays as exp(âˆ’s / nlive) between trainings",loc="left",fontsize=11)
 ax.grid(alpha=0.25); ax.spines[["top","right"]].set_visible(False); ax.legend(frameon=False,fontsize=9)
-fig.tight_layout(); fig.savefig("fig_decay.png",dpi=150)
+fig.tight_layout(); fig.savefig("report/fig_decay.pdf")
