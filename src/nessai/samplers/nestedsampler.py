@@ -153,17 +153,23 @@ class NestedSampler(BaseNestedSampler):
         List of parameters to include in the trace plot. If None, all model
         parameters are included.
     retrain_decision : bool or dict, optional
-        If true (or a dictionary of keyword arguments for
+        If true (the default, or a dictionary of keyword arguments for
         :py:class:`nessai.samplers.retrain.RetrainDecision`), the flow is
         only retrained when the pool is empty and the cost-based decision
         model predicts that retraining reduces the run time. This replaces
         :code:`training_frequency`, :code:`cooldown`,
-        :code:`retrain_acceptance` and :code:`reset_acceptance`.
+        :code:`retrain_acceptance` and :code:`reset_acceptance`. Set to
+        false to use those criteria instead.
     retrain_costs : dict or str, optional
         Unit costs used by the retrain decision (see
-        :py:class:`nessai.samplers.retrain.RetrainCostModel`). If not
-        specified, costs are measured during the run and the training
-        schedule is not deterministic.
+        :py:class:`nessai.samplers.retrain.RetrainCostModel`). Defaults to
+        the :code:`'gw'` preset, which makes the training schedule
+        deterministic. Can be a dictionary, the name of a preset, the path
+        to a JSON file (e.g. :code:`retrain_costs.json` written by a
+        previous run, or by :code:`python -m
+        nessai.samplers.retrain_benchmark`), :code:`'benchmark'` to measure
+        the costs on this hardware before the run, or None to measure them
+        during the run. The last two make the schedule hardware-dependent.
     kwargs :
         Keyword arguments passed to the flow proposal class
     """
@@ -210,8 +216,8 @@ class NestedSampler(BaseNestedSampler):
         acceptance_threshold=0.01,
         shrinkage_expectation="logt",
         trace_parameters=None,
-        retrain_decision=False,
-        retrain_costs=None,
+        retrain_decision=True,
+        retrain_costs="gw",
         **kwargs,
     ):
         super().__init__(
@@ -401,10 +407,33 @@ class NestedSampler(BaseNestedSampler):
         kwargs = (
             retrain_decision if isinstance(retrain_decision, dict) else {}
         )
+        self._retrain_benchmark = retrain_costs == "benchmark"
         self.retrain_decision = RetrainDecision(
-            self.nlive, costs=retrain_costs, **kwargs
+            self.nlive,
+            costs=None if self._retrain_benchmark else retrain_costs,
+            **kwargs,
         )
         self._retrain_snapshot = None
+
+    def benchmark_retrain_costs(self):
+        """Measure the retrain unit costs with the run's configuration."""
+        from .retrain_benchmark import measure_retrain_costs
+
+        ProposalClass, flow_config, kwargs = self._flow_proposal_config
+        filename = None
+        if self.output:
+            filename = os.path.join(self.output, "retrain_costs_benchmark.json")
+        logger.info("Measuring the retrain unit costs on this hardware")
+        costs = measure_retrain_costs(
+            self.model,
+            nlive=self.nlive,
+            flow_config=flow_config,
+            flow_proposal_class=ProposalClass,
+            filename=filename,
+            **kwargs,
+        )
+        self.retrain_decision.cost.provided.update(costs)
+        self._retrain_benchmark = False
 
     def _retrain_time_snapshot(self):
         return (
@@ -543,6 +572,11 @@ class NestedSampler(BaseNestedSampler):
         kwargs = check_proposal_kwargs(ProposalClass, kwargs)
 
         logger.info(f"Passing kwargs to {ProposalClass.__name__}: {kwargs}")
+        self._flow_proposal_config = (
+            ProposalClass,
+            flow_config,
+            dict(kwargs),
+        )
         self._flow_proposal = ProposalClass(
             self.model,
             rng=self.rng,
@@ -867,6 +901,8 @@ class NestedSampler(BaseNestedSampler):
             steps are complete but live points remain empty.
         """
         flags = [False] * 3
+        if getattr(self, "_retrain_benchmark", False):
+            self.benchmark_retrain_costs()
         if not self._flow_proposal.initialised:
             self._flow_proposal.initialise()
             flags[0] = True

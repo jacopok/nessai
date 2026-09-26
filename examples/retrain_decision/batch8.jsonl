@@ -1,0 +1,36 @@
+{"name": "newdef_gauss8_s1", "model_name": "gaussian", "dims": 8, "outdir": "runs8", "seed": 1}
+{"name": "bench_gauss8_s1", "model_name": "gaussian", "dims": 8, "outdir": "runs8", "seed": 1, "retrain_costs": "benchmark"}
+{"name": "newdef_rosen4_s1", "model_name": "rosenbrock", "dims": 4, "outdir": "runs8", "seed": 1}
+{"name": "bench_rosen4_s1", "model_name": "rosenbrock", "dims": 4, "outdir": "runs8", "seed": 1, "retrain_costs": "benchmark"}
+{"name": "newdef_bimod4_s1", "model_name": "bimodal", "dims": 4, "outdir": "runs8", "seed": 1}
+{"name": "bench_bimod4_s1", "model_name": "bimodal", "dims": 4, "outdir": "runs8", "seed": 1, "retrain_costs": "benchmark"}
+{"name": "newdef_gauss8_s2", "model_name": "gaussian", "dims": 8, "outdir": "runs8", "seed": 2}
+{"name": "bench_gauss8_s2", "model_name": "gaussian", "dims": 8, "outdir": "runs8", "seed": 2, "retrain_costs": "benchmark"}
+{"name": "newdef_rosen4_s2", "model_name": "rosenbrock", "dims": 4, "outdir": "runs8", "seed": 2}
+{"name": "bench_rosen4_s2", "model_name": "rosenbrock", "dims": 4, "outdir": "runs8", "seed": 2, "retrain_costs": "benchmark"}
+{"name": "newdef_bimod4_s2", "model_name": "bimodal", "dims": 4, "outdir": "runs8", "seed": 2}
+{"name": "bench_bimod4_s2", "model_name": "bimodal", "dims": 4, "outdir": "runs8", "seed": 2, "retrain_costs": "benchmark"}
+{"name": "newdef_gauss8_s3", "model_name": "gaussian", "dims": 8, "outdir": "runs8", "seed": 3}
+{"name": "bench_gauss8_s3", "model_name": "gaussian", "dims": 8, "outdir": "runs8", "seed": 3, "retrain_costs": "benchmark"}
+{"name": "newdef_rosen4_s3", "model_name": "rosenbrock", "dims": 4, "outdir": "runs8", "seed": 3}
+{"name": "bench_rosen4_s3", "model_name": "rosenbrock", "dims": 4, "outdir": "runs8", "seed": 3, "retrain_costs": "benchmark"}
+{"name": "newdef_bimod4_s3", "model_name": "bimodal", "dims": 4, "outdir": "runs8", "seed": 3}
+{"name": "bench_bimod4_s3", "model_name": "bimodal", "dims": 4, "outdir": "runs8", "seed": 3, "retrain_costs": "benchmark"}
+{"name": "newdef_gauss8_s4", "model_name": "gaussian", "dims": 8, "outdir": "runs8", "seed": 4}
+{"name": "bench_gauss8_s4", "model_name": "gaussian", "dims": 8, "outdir": "runs8", "seed": 4, "retrain_costs": "benchmark"}
+{"name": "newdef_rosen4_s4", "model_name": "rosenbrock", "dims": 4, "outdir": "runs8", "seed": 4}
+{"name": "bench_rosen4_s4", "model_name": "rosenbrock", "dims": 4, "outdir": "runs8", "seed": 4, "retrain_costs": "benchmark"}
+{"name": "newdef_bimod4_s4", "model_name": "bimodal", "dims": 4, "outdir": "runs8", "seed": 4}
+{"name": "bench_bimod4_s4", "model_name": "bimodal", "dims": 4, "outdir": "runs8", "seed": 4, "retrain_costs": "benchmark"}
+{"name": "newdef_gauss8_s5", "model_name": "gaussian", "dims": 8, "outdir": "runs8", "seed": 5}
+{"name": "bench_gauss8_s5", "model_name": "gaussian", "dims": 8, "outdir": "runs8", "seed": 5, "retrain_costs": "benchmark"}
+{"name": "newdef_rosen4_s5", "model_name": "rosenbrock", "dims": 4, "outdir": "runs8", "seed": 5}
+{"name": "bench_rosen4_s5", "model_name": "rosenbrock", "dims": 4, "outdir": "runs8", "seed": 5, "retrain_costs": "benchmark"}
+{"name": "newdef_bimod4_s5", "model_name": "bimodal", "dims": 4, "outdir": "runs8", "seed": 5}
+{"name": "bench_bimod4_s5", "model_name": "bimodal", "dims": 4, "outdir": "runs8", "seed": 5, "retrain_costs": "benchmark"}
+{"name": "newdef_gauss8_s6", "model_name": "gaussian", "dims": 8, "outdir": "runs8", "seed": 6}
+{"name": "bench_gauss8_s6", "model_name": "gaussian", "dims": 8, "outdir": "runs8", "seed": 6, "retrain_costs": "benchmark"}
+{"name": "newdef_rosen4_s6", "model_name": "rosenbrock", "dims": 4, "outdir": "runs8", "seed": 6}
+{"name": "bench_rosen4_s6", "model_name": "rosenbrock", "dims": 4, "outdir": "runs8", "seed": 6, "retrain_costs": "benchmark"}
+{"name": "newdef_bimod4_s6", "model_name": "bimodal", "dims": 4, "outdir": "runs8", "seed": 6}
+{"name": "bench_bimod4_s6", "model_name": "bimodal", "dims": 4, "outdir": "runs8", "seed": 6, "retrain_costs": "benchmark"}

@@ -70,6 +70,15 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 COST_KEYS = ("likelihood", "population", "training")
+
+#: Preset unit costs (seconds per likelihood evaluation, per pool point and
+#: per training sample-epoch). ``"gw"`` is an order-of-magnitude estimate for
+#: compact-binary analyses with bilby on a CPU (relative-binning or ROQ
+#: likelihood, ~15 parameters with reparameterisations). The decision is only
+#: sensitive to the ratios of the costs to within a factor of a few.
+RETRAIN_COST_PRESETS = {
+    "gw": dict(likelihood=2e-3, population=5e-4, training=5e-5),
+}
 """Unit costs: seconds per likelihood evaluation, seconds per pool point
 (excluding the likelihood) and seconds per training sample per epoch."""
 
@@ -201,8 +210,11 @@ class RetrainCostModel:
     costs : dict, str or None
         Unit costs (seconds per likelihood evaluation, per pool point and per
         training sample-epoch) with keys :code:`likelihood`,
-        :code:`population` and :code:`training`. Can also be the path to a
-        JSON file written by a previous run. Missing values are measured
+        :code:`population` and :code:`training`. Can also be the name of a
+        preset in :py:data:`RETRAIN_COST_PRESETS` or the path to a JSON file
+        written by a previous run or by
+        :py:func:`nessai.samplers.retrain_benchmark.measure_retrain_costs`.
+        Missing values are measured
         during the run, which makes the run non-deterministic.
     warn_ratio : float
         Warn if a measured unit cost differs from the provided one by more
@@ -210,7 +222,10 @@ class RetrainCostModel:
     """
 
     def __init__(self, costs=None, warn_ratio=2.0):
-        if isinstance(costs, (str, os.PathLike)):
+        if isinstance(costs, str) and costs in RETRAIN_COST_PRESETS:
+            logger.info("Retrain decision using '%s' cost preset", costs)
+            costs = RETRAIN_COST_PRESETS[costs]
+        elif isinstance(costs, (str, os.PathLike)):
             with open(costs, "r") as f:
                 costs = json.load(f)
             costs = costs.get("unit_costs", costs)

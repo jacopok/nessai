@@ -1,7 +1,27 @@
 # Cost-based retraining decision: investigation
 
-Code: `nessai.samplers.retrain` (enabled with `retrain_decision=True` on
-`NestedSampler`/`FlowSampler`).
+Code: `nessai.samplers.retrain`. Enabled by default on
+`NestedSampler`/`FlowSampler`; `retrain_decision=False` restores the old
+triggers (`training_frequency`, `retrain_acceptance`, ...).
+
+## Usage
+
+    FlowSampler(model, ...)                               # deterministic, "gw" cost preset
+    FlowSampler(model, retrain_costs="retrain_costs.json")  # costs from a previous run / benchmark
+    FlowSampler(model, retrain_costs="benchmark")         # measure costs before the run
+    FlowSampler(model, retrain_costs=None)                # measure costs during the run
+
+The unit costs can be measured independently of a run, with the run's
+configuration (`flow_config`, `poolsize`, reparameterisations, ...):
+
+    python -m nessai.samplers.retrain_benchmark my_module:MyModel \
+        --config run_config.json --nlive 1000 --output retrain_costs.json
+
+or from Python with `nessai.samplers.retrain_benchmark.measure_retrain_costs`.
+It takes about one training plus one pool population. The `"gw"` preset
+(2 ms per likelihood evaluation, 0.5 ms per pool point, 50 µs per training
+sample-epoch) is an order-of-magnitude guess for CPU compact-binary analyses,
+not a measurement.
 
 ## Question
 
@@ -174,6 +194,34 @@ is added to the real run time.
   degrade (0.62 vs 0.85 at `t_L = 1e-2`), and are neutral elsewhere.
 * `logZ` is unaffected: Gaussian -16.61 ± 0.10 (analytic -16.614), bimodal
   -10.59 ± 0.09 (analytic -10.604), for all policies.
+
+### Replay with the new defaults
+
+Same 3 problems × 6 seeds, relative to the old default schedule
+(`retrain_decision=False`, runs reused from the table above):
+
+| policy | t_L = 0 (real toy cost) | t_L = 2e-3 (GW-like, emulated) | trainings |
+|---|---|---|---|
+| new default (`"gw"` preset) | 0.88 [0.84, 0.93] | 1.05 [0.98, 1.12] | 22 |
+| `retrain_costs="benchmark"` | **0.75 [0.68, 0.83]** | 1.48 [1.29, 1.65]* | 11 |
+| costs for t_L=1e-3 (from above) | 0.96 [0.91, 1.00] | 0.99 [0.94, 1.06] | 26 |
+| costs for t_L=1e-2 (from above) | 1.44 [1.36, 1.53] | 0.90 [0.86, 0.94] | 60 |
+
+\* The benchmark measures the real (≈1 µs) likelihood, so it is mis-specified
+for the emulated 2 ms cost; this column only shows the cost of wrong inputs.
+
+* The preset is conservative on this hardware: training and population are
+  3–5× cheaper here than the preset assumes, so it retrains slightly less often
+  than optimal. At GW-like likelihood costs the old train-on-empty schedule is
+  already close to optimal on these problems, and the default neither gains
+  nor loses significantly.
+* Measured costs pay off when the likelihood is cheap (25% faster).
+* Costs wrong by 10× or more cost 1.4–1.5×, so the preset should be replaced
+  by a benchmark or a previous run's `retrain_costs.json` when the likelihood
+  is far from 2 ms.
+* `logZ` agrees with the old default for all policies.
+* The benchmark's measured unit costs agree with the in-run ones: population
+  7e-5 vs 8–13e-5 s, training 1.6e-5 vs 1.4e-5 s.
 
 ## Reproducing
 

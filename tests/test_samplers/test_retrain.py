@@ -221,3 +221,82 @@ def test_sampling_with_retrain_decision(
     assert decision.cost.deterministic
     assert len(decision.log) > 0
     assert (tmp_path / "retrain_costs.json").exists()
+
+
+def test_cost_model_preset():
+    from nessai.samplers.retrain import RETRAIN_COST_PRESETS
+
+    cost = RetrainCostModel("gw")
+    assert cost.deterministic
+    assert cost["likelihood"] == RETRAIN_COST_PRESETS["gw"]["likelihood"]
+
+
+def test_default_is_enabled_and_deterministic(integration_model, tmp_path):
+    from nessai.samplers.nestedsampler import NestedSampler
+
+    ns = NestedSampler(integration_model, output=str(tmp_path), nlive=50)
+    assert ns.retrain_decision is not None
+    assert ns.retrain_decision.cost.deterministic
+
+
+@pytest.mark.slow_integration_test
+def test_measure_retrain_costs(integration_model, flow_config, tmp_path):
+    from nessai.samplers.retrain_benchmark import measure_retrain_costs
+
+    filename = tmp_path / "costs.json"
+    costs = measure_retrain_costs(
+        integration_model,
+        nlive=100,
+        flow_config=flow_config,
+        epochs=2,
+        filename=str(filename),
+        not_a_proposal_kwarg=True,
+    )
+    assert all(costs[k] > 0 for k in ("likelihood", "training"))
+    assert costs["population"] >= 0
+    assert integration_model.likelihood_evaluations == 0
+    assert RetrainCostModel(str(filename)).deterministic
+
+
+@pytest.mark.slow_integration_test
+def test_retrain_benchmark_cli(tmp_path):
+    from nessai.samplers.retrain_benchmark import main
+
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(dict(nlive=50, poolsize=100)))
+    output = tmp_path / "costs.json"
+    costs = main(
+        [
+            "nessai.utils.testing:IntegrationTestModel",
+            "--config",
+            str(config),
+            "--epochs",
+            "2",
+            "--output",
+            str(output),
+        ]
+    )
+    assert output.exists()
+    assert set(costs) == {"likelihood", "population", "training"}
+
+
+@pytest.mark.slow_integration_test
+def test_sampling_with_benchmark_costs(
+    integration_model, flow_config, tmp_path
+):
+    from nessai.flowsampler import FlowSampler
+
+    fs = FlowSampler(
+        integration_model,
+        output=str(tmp_path),
+        nlive=100,
+        plot=False,
+        flow_config=flow_config,
+        retrain_costs="benchmark",
+        seed=1234,
+        max_iteration=300,
+        checkpointing=False,
+    )
+    fs.run(plot=False)
+    assert fs.ns.retrain_decision.cost.deterministic
+    assert (tmp_path / "retrain_costs_benchmark.json").exists()
