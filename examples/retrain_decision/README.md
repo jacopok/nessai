@@ -51,6 +51,11 @@ likelihood, pool population and training.
 
 ## Decision model
 
+The mathematics is classical equipment-replacement / renewal-reward theory.
+See the report's "Related work and novelty" section for references (Taylor
+1923, Hotelling 1925, Bellman 1955, Barlow & Hunter 1960, Fox 1967, …) and
+for what is specific to this application.
+
 With per-pool-point cost `c` (population + likelihood), a flow with fresh
 acceptance `A` costs `c/A · exp(k s)` per iteration, with `k ≈ 1/nlive`.
 Retraining costs `T`.

@@ -5,6 +5,7 @@
 \usepackage{amsmath,amssymb,amsthm}
 \usepackage{graphicx}
 \usepackage{booktabs}
+\usepackage[round,sort]{natbib}
 \usepackage{hyperref}
 \usepackage{xcolor}
 \renewcommand{\topfraction}{0.9}\renewcommand{\textfraction}{0.1}\renewcommand{\floatpagefraction}{0.8}
@@ -30,8 +31,8 @@ iteration, whether to retrain (or reset) the normalising flow in
 show that (i) the proposal pool is paid for when it is populated, so the only
 sensible decision points are when the pool is empty, and (ii) between
 trainings the acceptance decays as $\exp(-s/\nlive)$ with remarkable
-precision. Under these facts the problem is a classic renewal
-(machine-replacement) problem. It has a closed-form optimal long-run cost rate
+precision. Under these facts the problem is the classic equipment-replacement
+problem of operations research, solved with renewal-reward theory. It has a closed-form optimal long-run cost rate
 $g^*$, which answers the question of how far ahead to look: one training
 cycle, with everything beyond it summarised by $g^*$. The rule is to retrain
 when the next pool drawn from the current flow would cost more per iteration
@@ -44,11 +45,17 @@ the cost and by 17\% when the likelihood dominates (emulated
 $t_L=10\,ms$). In between it is neutral, and it is never significantly
 worse. A fixed schedule is up to $1.6\times$ slower. The reset option gains a
 further 12\% at $t_L=10\,ms$, coming mostly from the bimodal problem.
+The decision theory is classical; Section~\ref{sec:related} discusses what,
+if anything, is new.
 \end{abstract}
 
 \section{Setting and empirical facts}\label{sec:facts}
 
-In \textsc{nessai}'s standard nested sampler a pool of $P$ points is drawn
+Nested sampling \citep{Skilling2006} replaces, at each iteration, the
+lowest-likelihood live point with a new point drawn from the prior restricted
+to the current likelihood contour. \textsc{nessai}
+\citep{Williams2021,Williams2023} draws these points from a normalising flow
+trained on the live points. In \textsc{nessai}'s standard nested sampler a pool of $P$ points is drawn
 from the flow proposal. All $P$ likelihoods are evaluated when the pool is
 populated, and each iteration then draws points from the pool until one lies
 above the current likelihood contour. Let
@@ -85,7 +92,11 @@ model fits to within the counting noise, and the result holds even at the
 start of an episode. The exponential model is therefore exact in practice
 and the rate is known a priori. We still fit it, with a prior centred on
 $1/\nlive$, because proposal schemes that shrink the proposal volume between
-trainings would change it.
+trainings would change it. That the efficiency of rejection sampling from a
+fixed bounding region scales as $X/V_{\rm bound}$ is standard in nested
+sampling: it is why ellipsoidal samplers rescale or rebuild their bounds as
+$X$ shrinks \citep{Mukherjee2006,Feroz2009}. What we use here is the
+consequence that, for a fixed flow, the degradation rate is known in advance.
 
 \begin{figure}[htbp]
   \centering
@@ -135,7 +146,11 @@ retraining. Equation~\eqref{eq:diff} gives the rule
   \label{eq:rule}
 \end{equation}
 i.e.\ retrain when continuing costs more per iteration than the optimal
-long-run rate. The effective horizon is one training cycle.
+long-run rate. The effective horizon is one training cycle. In the
+language of Markov decision processes this is the average-cost criterion for
+a semi-Markov decision process \citep{Puterman1994,Tijms2003}: $g^*$ is the
+optimal gain, and \eqref{eq:rule} is a one-step policy-improvement test
+against the relative value function.
 
 \subsection{The optimal long-run rate}
 
@@ -145,7 +160,12 @@ A cycle that starts with a training and lasts $\tau$ iterations costs
           = T + \frac{c}{A'k}\left(e^{k\tau}-1\right),
 \end{equation}
 where $A'$ is the fresh acceptance of the next flow. By the renewal-reward
-theorem the long-run cost per iteration is $g(\tau)=C(\tau)/\tau$.
+theorem \citep{Ross1970} the long-run cost per iteration is
+$g(\tau)=C(\tau)/\tau$. This is the deterministic equipment-replacement
+problem with increasing running costs
+\citep{Taylor1923,Hotelling1925,Bellman1955}; its stochastic counterparts
+(age and block replacement) were solved with renewal theory by
+\citet{BarlowHunter1960} \citep[see also][]{Nakagawa2005}.
 
 \begin{proposition}
 Let $y = TkA'/c$ (the training cost in units of the cost of $1/k$ iterations
@@ -166,7 +186,9 @@ at the optimum the instantaneous rate equals the average rate:
 $c e^{k\tau^*}/A' = g^*$. Writing $x=e^{k\tau^*}$, the condition
 $C(\tau^*) = g^*\tau^*$ becomes
 $T + \frac{c}{A'k}(x-1) = \frac{c}{A'}x\frac{\ln x}{k}$, which is
-\eqref{eq:renewal}. The left-hand side of \eqref{eq:renewal} is increasing
+\eqref{eq:renewal}. This is the classical condition that equipment is
+replaced when its marginal running cost reaches the minimal average cost
+\citep{Taylor1923,Hotelling1925}. The left-hand side of \eqref{eq:renewal} is increasing
 for $x>1$ and vanishes at $x=1$, so the solution is unique. For
 \eqref{eq:savings}, $\int_0^{\tau^*}(g^*-c e^{ks}/A')\,\mathrm{d}s
 = g^*\tau^* - (C(\tau^*)-T) = T$.
@@ -174,7 +196,16 @@ for $x>1$ and vanishes at $x=1$, so the solution is unique. For
 
 Equation~\eqref{eq:savings} has a simple reading: the training cost is
 recovered by the savings accumulated while the new flow runs below the
-break-even rate (Fig.~\ref{fig:schematic}). Limits:
+break-even rate (Fig.~\ref{fig:schematic}). It has the same structure as
+the reservation-price equation of optimal search, $c = \E[(x-z)^+]$
+\citep{Weitzman1979}. With $u=\ln x$, \eqref{eq:renewal} reads
+$(u-1)e^u = y-1$, whose solution in terms of the principal branch of the
+Lambert $W$ function is
+\begin{equation}
+  k\tau^* = 1 + W_0\!\left(\frac{y-1}{e}\right),
+\end{equation}
+consistent with recent closed-form treatments of replacement with
+exponentially increasing costs \citep{TiradoSerrato2025}. Limits:
 \begin{equation}
   y\ll1:\quad x\simeq 1+\sqrt{2y},\;\;
   \tau^*\simeq\sqrt{\frac{2T A'\nlive}{c}};
@@ -182,7 +213,8 @@ break-even rate (Fig.~\ref{fig:schematic}). Limits:
   y\gg1:\quad x\simeq \frac{y}{\ln y}.
 \end{equation}
 The small-$y$ limit is a square-root law, analogous to the economic order
-quantity. Equation~\eqref{eq:renewal} is solved by bisection.
+quantity \citep{Harris1913}. In the code, Eq.~\eqref{eq:renewal} is solved
+by bisection.
 
 \begin{figure}[htbp]
   \centering
@@ -405,6 +437,96 @@ show the following.
         default.
 \end{itemize}
 
+\section{Related work and novelty}\label{sec:related}
+
+\paragraph{What is classical.} The core of the decision model is textbook
+operations research:
+\begin{itemize}
+  \item the rule ``replace when the marginal running cost reaches the minimal
+        average cost'' goes back to the depreciation theory of
+        \citet{Taylor1923} and \citet{Hotelling1925};
+  \item dynamic-programming and renewal treatments are due to
+        \citet{Bellman1955} and \citet{BarlowHunter1960}, and are covered in
+        standard texts \citep{Ross1970,Tijms2003,Nakagawa2005};
+  \item the average-cost semi-Markov formulation behind \eqref{eq:diff} and
+        \eqref{eq:rule} is standard MDP theory \citep{Puterman1994};
+  \item the closed form \eqref{eq:renewal} and its Lambert-$W$ solution are a
+        special case of replacement with exponentially increasing running
+        costs \citep{TiradoSerrato2025};
+  \item the square-root law is the EOQ result \citep{Harris1913}.
+\end{itemize}
+Replacement while learning the unknown parameters from the process itself
+(our Gaussian posteriors, re-estimated at every decision) is \emph{adaptive}
+or \emph{Bayesian} replacement \citep{Fox1967,DayanikGurler2002}. Our
+certainty-equivalent treatment, which plugs posterior moments into the
+known-parameter rule, is a simplification of these; it does not value
+information. None of the mathematics in Section~2 is new.
+
+\paragraph{Retraining schedules in machine learning.} Deciding when to
+retrain a model as a cost--benefit problem is an active topic, e.g.
+\begin{itemize}
+  \item \citet{Zliobaite2015} frame model updates as investments with a
+        return;
+  \item \citet{Mahadevan2024} introduce a ``staleness cost'' traded off
+        against retraining cost;
+  \item \citet{Regol2025} forecast the evolution of model performance with
+        uncertainty and retrain based on a cost ratio;
+  \item \citet{Katz2026} derive a one-step Bayes retraining rule from a
+        posterior ``learning debt''.
+\end{itemize}
+Our setting is simpler than theirs in one important way: the degradation of
+the proposal is not an unknown drift but is known to follow
+$e^{-s/\nlive}$, and the cost of degradation is directly measurable as
+likelihood evaluations. We have only read the abstracts of these works:
+\citet{Katz2026} explicitly derives a one-step (myopic) rule, and we have not
+checked whether any of the others uses the renewal-reward (average-cost)
+formulation.
+
+\paragraph{Nested sampling.} Samplers that adapt a proposal or bounding
+region all face this trade-off, but schedule the updates heuristically:
+\begin{itemize}
+  \item \textsc{dynesty} rebuilds its bounds every fixed number of likelihood
+        calls (\code{update\_interval}); its documentation notes that larger
+        values reduce the sampling efficiency but can improve overall
+        performance \citep{Speagle2020};
+  \item \textsc{MultiNest} rescales its ellipsoids with $X$ and targets a
+        user-set sampling efficiency \citep{Feroz2009};
+  \item flow- and network-based samplers retrain on fixed or event-driven
+        schedules: \textsc{nessai} trains when the pool empties, when the
+        acceptance drops below a threshold or at a fixed frequency; see also
+        \citet{Moss2020} and \citet{Lange2023}.
+\end{itemize}
+\citet{Coretti2026} recently studied the trade-off between pool size and
+retraining frequency for flow-based nested sampling empirically, finding that
+smaller pools with more frequent retraining can win in both wall-clock time
+and energy evaluations. This matches our pool-planning result. We did not
+find a nested-sampling paper that derives the update schedule from a cost
+model. Our search was limited to search-engine results and abstracts (full
+texts on arXiv were not accessible), so this should be read as ``not found'',
+not ``does not exist''.
+
+\paragraph{What may be new.} The contribution is the mapping, not the theory:
+\begin{enumerate}
+  \item identifying the pool, which is paid for in advance, as the
+        decision unit, so that decisions happen only at empty pools, and
+        using the pool size as a second control (pool planning);
+  \item the observation that the degradation rate is known a priori
+        ($k=1/\nlive$ for a fixed flow), which makes the forecast nearly
+        free of model error and turns a hard drift-forecasting problem
+        into a one-parameter estimate of the fresh acceptance $A'$;
+  \item deterministic cost accounting (counts $\times$ unit costs) so that
+        the schedule is reproducible, with measured costs reported for
+        future runs;
+  \item the lineage-relative reset model, which is ad hoc and not grounded
+        in the replacement literature. A principled version would be a
+        two-action Bayesian replacement problem with exploration, e.g.\ along
+        the lines of \citet{DayanikGurler2002}.
+\end{enumerate}
+In short, this is an application of classical replacement theory to
+nested-sampling proposals, with some sampler-specific ingredients. It would
+fit as a methods section in a sampler paper rather than as a stand-alone
+contribution to decision theory.
+
 \section{Discussion and limitations}
 
 \begin{itemize}
@@ -440,5 +562,35 @@ FlowSampler(model, ...,
 \end{verbatim}
 Code: \code{src/nessai/samplers/retrain.py}. Experiments and scripts:
 \code{examples/retrain\_decision/}.
+
+
+\begin{thebibliography}{99}
+\bibitem[Barlow \& Hunter(1960)]{BarlowHunter1960} R.~E.~Barlow and L.~C.~Hunter, ``Optimum preventive maintenance policies'', \emph{Operations Research} \textbf{8}(1), 90--100 (1960).
+\bibitem[Bellman(1955)]{Bellman1955} R.~Bellman, ``Equipment replacement policy'', \emph{Journal of the Society for Industrial and Applied Mathematics} \textbf{3}(3), 133--136 (1955).
+\bibitem[Coretti et~al.(2026)]{Coretti2026} A.~Coretti, N.~Unglert, S.~Falkner, G.~K.~H.~Madsen and C.~Dellago, ``Generative nested sampling of atomistic thermodynamic landscapes'', arXiv:2609.03193 (2026).
+\bibitem[Dayanik \& G\"urler(2002)]{DayanikGurler2002} S.~Dayanik and \"U.~G\"urler, ``An adaptive Bayesian replacement policy with minimal repair'', \emph{Operations Research} \textbf{50}(3), 552--558 (2002).
+\bibitem[Feroz et~al.(2009)]{Feroz2009} F.~Feroz, M.~P.~Hobson and M.~Bridges, ``MultiNest: an efficient and robust Bayesian inference tool for cosmology and particle physics'', \emph{MNRAS} \textbf{398}, 1601--1614 (2009).
+\bibitem[Fox(1967)]{Fox1967} B.~Fox, ``Adaptive age replacement'', \emph{Journal of Mathematical Analysis and Applications} \textbf{18}(2), 365--376 (1967).
+\bibitem[Harris(1913)]{Harris1913} F.~W.~Harris, ``How many parts to make at once'', \emph{Factory, The Magazine of Management} \textbf{10}(2), 135--136, 152 (1913).
+\bibitem[Hotelling(1925)]{Hotelling1925} H.~Hotelling, ``A general mathematical theory of depreciation'', \emph{Journal of the American Statistical Association} \textbf{20} (1925).
+\bibitem[Katz(2026)]{Katz2026} H.~E.~Katz, ``Learning debt and cost-sensitive Bayesian retraining: a forecasting operations framework'', arXiv:2604.06438 (2026).
+\bibitem[Lange(2023)]{Lange2023} J.~U.~Lange, ``nautilus: boosting Bayesian importance nested sampling with deep learning'', \emph{MNRAS} \textbf{525}, 3181 (2023).
+\bibitem[Mahadevan \& Mathioudakis(2024)]{Mahadevan2024} A.~Mahadevan and M.~Mathioudakis, ``Cost-aware retraining for machine learning'', \emph{Knowledge-Based Systems} \textbf{293} (2024); arXiv:2310.04216.
+\bibitem[Moss(2020)]{Moss2020} A.~Moss, ``Accelerated Bayesian inference using deep learning'', \emph{MNRAS} \textbf{496}, 328--338 (2020).
+\bibitem[Mukherjee et~al.(2006)]{Mukherjee2006} P.~Mukherjee, D.~Parkinson and A.~R.~Liddle, ``A nested sampling algorithm for cosmological model selection'', \emph{ApJ} \textbf{638}, L51 (2006).
+\bibitem[Nakagawa(2005)]{Nakagawa2005} T.~Nakagawa, \emph{Maintenance Theory of Reliability}, Springer (2005).
+\bibitem[Puterman(1994)]{Puterman1994} M.~L.~Puterman, \emph{Markov Decision Processes: Discrete Stochastic Dynamic Programming}, Wiley (1994).
+\bibitem[Regol et~al.(2025)]{Regol2025} F.~Regol, L.~Schwinn, K.~Sprague, M.~Coates and T.~Markovich, ``When to retrain a machine learning model'', \emph{Proceedings of the 42nd International Conference on Machine Learning}, PMLR \textbf{267}, 51369--51404 (2025).
+\bibitem[Ross(1970)]{Ross1970} S.~M.~Ross, \emph{Applied Probability Models with Optimization Applications}, Holden-Day (1970); Dover reprint (1992).
+\bibitem[Skilling(2006)]{Skilling2006} J.~Skilling, ``Nested sampling for general Bayesian computation'', \emph{Bayesian Analysis} \textbf{1}(4), 833--859 (2006).
+\bibitem[Speagle(2020)]{Speagle2020} J.~S.~Speagle, ``dynesty: a dynamic nested sampling package for estimating Bayesian posteriors and evidences'', \emph{MNRAS} \textbf{493}, 3132--3158 (2020).
+\bibitem[Taylor(1923)]{Taylor1923} J.~S.~Taylor, ``A statistical theory of depreciation based on unit cost'', \emph{Journal of the American Statistical Association} \textbf{18}(144) (1923).
+\bibitem[Tijms(2003)]{Tijms2003} H.~C.~Tijms, \emph{A First Course in Stochastic Models}, Wiley (2003).
+\bibitem[Tirado Serrato(2025)]{TiradoSerrato2025} J.~G.~Tirado Serrato, ``Applications of the Lambert W function in the calculation of optimal replacement time'', \emph{International Journal of Reliability, Quality and Safety Engineering} \textbf{33}(2) (2025).
+\bibitem[Weitzman(1979)]{Weitzman1979} M.~L.~Weitzman, ``Optimal search for the best alternative'', \emph{Econometrica} \textbf{47}(3), 641--654 (1979).
+\bibitem[Williams et~al.(2021)]{Williams2021} M.~J.~Williams, J.~Veitch and C.~Messenger, ``Nested sampling with normalizing flows for gravitational-wave inference'', \emph{Phys.\ Rev.\ D} \textbf{103}, 103006 (2021).
+\bibitem[Williams et~al.(2023)]{Williams2023} M.~J.~Williams, J.~Veitch and C.~Messenger, ``Importance nested sampling with normalising flows'', \emph{Machine Learning: Science and Technology} \textbf{4}, 035011 (2023).
+\bibitem[\v{Z}liobait\.{e} et~al.(2015)]{Zliobaite2015} I.~\v{Z}liobait\.{e}, M.~Budka and F.~Stahl, ``Towards cost-sensitive adaptation: when is it worth updating your predictive model?'', \emph{Neurocomputing} \textbf{150}, 240--249 (2015).
+\end{thebibliography}
 
 \end{document}
