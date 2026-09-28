@@ -469,8 +469,10 @@ class NestedSampler(BaseNestedSampler):
             return np.inf
         if self.condition <= tol:
             return 0.0
+        # log(expm1(c)) = c + log(-expm1(-c)), stable for large c
+        c = self.condition
         return self.nlive * (
-            np.log(np.expm1(self.condition)) - np.log(np.expm1(tol))
+            c + np.log(-np.expm1(-c)) - np.log(np.expm1(tol))
         )
 
     def configure_uninformed_proposal(
