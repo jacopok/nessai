@@ -42,6 +42,10 @@ def configure_population_test_proposal(proposal, rng, samples):
     proposal.training_data = samples([(0.0, 0.0), (1.0, 1.0)])
     proposal._truncation_scheme = TruncationScheme()
     proposal.adapt_latent_temperature = False
+    proposal.clip_population_weights = False
+    proposal._get_population_log_weights = (
+        lambda log_w: FlowProposal._get_population_log_weights(proposal, log_w)
+    )
     proposal.drawsize = 3
     proposal.flow = MagicMock()
     proposal.sample_latent_distribution = MagicMock(

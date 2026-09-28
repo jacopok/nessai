@@ -395,6 +395,28 @@ class MinLogQTruncation(BaseTruncationRule):
         return get_subset_arrays(keep, x, log_q, z)
 
 
+def _live_log_q(proposal):
+    """``log q`` of the training (live) points under the density the pool is
+    drawn from.
+
+    ``backward_pass`` scores draws with the *tempered* latent density
+    (``latent_log_prob(z, latent_temperature)``) while ``forward_pass``
+    returns the untempered flow density, so with ``latent_temperature != 1``
+    the live points are rescored at the same temperature before a threshold
+    is taken from them.
+    """
+    live_points = proposal.training_data.copy()
+    z, log_q = proposal.forward_pass(live_points)
+    temperature = getattr(proposal, "latent_temperature", None)
+    if temperature not in (None, 1.0):
+        log_q = (
+            log_q
+            + proposal.latent_log_prob(z, temperature)
+            - proposal.latent_log_prob(z, None)
+        )
+    return live_points, log_q
+
+
 class LogProposalThresholdTruncation(BaseTruncationRule):
     """Truncate samples using the current log-proposal threshold."""
 
@@ -402,6 +424,7 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
     _transient_defaults = {"_threshold": np.nan}
 
     def __init__(self, quantile: float = 0.05) -> None:
+        super().__init__()
         self.quantile = float(quantile)
 
     @property
@@ -409,8 +432,7 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
         return self._threshold
 
     def prepare(self, proposal, worst_point, radius=None):
-        live_points = proposal.training_data.copy()
-        log_q = proposal.forward_pass(live_points)[1]
+        _, log_q = _live_log_q(proposal)
         self._threshold = float(np.quantile(log_q, self.quantile))
 
     def apply_after_backward(self, proposal, x, log_q, z):
@@ -478,8 +500,7 @@ class LogWeightThresholdTruncation(BaseTruncationRule):
         return self._threshold
 
     def prepare(self, proposal, worst_point, radius=None):
-        live_points = proposal.training_data.copy()
-        log_q = proposal.forward_pass(live_points)[1]
+        live_points, log_q = _live_log_q(proposal)
         log_w = proposal.compute_weights(
             live_points,
             log_q=log_q,

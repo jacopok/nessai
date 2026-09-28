@@ -2,7 +2,7 @@
 """Standalone tests for truncation rules and helpers."""
 
 import logging
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -459,3 +459,35 @@ def test_truncation_scheme_prepare_and_reset(proposal):
     assert np.isnan(radius_rule.radius)
     assert np.isnan(radius_rule.threshold)
     assert np.isnan(likelihood_rule.threshold)
+
+
+@pytest.mark.parametrize("temperature", [None, 1.0, 2.0])
+def test_log_proposal_threshold_uses_tempered_live_log_q(temperature):
+    """The live points are scored at the pool's latent temperature, so the
+    threshold is comparable with the tempered ``log_q`` of the draws."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    z = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]])
+    log_q = np.array([-1.0, -2.0, -3.0, -4.0])
+    proposal = MagicMock()
+    proposal.training_data = np.zeros(4)
+    proposal.forward_pass = MagicMock(return_value=(z, log_q))
+    proposal.latent_temperature = temperature
+
+    def latent_log_prob(z, temperature=None):
+        t = 1.0 if temperature is None else temperature
+        return -0.5 * np.sum(z**2, axis=-1) / t - 0.5 * z.shape[-1] * np.log(t)
+
+    proposal.latent_log_prob = latent_log_prob
+
+    rule = LogProposalThresholdTruncation(quantile=0.5)
+    rule.prepare(proposal, worst_point=None)
+
+    expected = log_q
+    if temperature not in (None, 1.0):
+        expected = (
+            log_q + latent_log_prob(z, temperature) - latent_log_prob(z)
+        )
+    assert rule.threshold == pytest.approx(np.quantile(expected, 0.5))
