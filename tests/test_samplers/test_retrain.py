@@ -300,3 +300,27 @@ def test_sampling_with_benchmark_costs(
     fs.run(plot=False)
     assert fs.ns.retrain_decision.cost.deterministic
     assert (tmp_path / "retrain_costs_benchmark.json").exists()
+
+
+def test_retrain_logs_calculation(rng, caplog):
+    """Every retrain is logged at info level with the inputs."""
+    caplog.set_level(logging.INFO, logger="nessai.samplers.retrain")
+    d = make_decision(horizon=False, plan_pool=False, allow_reset=True)
+    d.cost.provided["training"] = 1e-9
+    it = run_episodes(d, rng, [np.log(0.3)] * 4, 300)
+    assert d.decide(it, 2000) is True
+    msg = caplog.records[-1]
+    assert msg.levelno == logging.INFO
+    for key in ("Retraining", "c*P=", "g**n=", "acc=", "decay=", "T=", "tau*="):
+        assert key in msg.getMessage()
+    assert "reset gain" in msg.getMessage()
+
+
+def test_continue_not_logged_at_info(rng, caplog):
+    caplog.set_level(logging.INFO, logger="nessai.samplers.retrain")
+    d = make_decision(horizon=False, plan_pool=False)
+    d.cost.provided["training"] = 1.0
+    it = run_episodes(d, rng, [np.log(0.3)] * 4, 300)
+    caplog.clear()
+    assert d.decide(it, 2000) is False
+    assert not caplog.records

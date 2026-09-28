@@ -643,7 +643,9 @@ class RetrainDecision:
             return True
         best = warm
         reset = False
+        gain = None
         if self.allow_reset:
+            gain = self.reset_gain()
             rst = self.long_run_rate(reset=True)
             if rst is not None and rst["g"] < warm["g"]:
                 best = rst
@@ -669,14 +671,14 @@ class RetrainDecision:
             h = max(remaining, 1.0)
             k_cur = -mean[1] if mean[1] < 0 else k
             # E[exp(-log a(s'))] integrated over the remaining iterations
-            cont = (
+            cost_continue = (
                 c
                 * np.exp(-log_a + 0.5 * sd**2)
                 * np.expm1(k_cur * h)
                 / k_cur
             )
-            new = best["T"] + c / best["a"] * np.expm1(k * h) / k
-            retrain = bool(new < cont)
+            cost_optimal = best["T"] + c / best["a"] * np.expm1(k * h) / k
+            retrain = bool(cost_optimal < cost_continue)
             reason = "horizon"
         self.reset_next = retrain and reset
         self.next_poolsize = None
@@ -687,6 +689,8 @@ class RetrainDecision:
                 self.next_poolsize = int(max(p, p_min))
             elif block < pool_size:
                 self.next_poolsize = int(block)
+        fresh = self.fresh_acceptance(reset=reset)
+        k_mean, k_var = self.slope()
         self._log(
             iteration,
             s,
@@ -695,8 +699,21 @@ class RetrainDecision:
             reset=self.reset_next,
             log_a=log_a,
             log_a_sd=sd,
+            slope=-mean[1],
+            slope_sd=np.sqrt(max(cov[1, 1], 0.0)),
+            block=block,
             n_block=n,
-            rate_continue=cost_continue / max(n, 1e-12),
+            cost_continue=cost_continue,
+            cost_optimal=cost_optimal,
+            rate_continue=c * block / max(n, 1e-12),
+            fresh_log_a=fresh[0],
+            fresh_log_a_sd=np.sqrt(fresh[1]),
+            k=-k_mean,
+            k_sd=np.sqrt(k_var),
+            reset_gain=gain[0] if gain else None,
+            reset_gain_sd=np.sqrt(gain[1]) if gain else None,
+            c=c,
+            T=best["T"],
             g=best["g"],
             tau=best["tau"],
             y=best["y"],
@@ -725,20 +742,62 @@ class RetrainDecision:
         d = dict(iteration=iteration, since_training=s, retrain=retrain)
         d.update(kwargs)
         self.log.append(d)
-        if "g" in kwargs:
-            logger.debug(
-                "Retrain decision at it %d (s=%d): acc=%.3g+/-%.2g(log) "
-                "rate=%.3g g*=%.3g tau*=%.0f -> %s%s",
-                iteration,
-                s,
-                np.exp(kwargs["log_a"]),
-                kwargs["log_a_sd"],
-                kwargs["rate_continue"],
-                kwargs["g"],
-                kwargs["tau"],
-                "retrain" if retrain else "continue",
-                " (reset)" if kwargs.get("reset") else "",
+        if "g" not in kwargs:
+            if retrain:
+                logger.info(
+                    "Retraining at iteration %d (%d iterations since the "
+                    "last training): %s",
+                    iteration,
+                    s,
+                    kwargs.get("reason"),
+                )
+            return
+        msg = self.format_decision(d)
+        if retrain:
+            logger.info(msg)
+        else:
+            logger.debug(msg)
+
+    def format_decision(self, d):
+        """One-line description of a logged decision and its inputs."""
+        nlive = self.nlive
+        if d["reason"] == "horizon":
+            compare = (
+                f"cost to the end ({d['remaining']:.0f} it) continuing "
+                f"{d['cost_continue']:.3g}s vs retraining "
+                f"{d['cost_optimal']:.3g}s"
             )
+        else:
+            compare = (
+                f"next pool P={d['block']:.0f} -> n={d['n_block']:.0f} it: "
+                f"c*P={d['cost_continue']:.3g}s vs g**n="
+                f"{d['cost_optimal']:.3g}s"
+            )
+        reset = ""
+        if d.get("reset_gain") is not None:
+            reset = (
+                f"; reset gain dlogA={d['reset_gain']:.2f}"
+                f"+/-{d['reset_gain_sd']:.2f}"
+            )
+        pool = ""
+        if d.get("poolsize") is not None:
+            pool = f"; next pool {d['poolsize']}"
+        action = "Retraining" if d["retrain"] else "Not retraining"
+        if d.get("reset"):
+            action = "Resetting and retraining"
+        return (
+            f"{action} at iteration {d['iteration']} "
+            f"(s={d['since_training']}, rule={d['reason']}): {compare}. "
+            f"Current flow: acc={np.exp(d['log_a']):.3g} "
+            f"(log sd {d['log_a_sd']:.2f}), "
+            f"decay={d['slope'] * nlive:.2f}+/-{d['slope_sd'] * nlive:.2f}"
+            f"/nlive. Fresh flow: acc={np.exp(d['fresh_log_a']):.3g} "
+            f"(log sd {d['fresh_log_a_sd']:.2f}), "
+            f"decay={d['k'] * nlive:.2f}+/-{d['k_sd'] * nlive:.2f}/nlive. "
+            f"Costs: c={d['c']:.3g}s/point, T={d['T']:.3g}s -> "
+            f"y={d['y']:.3g}, g*={d['g']:.3g}s/it, tau*={d['tau']:.0f} it"
+            f"{reset}{pool}"
+        )
 
     def summary(self):
         """Summary of the fitted quantities at the end of a run."""
