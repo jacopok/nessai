@@ -43,6 +43,29 @@ def _clip_weights(weights: np.ndarray) -> np.ndarray:
     return weights
 
 
+def _weight_cap_for_mass(weights: np.ndarray, mass: float) -> float:
+    """Smallest cap ``c`` whose excess ``sum(max(w - c, 0))`` is at most
+    ``mass * sum(w)``.
+
+    Rejection sampling with the bound ``c`` instead of ``max(w)`` accepts a
+    draw with probability ``min(w, c) / c``, so the population follows
+    ``p * min(1, c / w)``: exactly the prior except on the draws above the
+    cap, which lose the fraction ``mass`` of the prior mass of the support
+    (as estimated by the draws themselves).
+    """
+    w = np.sort(weights[np.isfinite(weights)])[::-1]
+    if not len(w):
+        return np.nan
+    total = w.sum()
+    top = np.cumsum(w)
+    k = np.arange(1, len(w) + 1)
+    # excess over a cap equal to the k-th largest weight: increasing in k
+    excess = top - k * w
+    n = int(np.searchsorted(excess, mass * total, side="right"))
+    # the cap lies between the (n+1)-th and n-th largest weights
+    return float(max((top[n - 1] - mass * total) / n, w[min(n, len(w) - 1)]))
+
+
 class FlowProposal(BaseFlowProposal):
     """Proposal that samples in latent space using the trained flow.
 
@@ -135,6 +158,16 @@ class FlowProposal(BaseFlowProposal):
         The keyword arguments to use for the truncation methods when populating
         the pool. When using :code:`truncation_methods`, the keys of this
         dictionary should match the names of the truncation methods.
+    clip_population_weights : bool, optional
+        Clip the largest ``ceil(sqrt(N))`` rejection weights to their mean.
+    population_weight_cap_mass : float, optional
+        If set, the rejection bound is the smallest weight cap under which the
+        draws above it lose at most this fraction of the prior mass of the
+        proposal's support (instead of the largest weight). Trades a
+        controlled under-sampling of the lowest-density fringe of the
+        support for population efficiency. Best combined with
+        :code:`accumulate_weights=True`, which sets the cap from every draw
+        of the populate call rather than batch by batch.
     **kwargs
         Additional keyword arguments to pass to the base class.
     """
@@ -166,6 +199,7 @@ class FlowProposal(BaseFlowProposal):
         truncation_methods=None,
         truncation_kwargs=None,
         clip_population_weights=False,
+        population_weight_cap_mass=None,
         **kwargs,
     ):
         super().__init__(model, poolsize=poolsize, **kwargs)
@@ -182,6 +216,7 @@ class FlowProposal(BaseFlowProposal):
             latent_temperature_validation_size=latent_temperature_validation_size,
             latent_temperature_warmup=latent_temperature_warmup,
             clip_population_weights=clip_population_weights,
+            population_weight_cap_mass=population_weight_cap_mass,
         )
 
         self._truncation_scheme = TruncationScheme()
@@ -308,6 +343,7 @@ class FlowProposal(BaseFlowProposal):
         latent_temperature_validation_size=None,
         latent_temperature_warmup=2,
         clip_population_weights=False,
+        population_weight_cap_mass=None,
     ) -> None:
         """Configure settings related to population."""
         if drawsize is None:
@@ -344,11 +380,29 @@ class FlowProposal(BaseFlowProposal):
         self.latent_temperature_warmup = int(latent_temperature_warmup)
         self.latent_temperature_history = []
         self.clip_population_weights = clip_population_weights
+        if population_weight_cap_mass is not None:
+            population_weight_cap_mass = float(population_weight_cap_mass)
+            if not 0.0 < population_weight_cap_mass < 1.0:
+                raise ValueError(
+                    "population_weight_cap_mass must be in (0, 1)"
+                )
+            if clip_population_weights:
+                raise ValueError(
+                    "clip_population_weights and population_weight_cap_mass "
+                    "are mutually exclusive"
+                )
+        self.population_weight_cap_mass = population_weight_cap_mass
 
     def _get_population_log_weights(self, log_weights) -> np.ndarray:
         """Return log-weights used in the rejection step during population."""
         log_weights = np.asarray(log_weights, dtype=float)
         log_weights = log_weights - np.nanmax(log_weights)
+        cap_mass = getattr(self, "population_weight_cap_mass", None)
+        if cap_mass is not None:
+            cap = _weight_cap_for_mass(np.exp(log_weights), cap_mass)
+            if not np.isfinite(cap) or cap <= 0:
+                return log_weights
+            return np.minimum(log_weights - np.log(cap), 0.0)
         if not self.clip_population_weights:
             return log_weights
 

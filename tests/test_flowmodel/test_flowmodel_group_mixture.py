@@ -2566,3 +2566,77 @@ def test_clustered_importance_summaries_logged_at_retrain(caplog):
     with caplog.at_level(logging.INFO, logger="nessai.flowmodel.group_mixture"):
         GroupFlowProposalMixin._log_importance_summaries(w)
     assert "importance expert weights" in caplog.text
+
+
+# -- mixture pieces for the log_level_threshold truncation --------------------
+def _pieces_proposal(model, x):
+    class _Prop(GroupFlowProposalMixin):
+        pass
+
+    prop = _Prop()
+    prop.flow = MagicMock(model=model)
+    prop._training_data_as_prime_tensor = MagicMock(return_value=x)
+    return prop
+
+
+def test_mixture_levels_divide_out_the_element_weights():
+    w = _expert()
+    rng = np.random.default_rng(7)
+    x = torch.cat([points_in_element(k, 20, rng) for k in range(GROUP_SIZE)])
+    prop = _pieces_proposal(w, x)
+    levels = []
+    for weights in ([0.25, 0.25, 0.25, 0.25], [0.7, 0.2, 0.09, 0.01]):
+        with torch.no_grad():
+            w.weights.copy_(torch.tensor(weights))
+            log_q = w.log_prob(x).numpy()
+        piece, level = prop.mixture_levels(np.zeros(len(x)), log_q)
+        assert piece.shape == level.shape == (len(x), 1)
+        np.testing.assert_array_equal(piece[:, 0], np.repeat(np.arange(4), 20))
+        levels.append(level[:, 0])
+    # the level is the element's own flow density: weight-free
+    np.testing.assert_allclose(levels[0], levels[1], atol=1e-5)
+
+
+def test_mixture_levels_of_a_zero_weight_element_are_minus_inf():
+    w = _expert()
+    rng = np.random.default_rng(9)
+    x = torch.cat([points_in_element(k, 5, rng) for k in range(GROUP_SIZE)])
+    with torch.no_grad():
+        w.weights.copy_(torch.tensor([0.5, 0.5, 0.0, 0.0]))
+    prop = _pieces_proposal(w, x)
+    _, level = prop.mixture_levels(np.zeros(len(x)), np.zeros(len(x)))
+    assert np.all(np.isneginf(level[10:, 0]))
+    assert np.all(np.isfinite(level[:10, 0]))
+
+
+def test_mixture_levels_of_a_clustered_mixture():
+    """Every expert gives a candidate: its own flow's density at x, free of
+    both the expert and the element weights; a zero-weight piece gives -inf
+    (a draw of expert 0 in a region routed to expert 1 is then judged by
+    expert 0's level, not waved through)."""
+    rng = np.random.default_rng(8)
+    x = points_in_element(1, 30, rng)
+    w = _clustered_wrapper(2)
+    prop = _pieces_proposal(w, x)
+    levels = []
+    for weights in ((0.8, 0.2), (0.3, 0.7)):
+        _k2(w, weights)
+        with torch.no_grad():
+            log_q = w.log_prob(x).numpy()
+        piece, level = prop.mixture_levels(np.zeros(len(x)), log_q)
+        assert piece.shape == (len(x), 2)
+        np.testing.assert_array_equal(piece[:, 0], 1)
+        np.testing.assert_array_equal(piece[:, 1], GROUP_SIZE + 1)
+        with torch.no_grad():
+            own = torch.stack([
+                e.log_prob(x) - torch.log(e.weights[1]) for e in w.experts
+            ], dim=1).numpy()
+        np.testing.assert_allclose(level, own, atol=1e-4)
+        levels.append(level)
+    np.testing.assert_allclose(levels[0], levels[1], atol=1e-4)
+    with torch.no_grad():
+        w.experts[1].weights.copy_(torch.tensor([0.5, 0.0, 0.5, 0.0]))
+        log_q = w.log_prob(x).numpy()
+    _, level = prop.mixture_levels(np.zeros(len(x)), log_q)
+    assert np.all(np.isneginf(level[:, 1]))
+    np.testing.assert_allclose(level[:, 0], levels[1][:, 0], atol=1e-4)

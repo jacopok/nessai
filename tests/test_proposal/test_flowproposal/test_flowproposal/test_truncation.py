@@ -491,3 +491,159 @@ def test_log_proposal_threshold_uses_tempered_live_log_q(temperature):
             log_q + latent_log_prob(z, temperature) - latent_log_prob(z)
         )
     assert rule.threshold == pytest.approx(np.quantile(expected, 0.5))
+
+
+# -- log_level_threshold ------------------------------------------------------
+def _level_proposal(live_x, weights, with_pieces=True):
+    """Mock two-piece proposal on a line: piece 1 is x < 0, the flow level is
+    -x**2 and q = w_piece * exp(level)."""
+    from nessai.livepoint import empty_structured_array
+
+    def arr(xs):
+        a = empty_structured_array(len(xs), names=["x"])
+        a["x"] = xs
+        return a
+
+    def pieces(x):
+        p = (x["x"] < 0).astype(int)
+        return p, np.log(np.asarray(weights, float))[p]
+
+    proposal = MagicMock(spec=["training_data", "forward_pass",
+                               "latent_temperature", "compute_weights",
+                               "training_count", "mixture_levels"])
+    proposal.training_data = arr(live_x)
+    proposal.latent_temperature = None
+    proposal.training_count = 0
+
+    def log_q_of(x):
+        p, log_pi = pieces(x)
+        return -x["x"] ** 2 + (log_pi if with_pieces else 0.0)
+
+    proposal.forward_pass = MagicMock(
+        side_effect=lambda x: (np.zeros((len(x), 1)), log_q_of(x)))
+    proposal.compute_weights = MagicMock(side_effect=lambda x, log_q: -log_q)
+    def levels(x, log_q):
+        p, log_pi = pieces(x)
+        return p[:, None], (np.asarray(log_q) - log_pi)[:, None]
+
+    if with_pieces:
+        proposal.mixture_levels = MagicMock(side_effect=levels)
+    else:
+        del proposal.mixture_levels
+    return proposal, arr, log_q_of
+
+
+def test_log_level_threshold_ignores_piece_weights():
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    rng = np.random.default_rng(0)
+    live_x = np.r_[rng.uniform(0, 1, 990), rng.uniform(-0.2, -0.1, 10)]
+    draws = rng.uniform(-1, 1, 5000)
+    kept = []
+    for weights in ([0.5, 0.5], [0.99, 0.01]):
+        proposal, arr, log_q_of = _level_proposal(live_x, weights)
+        rule = LogLevelThresholdTruncation(quantile=0.1)
+        rule.prepare(proposal, worst_point=None)
+        assert rule.threshold == pytest.approx(np.quantile(-live_x**2, 0.1))
+        x = arr(draws)
+        out, _, _ = rule.apply_after_backward(
+            proposal, x, log_q_of(x), np.zeros((len(x), 1)))
+        kept.append(np.sort(out["x"]))
+    np.testing.assert_array_equal(kept[0], kept[1])
+
+
+def test_log_level_threshold_without_pieces_is_log_q_threshold():
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    live_x = np.linspace(-1, 1, 101)
+    proposal, _, log_q_of = _level_proposal(live_x, [0.3, 0.7],
+                                            with_pieces=False)
+    rule = LogLevelThresholdTruncation(quantile=0.2)
+    rule.prepare(proposal, worst_point=None)
+    assert rule.threshold == pytest.approx(
+        np.quantile(log_q_of(proposal.training_data), 0.2))
+
+
+def test_log_level_threshold_tightens_an_overrepresented_piece():
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    rng = np.random.default_rng(1)
+    # piece 1 holds 1 % of the live points, all near the flow's core, but a
+    # full-size copy of the support (half of the prior mass)
+    live_x = np.r_[rng.uniform(0, 1, 990), -np.linspace(0.1, 0.2, 10)]
+    proposal, arr, log_q_of = _level_proposal(live_x, [0.5, 0.5])
+    rule = LogLevelThresholdTruncation(quantile=0.005, share_cap=4.0)
+    # through the scheme, as populate() does: its reset must keep the draws
+    scheme = TruncationScheme([rule])
+    scheme.prepare(proposal, worst_point=None)    # new flow: no floors yet
+    assert rule.floors == {}
+    x = arr(rng.uniform(-1, 1, 20000))
+    scheme.apply_after_backward(proposal, x, log_q_of(x), np.zeros((len(x), 1)))
+    scheme.prepare(proposal, worst_point=None)
+    # the share target (4 x ~1 % of the pool) sits above piece 1's lowest
+    # live point, so the floor stops there: no live point is cut out
+    assert list(rule.floors) == [1]
+    assert rule.floors[1] == pytest.approx(-(0.2**2))
+    x = arr(rng.uniform(-1, 1, 20000))
+    out, _, _ = rule.apply_after_backward(
+        proposal, x, log_q_of(x), np.zeros((len(x), 1)))
+    neg = out["x"][out["x"] < 0]
+    assert neg.min() > -0.2
+    assert np.all(out["x"][out["x"] >= 0] ** 2 < -rule.threshold)
+    # a retrained flow starts again from the global threshold
+    proposal.training_count = 1
+    rule.prepare(proposal, worst_point=None)
+    assert rule.floors == {}
+
+
+def test_log_level_threshold_rejects_cap_below_one():
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    with pytest.raises(ValueError, match="share_cap"):
+        LogLevelThresholdTruncation(share_cap=0.5)
+
+
+def test_log_level_threshold_keeps_a_point_any_candidate_clears():
+    """Overlapping components: a point is in the support if any candidate
+    clears its piece's threshold; a zero-weight piece (-inf) never does."""
+    from nessai.livepoint import empty_structured_array
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    live = empty_structured_array(100, names=["x"])
+    live["x"] = np.linspace(0, 1, 100)
+    proposal = MagicMock(spec=["training_data", "forward_pass",
+                               "latent_temperature", "mixture_levels"])
+    proposal.training_data = live
+    proposal.latent_temperature = None
+    proposal.forward_pass = MagicMock(
+        side_effect=lambda x: (np.zeros((len(x), 1)), -x["x"]))
+    # candidate 0: level -x (piece 0); candidate 1: level -x - 5 (piece 1),
+    # except points with x > 2, where piece 0 has zero weight and piece 1
+    # has level 0
+    def levels(x, log_q):
+        a = -x["x"].astype(float)
+        b = a - 5.0
+        far = x["x"] > 2
+        a = np.where(far, -np.inf, a)
+        b = np.where(far, 0.0, b)
+        return np.tile([0, 1], (len(x), 1)), np.stack([a, b], axis=1)
+
+    proposal.mixture_levels = MagicMock(side_effect=levels)
+    rule = LogLevelThresholdTruncation(quantile=0.5)
+    rule.prepare(proposal, worst_point=None)
+    assert rule.threshold == pytest.approx(-0.5, abs=0.01)
+    x = empty_structured_array(4, names=["x"])
+    x["x"] = [0.2, 0.9, 3.0, 1.5]
+    out, _, _ = rule.apply_after_backward(
+        proposal, x, -x["x"], np.zeros((4, 1)))
+    np.testing.assert_array_equal(out["x"], [0.2, 3.0])

@@ -445,6 +445,187 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
         return get_subset_arrays(keep, x, log_q, z)
 
 
+class LogLevelThresholdTruncation(BaseTruncationRule):
+    """Truncate on the proposal density with each mixture piece's weight
+    divided out, optionally tightening over-represented pieces.
+
+    For a mixture proposal ``q(x) = pi_p(x) f_p(x)`` whose pieces ``p`` tile
+    the space (the group elements of a group-mixture flow, times its experts),
+    the support is ``{log q(x) - log pi_p(x) > t}`` with ``t`` the
+    ``quantile`` of the same level over the live points.  Unlike
+    :class:`LogProposalThresholdTruncation` the support does not depend on the
+    piece weights, so re-weighting the pieces (e.g. importance weights) moves
+    draws between pieces without moving any piece's boundary -- and without
+    moving the threshold, which a piece with a small weight otherwise drags
+    down through its live points' low ``log q``.
+
+    With ``share_cap``, a piece whose share of the prior mass of the support
+    (estimated from the draws of the previous populate) exceeds ``share_cap``
+    times its share of the live points gets its own, higher level floor: the
+    level above which its prior mass is ``share_cap`` times its live share,
+    but never above its lowest live point.  A symmetry image the likelihood is
+    abandoning then stops holding a full-size copy of the support.  Floors are
+    relaxed by ``relax`` when a piece falls well inside the cap, and are
+    reset whenever the flow is retrained.
+
+    The proposal supplies ``mixture_levels(x, log_q) -> (pieces, levels)``,
+    both of shape ``(n, k)``: one candidate (piece, level) per mixture
+    component that can generate ``x`` (e.g. per overlapping expert), with
+    level ``-inf`` for a component whose piece has zero weight.  A point is
+    in the support if any candidate clears its piece's threshold, and is
+    counted towards its highest-level candidate.  Proposals without the
+    method are a single piece with level ``log q``: the rule is then
+    :class:`LogProposalThresholdTruncation`.
+    """
+
+    name = "log_level_threshold"
+    # ``_draws`` (the last pool's kept draws, for the share cap) must survive
+    # the scheme's reset at the start of the next ``prepare``, which uses them
+    _transient_defaults = {"_threshold": np.nan}
+
+    def __init__(
+        self,
+        quantile: float = 0.005,
+        share_cap: float | None = None,
+        relax: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.quantile = float(quantile)
+        if share_cap is not None and share_cap < 1:
+            raise ValueError("share_cap must be >= 1")
+        self.share_cap = None if share_cap is None else float(share_cap)
+        self.relax = float(relax)
+        self._floors = {}
+        self._floors_training = None
+        self._draws = []
+
+    @property
+    def threshold(self) -> float:
+        return self._threshold
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["_draws"] = []   # up to a pool's worth of draws: not checkpointed
+        return state
+
+    @property
+    def floors(self) -> dict:
+        """Per-piece level floors above the global threshold."""
+        return dict(self._floors)
+
+    @staticmethod
+    def _levels(proposal, x, log_q):
+        log_q = np.asarray(log_q, dtype=float)
+        fn = getattr(proposal, "mixture_levels", None)
+        if fn is None:
+            return np.zeros((len(x), 1), dtype=int), log_q[:, None]
+        pieces, levels = fn(x, log_q)
+        return (
+            np.asarray(pieces, dtype=int).reshape(len(x), -1),
+            np.asarray(levels, dtype=float).reshape(len(x), -1),
+        )
+
+    @staticmethod
+    def _best(pieces, levels):
+        """Each point's highest-level candidate."""
+        k = np.argmax(levels, axis=1)
+        rows = np.arange(len(k))
+        return pieces[rows, k], levels[rows, k]
+
+    def _point_thresholds(self, pieces):
+        thr = np.full(pieces.shape, self._threshold)
+        for piece, floor in self._floors.items():
+            thr[pieces == piece] = max(self._threshold, floor)
+        return thr
+
+    def prepare(self, proposal, worst_point, radius=None):
+        _, log_q = _live_log_q(proposal)
+        n = len(proposal.training_data)
+        # rows past ``n`` are boundary-inversion mirror copies
+        pieces, level = self._best(
+            *self._levels(proposal, proposal.training_data, log_q[:n])
+        )
+        self._threshold = float(np.quantile(level, self.quantile))
+        if self.share_cap is not None:
+            self._update_floors(proposal, pieces, level)
+        self._draws = []
+
+    def _update_floors(self, proposal, live_pieces, live_level):
+        training = getattr(proposal, "training_count", None)
+        if training != self._floors_training:
+            # a new flow: levels are not comparable with the old ones
+            self._floors = {}
+            self._floors_training = training
+            return
+        if not self._draws:
+            return
+        d_piece = np.concatenate([d[0] for d in self._draws])
+        d_level = np.concatenate([d[1] for d in self._draws])
+        d_logw = np.concatenate([d[2] for d in self._draws])
+        ok = np.isfinite(d_logw) & (d_piece >= 0)
+        if not ok.any():
+            return
+        d_piece, d_level = d_piece[ok], d_level[ok]
+        w = np.exp(d_logw[ok] - d_logw[ok].max())
+        total = w.sum()
+        valid = live_pieces >= 0
+        all_pieces = np.union1d(np.unique(d_piece), live_pieces[valid])
+        n_live = int(valid.sum())
+        changed = []
+        for piece in all_pieces:
+            in_live = valid & (live_pieces == piece)
+            live_share = (in_live.sum() + 0.5) / (n_live + 0.5 * len(all_pieces))
+            sel = d_piece == piece
+            share = w[sel].sum() / total
+            floor = self._floors.get(piece, -np.inf)
+            if share > self.share_cap * live_share:
+                order = np.argsort(-d_level[sel])
+                cum = np.cumsum(w[sel][order])
+                idx = min(
+                    int(np.searchsorted(cum, self.share_cap * live_share * total)),
+                    len(order) - 1,
+                )
+                floor = max(floor, float(d_level[sel][order][idx]))
+            elif share < 0.5 * self.share_cap * live_share:
+                floor = floor - self.relax
+            if in_live.any():
+                floor = min(floor, float(live_level[in_live].min()))
+            if floor > self._threshold:
+                if self._floors.get(piece) != floor:
+                    changed.append((int(piece), share, live_share))
+                self._floors[piece] = floor
+            else:
+                self._floors.pop(piece, None)
+        if changed:
+            logger.info(
+                "Level threshold %.3f: %d piece(s) tightened (pool/live share: "
+                "%s)",
+                self._threshold,
+                len(self._floors),
+                ", ".join(
+                    f"{p}: {s:.3g}/{l:.3g}" for p, s, l in changed[:8]
+                ),
+            )
+
+    def apply_after_backward(self, proposal, x, log_q, z):
+        cand_pieces, cand_levels = self._levels(proposal, x, log_q)
+        keep = np.any(
+            cand_levels > self._point_thresholds(cand_pieces), axis=1
+        )
+        if self.share_cap is not None and keep.any():
+            pieces, level = self._best(cand_pieces[keep], cand_levels[keep])
+            log_w = proposal.compute_weights(x[keep], log_q[keep])
+            if self._draws is None:
+                self._draws = []
+            self._draws.append((pieces, level, np.asarray(log_w)))
+        logger.debug(
+            "Accepting %s / %s samples above the level threshold",
+            int(keep.sum()),
+            len(x),
+        )
+        return get_subset_arrays(keep, x, log_q, z)
+
+
 class LikelihoodThresholdTruncation(BaseTruncationRule):
     """Truncate samples using the current likelihood threshold."""
 
@@ -527,6 +708,7 @@ TRUNCATION_REGISTRY = {
     "min_log_q": MinLogQTruncation,
     "likelihood_threshold": LikelihoodThresholdTruncation,
     "log_proposal_threshold": LogProposalThresholdTruncation,
+    "log_level_threshold": LogLevelThresholdTruncation,
     "weights_threshold": LogWeightThresholdTruncation,
 }
 

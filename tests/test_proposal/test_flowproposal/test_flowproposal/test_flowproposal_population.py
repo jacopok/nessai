@@ -5,6 +5,7 @@ import datetime
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from nessai.livepoint import empty_structured_array
 from nessai.proposal import FlowProposal
@@ -209,3 +210,46 @@ def test_populate_stops_at_max_samples_after_all_likelihood_rejected(
     proposal.compute_weights.assert_not_called()
     assert proposal.x.size == 0
     assert proposal.population_acceptance == 0.0
+
+
+def test_weight_cap_for_mass_bounds_the_excess():
+    from nessai.proposal.flowproposal.flowproposal import _weight_cap_for_mass
+
+    rng = np.random.default_rng(0)
+    w = rng.pareto(3.0, size=20000) + 1.0
+    for mass in (1e-3, 1e-2, 0.1):
+        cap = _weight_cap_for_mass(w, mass)
+        excess = np.maximum(w - cap, 0.0).sum() / w.sum()
+        assert excess == pytest.approx(mass, rel=1e-6)
+    # a cap below the smallest weight is never returned
+    assert _weight_cap_for_mass(np.ones(10), 0.5) == pytest.approx(1.0)
+
+
+def test_population_log_weights_capped_by_mass(proposal):
+    proposal.clip_population_weights = False
+    proposal.population_weight_cap_mass = 0.01
+    rng = np.random.default_rng(1)
+    log_w = np.log(rng.pareto(2.0, size=5000) + 1.0)
+    out = FlowProposal._get_population_log_weights(proposal, log_w)
+    w = np.exp(log_w)
+    assert out.max() == 0.0
+    # rejection accepts min(w, c) / c: the prior mass lost is the excess
+    from nessai.proposal.flowproposal.flowproposal import _weight_cap_for_mass
+
+    cap = _weight_cap_for_mass(w / w.max(), 0.01) * w.max()
+    np.testing.assert_allclose(np.exp(out), np.minimum(w, cap) / cap)
+    lost = 1.0 - (np.exp(out) * cap).sum() / w.sum()
+    assert lost == pytest.approx(0.01, rel=1e-6)
+
+
+def test_population_weight_cap_mass_validation(proposal):
+    for bad in (0.0, 1.0):
+        with pytest.raises(ValueError, match="population_weight_cap_mass"):
+            FlowProposal.configure_population(
+                proposal, 10, population_weight_cap_mass=bad
+            )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        FlowProposal.configure_population(
+            proposal, 10, clip_population_weights=True,
+            population_weight_cap_mass=0.01,
+        )

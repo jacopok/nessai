@@ -2920,6 +2920,63 @@ class GroupFlowProposalMixin:
             )
         )
 
+    def mixture_levels(self, x, log_q):
+        """Candidate (piece, level) of every point of ``x``, one per expert.
+
+        A piece is an (expert, group element) pair -- index
+        ``expert * group_size + element`` -- with weight ``pi = expert weight
+        * element weight`` in the generative path.  Its level at ``x`` is the
+        density of the piece's own flow there, ``log q_j(x) - log pi`` in the
+        mixture's space, carried over to ``log_q``'s space by the Jacobian
+        ``log_q - log q_mixture``.  The experts overlap (``q`` is the
+        weighted sum over them), so every expert gives a candidate; a piece
+        of zero weight cannot make the point and gets level ``-inf``.  A
+        point no element of an expert claims gets piece ``-1`` and that
+        expert's unweighted density.  Used by the ``log_level_threshold``
+        truncation rule.  Returns two ``(n, k)`` arrays.
+        """
+        log_q = np.asarray(log_q, dtype=float)
+        model = getattr(self.flow, "model", None)
+        n = len(x)
+        if model is None or not hasattr(model, "_assign_branch") or not n:
+            return np.zeros((n, 1), dtype=int), log_q.reshape(n, 1)
+        xp = self._training_data_as_prime_tensor(x)[:n]
+        experts = getattr(model, "experts", None)
+        clustered = experts is not None and model._active() > 1
+        with torch.no_grad():
+            if clustered:
+                act = model._active()
+                wrappers = [experts[j] for j in range(act)]
+                log_w = torch.log(model.proposal_weights[:act])
+                lps = torch.stack([e.log_prob(xp) for e in wrappers])
+                log_qm = model._blend_bg(
+                    torch.logsumexp(lps + log_w[:, None], dim=0), xp
+                )
+            else:
+                wrappers = [experts[0] if experts is not None else model]
+                log_w = torch.zeros(1, dtype=xp.dtype, device=xp.device)
+                log_qm = None
+            pieces, levels = [], []
+            for j, wrapper in enumerate(wrappers):
+                element, _, claimed = wrapper._assign_branch(xp)
+                log_el = torch.where(
+                    claimed,
+                    torch.log(wrapper.proposal_weights)[element],
+                    torch.zeros(n, dtype=xp.dtype, device=xp.device),
+                )
+                log_pi = log_w[j] + log_el
+                if clustered:
+                    lvl = lps[j] - log_el - log_qm
+                else:
+                    lvl = -log_el
+                piece = j * model.group_size + element
+                piece = torch.where(claimed, piece, torch.full_like(piece, -1))
+                pieces.append(piece.cpu().numpy())
+                lvl = lvl.cpu().numpy().astype(float) + log_q
+                lvl[~np.isfinite(log_pi.cpu().numpy())] = -np.inf
+                levels.append(lvl)
+        return np.stack(pieces, axis=1), np.stack(levels, axis=1)
+
     def _training_data_as_prime_tensor(self, x):
         x_prime, _ = self.rescale(x.copy())
         arr = live_points_to_array(x_prime, self.prime_parameters, copy=True)
