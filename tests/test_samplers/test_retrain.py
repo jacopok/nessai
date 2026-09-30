@@ -190,6 +190,54 @@ def test_reset_gain_failed_reset(rng):
     assert delta < 0
 
 
+def test_fresh_acceptance_tracks_short_episodes(rng):
+    """Episodes shorter than a bin must still update the prediction.
+
+    A run whose acceptance collapses gets pools that last only a few tens of
+    iterations; if those episodes were ignored the prediction for a fresh
+    flow would stay at the old, much higher level and the flow would be
+    retrained every time the pool empties.
+    """
+    d = make_decision(nlive=4000)
+    high, low = np.log(0.026), np.log(0.0045)
+    it = run_episodes(d, rng, [high] * 5, 400)
+    assert d.fresh_acceptance()[0] == pytest.approx(high, abs=0.2)
+    for _ in range(10):
+        d.start_episode(it, False, 50, d.nlive)
+        for c in geometric_counts(rng, low, -1.0 / d.nlive, 40):
+            d.record_iteration(int(c))
+        it += 40
+    d.start_episode(it, False, 50, d.nlive)
+    mu, var = d.fresh_acceptance()
+    assert mu == pytest.approx(low, abs=0.3)
+    # the prediction errors of the short episodes widen the scatter
+    assert np.sqrt(var) > d.fresh_prior_sd
+
+
+def test_fresh_acceptance_weights_recent_episodes(rng):
+    """The latest episode counts more than older ones."""
+    d = make_decision()
+    it = run_episodes(d, rng, [np.log(0.3)] * 4 + [np.log(0.05)], 500)
+    d.start_episode(it, False, 50, d.nlive)
+    mu, _ = d.fresh_acceptance()
+    # the unweighted mean of the five levels would be log(0.21) ~ -1.6
+    assert mu < np.log(0.15)
+
+
+def test_slope_ignores_short_episodes(rng):
+    """Short episodes carry no information on the decay slope."""
+    d = make_decision()
+    it = run_episodes(d, rng, [np.log(0.3)] * 3, 500)
+    d.start_episode(it, False, 50, d.nlive)
+    before = d.slope()
+    for _ in range(5):
+        for c in geometric_counts(rng, np.log(0.3), -1.0 / d.nlive, 10):
+            d.record_iteration(int(c))
+        it += 10
+        d.start_episode(it, False, 50, d.nlive)
+    assert d.slope() == before
+
+
 def test_pickle(rng):
     d = make_decision()
     run_episodes(d, rng, [np.log(0.3)] * 3, 200)

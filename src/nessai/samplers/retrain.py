@@ -356,6 +356,12 @@ class RetrainDecision:
     # The scatter is calibrated using the errors of previous predictions.
     fresh_prior_sd = 0.3
     fresh_prior_weight = 2.0
+    # Weight of an episode relative to the one after it when predicting the
+    # acceptance of a fresh flow, so the prediction follows the latest trend
+    history_decay = 0.5
+    # Episodes shorter than this are too noisy to enter the estimates;
+    # episodes shorter than ``bin_size`` only inform the acceptance level
+    min_episode_length = 5
     # Reset model: log A_reset = log A_warm + delta
     reset_prior_sd = 1.0
     """Prior width on delta"""
@@ -426,11 +432,16 @@ class RetrainDecision:
         self._like_per_point = n_like / n_points if n_points else 1.0
 
     def _finish_episode(self, ep: Episode):
-        if len(ep.counts) < self.bin_size:
+        # Short episodes are fitted as a single bin with the slope from its
+        # prior. Skipping them would freeze the prediction for a fresh flow
+        # at the level of the last long episode exactly when the acceptance
+        # has dropped so far that no pool lasts a full bin.
+        n = len(ep.counts)
+        if n < self.min_episode_length:
             return
         mean, cov = fit_log_acceptance(
             ep.counts,
-            self.bin_size,
+            min(self.bin_size, n),
             prior_mean=[0.0, -1.0 / self.nlive],
             prior_cov=np.diag(
                 [np.inf, (self.slope_prior_width / self.nlive) ** 2]
@@ -454,15 +465,23 @@ class RetrainDecision:
     def _warm_level(self):
         """Mean and predictive variance of log A for a warm retraining.
 
-        The mean is the average over the recent episodes of the current
-        lineage. The variance is calibrated on the errors of the previous
-        predictions made in the same way, combined with a weak prior.
+        The mean is a weighted average over the recent episodes of the
+        current lineage: each episode is weighted by the inverse of its
+        variance (measurement plus the scatter of a single training) times
+        ``history_decay`` per more recent episode. The variance is calibrated
+        on the errors of the previous predictions made in the same way,
+        combined with a weak prior.
         """
         eps = self._lineage() or self._finished(self.episodes[:-1])
         eps = eps[-self.history_length :]
         if not eps:
             return None
-        mu = float(np.mean([e.log_a0 for e in eps]))
+        levels = np.array([e.log_a0 for e in eps])
+        recency = self.history_decay ** np.arange(len(eps))[::-1]
+        w = recency / (
+            np.array([e.log_a0_var for e in eps]) + self.fresh_prior_sd**2
+        )
+        mu = float(np.sum(w * levels) / np.sum(w))
         errors = np.array(
             [
                 e.log_a0 - e.predicted
@@ -519,7 +538,13 @@ class RetrainDecision:
 
     def slope(self):
         """Mean and variance of the decay slope from recent episodes."""
-        eps = self._finished(self.episodes[:-1])[-self.history_length :]
+        # Only episodes spanning at least a bin measure the slope; shorter
+        # ones return its prior
+        eps = [
+            e
+            for e in self._finished(self.episodes[:-1])
+            if len(e.counts) >= self.bin_size
+        ][-self.history_length :]
         prior_mean = -1.0 / self.nlive
         prior_var = (self.slope_prior_width / self.nlive) ** 2
         if not eps:
