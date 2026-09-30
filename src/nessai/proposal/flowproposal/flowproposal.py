@@ -66,6 +66,24 @@ def _weight_cap_for_mass(weights: np.ndarray, mass: float) -> float:
     return float(max((top[n - 1] - mass * total) / n, w[min(n, len(w) - 1)]))
 
 
+def _weight_cap_for_yield(weights: np.ndarray, n_yield: float) -> float:
+    """Largest cap ``c`` whose expected rejection-sampling yield
+    ``sum(min(w, c)) / c`` is at least ``n_yield``.
+    """
+    w = np.sort(weights[np.isfinite(weights)])[::-1]
+    if not len(w) or n_yield <= 0:
+        return np.inf
+    if n_yield >= len(w):
+        return float(w[-1])
+    total = w.sum()
+    # with the k largest weights above the cap: k + (total - top_k) / c = Y
+    k = np.arange(int(np.ceil(n_yield)))
+    top = np.concatenate([[0.0], np.cumsum(w)])[k]
+    cap = (total - top) / (n_yield - k)
+    ok = w[k] <= cap
+    return float(cap[np.argmax(ok)]) if ok.any() else float(w[-1])
+
+
 class FlowProposal(BaseFlowProposal):
     """Proposal that samples in latent space using the trained flow.
 
@@ -167,7 +185,12 @@ class FlowProposal(BaseFlowProposal):
         controlled under-sampling of the lowest-density fringe of the
         support for population efficiency. Best combined with
         :code:`accumulate_weights=True`, which sets the cap from every draw
-        of the populate call rather than batch by batch.
+        of the populate call rather than batch by batch. If a heavy-tailed
+        weight distribution (a poorly fitted flow) would make that cap yield
+        fewer than ``N * n_samples / max_samples`` points after ``N`` draws
+        (counted before truncation, as ``max_samples`` is), the cap is
+        lowered to that yield, so the pool always fills within
+        ``max_samples`` draws; the prior mass then under-sampled is logged.
     **kwargs
         Additional keyword arguments to pass to the base class.
     """
@@ -393,15 +416,30 @@ class FlowProposal(BaseFlowProposal):
                 )
         self.population_weight_cap_mass = population_weight_cap_mass
 
-    def _get_population_log_weights(self, log_weights) -> np.ndarray:
+    def _get_population_log_weights(
+        self, log_weights, min_yield=None
+    ) -> np.ndarray:
         """Return log-weights used in the rejection step during population."""
         log_weights = np.asarray(log_weights, dtype=float)
         log_weights = log_weights - np.nanmax(log_weights)
         cap_mass = getattr(self, "population_weight_cap_mass", None)
         if cap_mass is not None:
-            cap = _weight_cap_for_mass(np.exp(log_weights), cap_mass)
+            w = np.exp(log_weights)
+            cap = _weight_cap_for_mass(w, cap_mass)
             if not np.isfinite(cap) or cap <= 0:
                 return log_weights
+            self._population_cap_lost_mass = None
+            if min_yield:
+                # a heavy tail must not stall the population: relax the cap
+                # until the draws so far yield their share of the pool
+                floor = _weight_cap_for_yield(w, min_yield)
+                if floor < cap:
+                    cap = floor
+                    finite = np.isfinite(w)
+                    self._population_cap_lost_mass = float(
+                        np.maximum(w[finite] - cap, 0.0).sum()
+                        / w[finite].sum()
+                    )
             return np.minimum(log_weights - np.log(cap), 0.0)
         if not self.clip_population_weights:
             return log_weights
@@ -569,7 +607,8 @@ class FlowProposal(BaseFlowProposal):
 
         while n_accepted < n_samples:
             z = self.sample_latent_distribution(self.drawsize)
-            n_proposed += z.shape[0]
+            n_batch = z.shape[0]
+            n_proposed += n_batch
             if self.adapt_latent_temperature:
                 adapt_full_z.append(np.asarray(z, dtype=float))
             z = self._truncation_scheme.apply_latent(self, z)
@@ -617,7 +656,8 @@ class FlowProposal(BaseFlowProposal):
                 samples = np.concatenate([samples, x])
                 log_weights = np.concatenate([log_weights, log_w])
                 log_weights_rejection = self._get_population_log_weights(
-                    log_weights
+                    log_weights,
+                    min_yield=n_proposed * n_samples / max_samples,
                 )
                 log_n_expected = logsumexp(log_weights_rejection)
 
@@ -636,7 +676,9 @@ class FlowProposal(BaseFlowProposal):
                     logger.warning("Reached max samples (%s)", max_samples)
                     break
             else:
-                log_w = self._get_population_log_weights(log_w)
+                log_w = self._get_population_log_weights(
+                    log_w, min_yield=n_batch * n_samples / max_samples
+                )
                 log_u = np.log(self.rng.random(len(log_w)))
                 accept = log_w > log_u
                 n_accept_batch = accept.sum()
@@ -651,7 +693,8 @@ class FlowProposal(BaseFlowProposal):
         if self.accumulate_weights:
             if accept is None or len(accept) != len(samples):
                 log_weights_rejection = self._get_population_log_weights(
-                    log_weights
+                    log_weights,
+                    min_yield=n_proposed * n_samples / max_samples,
                 )
                 log_u = np.log(self.rng.random(len(log_weights)))
                 accept = log_weights_rejection > log_u
@@ -699,6 +742,16 @@ class FlowProposal(BaseFlowProposal):
 
         self.indices = self.rng.permutation(self.samples.size).tolist()
         self.population_acceptance = n_accepted / n_proposed
+        lost = getattr(self, "_population_cap_lost_mass", None)
+        if getattr(self, "population_weight_cap_mass", None) and lost:
+            logger.info(
+                "Population weight cap lowered to fill the pool within "
+                "max_samples (heavy-tailed weights): %.2g of the support's "
+                "prior mass under-sampled (target %.2g)",
+                lost,
+                self.population_weight_cap_mass,
+            )
+            self._population_cap_lost_mass = None
         self.populated_count += 1
         self.populated = True
         self._checked_population = False

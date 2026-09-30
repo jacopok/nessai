@@ -60,6 +60,7 @@ def measure_retrain_costs(
     seed=0,
     filename=None,
     output=None,
+    measure_population=True,
     **kwargs,
 ):
     """Measure the unit costs of likelihood, pool population and training.
@@ -88,6 +89,13 @@ def measure_retrain_costs(
     output : str, optional
         Directory for the proposal files. A temporary directory is used by
         default.
+    measure_population : bool
+        If False, the population cost is not measured (and not saved), so
+        the run measures it from its own pools. The benchmark's pool comes
+        from a flow trained for ``epochs`` epochs on prior draws, whose
+        weights can be far more heavy-tailed than any of the run's, which
+        makes its population cost unrepresentative with a mass-controlled
+        weight cap (``population_weight_cap_mass``).
     kwargs :
         Other keyword arguments of the run. Those accepted by the proposal
         class (e.g. ``poolsize``, ``reparameterisations``) are used.
@@ -95,8 +103,8 @@ def measure_retrain_costs(
     Returns
     -------
     dict
-        Unit costs with keys ``likelihood``, ``population`` and
-        ``training``, in seconds.
+        Unit costs with keys ``likelihood``, ``population`` (unless
+        ``measure_population`` is False) and ``training``, in seconds.
     """
     from ..proposal.utils import get_flow_proposal_class
 
@@ -151,14 +159,18 @@ def measure_retrain_costs(
 
         # Population, excluding likelihood time. The worst point is the
         # lowest likelihood, as at the start of a run.
-        worst = x[np.argmin(x["logL"])]
-        t0 = model.likelihood_evaluation_time
-        st = time.perf_counter()
-        proposal.populate(worst, n_samples=kwargs["poolsize"], plot=False)
-        t_pop = time.perf_counter() - st
-        t_like_pop = (model.likelihood_evaluation_time - t0).total_seconds()
-        n_points = max(int(proposal.samples.size), 1)
-        population = max(t_pop - t_like_pop, 0.0) / n_points
+        population = None
+        if measure_population:
+            worst = x[np.argmin(x["logL"])]
+            t0 = model.likelihood_evaluation_time
+            st = time.perf_counter()
+            proposal.populate(worst, n_samples=kwargs["poolsize"], plot=False)
+            t_pop = time.perf_counter() - st
+            t_like_pop = (
+                model.likelihood_evaluation_time - t0
+            ).total_seconds()
+            n_points = max(int(proposal.samples.size), 1)
+            population = max(t_pop - t_like_pop, 0.0) / n_points
     finally:
         model.likelihood_evaluations = n_evals
         model.likelihood_evaluation_time = t_evals
@@ -169,9 +181,12 @@ def measure_retrain_costs(
     costs = dict(
         likelihood=likelihood, population=population, training=training
     )
+    if population is None:
+        del costs["population"]
     logger.info(
         "Measured retrain unit costs: "
-        + ", ".join(f"{k}={costs[k]:.3g} s" for k in COST_KEYS)
+        + ", ".join(f"{k}={v:.3g} s" for k, v in costs.items())
+        + ("" if population is not None else " (population: from the run)")
     )
     if filename is not None:
         save_costs(costs, filename)
@@ -186,7 +201,7 @@ def save_costs(costs, filename):
     with open(filename, "w") as f:
         json.dump(
             dict(
-                unit_costs={k: costs[k] for k in COST_KEYS},
+                unit_costs={k: costs[k] for k in COST_KEYS if k in costs},
                 details=dict(
                     source="benchmark",
                     date=datetime.datetime.now().isoformat(),

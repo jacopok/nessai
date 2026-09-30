@@ -45,7 +45,8 @@ def configure_population_test_proposal(proposal, rng, samples):
     proposal.adapt_latent_temperature = False
     proposal.clip_population_weights = False
     proposal._get_population_log_weights = (
-        lambda log_w: FlowProposal._get_population_log_weights(proposal, log_w)
+        lambda log_w, **kw: FlowProposal._get_population_log_weights(
+            proposal, log_w, **kw)
     )
     proposal.drawsize = 3
     proposal.flow = MagicMock()
@@ -240,6 +241,39 @@ def test_population_log_weights_capped_by_mass(proposal):
     np.testing.assert_allclose(np.exp(out), np.minimum(w, cap) / cap)
     lost = 1.0 - (np.exp(out) * cap).sum() / w.sum()
     assert lost == pytest.approx(0.01, rel=1e-6)
+
+
+def test_population_weight_cap_keeps_a_minimum_yield(proposal):
+    """A heavy tail (a few draws carry most of the mass) must not stall the
+    population: the cap is lowered until the draws yield ``min_yield``
+    points, and the prior mass then under-sampled is recorded."""
+    from nessai.proposal.flowproposal.flowproposal import _weight_cap_for_yield
+
+    proposal.clip_population_weights = False
+    proposal.population_weight_cap_mass = 0.005
+    n = 10_000
+    w = np.ones(n)
+    w[:3] = 1e6   # three draws hold ~99.7 % of the mass
+    out = FlowProposal._get_population_log_weights(
+        proposal, np.log(w), min_yield=50.0)
+    assert np.exp(out).sum() == pytest.approx(50.0)
+    assert proposal._population_cap_lost_mass > 0.99
+    # without the floor the mass cap yields ~3 points
+    out = FlowProposal._get_population_log_weights(proposal, np.log(w))
+    assert np.exp(out).sum() < 4
+    assert proposal._population_cap_lost_mass is None
+    # a light tail keeps the mass cap when it already yields enough
+    rng = np.random.default_rng(2)
+    log_w = np.log(rng.pareto(3.0, size=n) + 1.0)
+    out = FlowProposal._get_population_log_weights(
+        proposal, log_w, min_yield=50.0)
+    assert np.exp(out).sum() > 50.0
+    assert proposal._population_cap_lost_mass is None
+    # the yield cap solves sum(min(w, c)) / c = Y
+    v = rng.pareto(1.5, size=1000) + 1.0
+    for y in (1.5, 10.0, 400.0):
+        c = _weight_cap_for_yield(v, y)
+        assert np.minimum(v, c).sum() / c == pytest.approx(y)
 
 
 def test_population_weight_cap_mass_validation(proposal):

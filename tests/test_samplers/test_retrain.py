@@ -306,6 +306,29 @@ def test_measure_retrain_costs(integration_model, flow_config, tmp_path):
     assert RetrainCostModel(str(filename)).deterministic
 
 
+def test_measure_retrain_costs_without_population(
+    integration_model, flow_config, tmp_path
+):
+    """The run then measures the population cost from its own pools."""
+    from nessai.samplers.retrain_benchmark import measure_retrain_costs
+
+    filename = tmp_path / "costs.json"
+    costs = measure_retrain_costs(
+        integration_model,
+        nlive=100,
+        flow_config=flow_config,
+        epochs=2,
+        filename=str(filename),
+        measure_population=False,
+    )
+    assert set(costs) == {"likelihood", "training"}
+    model = RetrainCostModel(str(filename))
+    assert not model.deterministic
+    assert model["population"] is None
+    model.record("population", 2.0, 100)
+    assert model["population"] == pytest.approx(0.02)
+
+
 @pytest.mark.slow_integration_test
 def test_retrain_benchmark_cli(tmp_path):
     from nessai.samplers.retrain_benchmark import main
