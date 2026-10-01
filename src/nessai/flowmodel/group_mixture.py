@@ -532,6 +532,24 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             sd.setdefault(name, val)
         return super().load_state_dict(sd, strict=strict, assign=assign)
 
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # A checkpoint written with a different ``mode_factor_sizes`` has
+        # factor buffers of another shape: keep the current (config-derived)
+        # factor layout and restart the empty-round counts. Done here rather
+        # than in :meth:`load_state_dict` so it also applies when a parent
+        # module (e.g. the clustered wrapper) loads this one.
+        for name in ("_mode_factor_index", "_factor_empty_rounds"):
+            key = prefix + name
+            cur = getattr(self, name, None)
+            old = state_dict.get(key)
+            if (
+                isinstance(cur, torch.Tensor)
+                and isinstance(old, torch.Tensor)
+                and old.shape != cur.shape
+            ):
+                state_dict[key] = cur.detach().clone()
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     def _configure_reflection(self):
         """(Re)build the reflect-dim indices and sign patterns from
         ``reflect_parameters`` against the current ``param_names``."""
