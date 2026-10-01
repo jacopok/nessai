@@ -758,7 +758,15 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         ``assigned`` is the group element whose inverse maps ``x`` into the
         fundamental domain (0 for points no element claims).
         """
-        pre, _ = self._preimages(x)
+        memo = getattr(self, "_branch_memo", None)
+        if memo is not None and memo[0] is x:
+            # the pre-images (and domain mask) of this very tensor were just
+            # computed by :meth:`_branch_log_probs`
+            pre, in_dom = memo[1], memo[2]
+            self._branch_memo = None
+        else:
+            pre, _ = self._preimages(x)
+            in_dom = None
         if self.in_fundamental_domain is None and not self.uses_prime_space_action:
             return (
                 torch.zeros(x.shape[0], dtype=torch.long, device=x.device),
@@ -766,7 +774,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 torch.ones(x.shape[0], dtype=torch.bool, device=x.device),
             )
         k, b, d = pre.shape
-        in_dom = self._in_domain(pre.reshape(k * b, d)).view(k, b)
+        if in_dom is None:
+            in_dom = self._in_domain(pre.reshape(k * b, d)).view(k, b)
         claimed = in_dom.any(dim=0)
         assigned = torch.where(claimed, in_dom.float().argmax(dim=0), 0)
         return assigned, pre, claimed
@@ -1040,6 +1049,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         """
         k, b = self.group_size, x.shape[0]
         pre, conj_logdet = self._preimages(x)
+        # kept for :meth:`_assign_branch` on the same tensor (see there)
+        self._branch_memo = (x, pre, None)
         log_pi = torch.log(self.proposal_weights).unsqueeze(1).expand(k, b)
         flat_pre = pre.reshape(k * b, -1)
         flat_modes = torch.arange(k, device=x.device).repeat_interleave(b)
@@ -1054,6 +1065,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             return base_lp + log_pi
 
         in_dom = self._in_domain(flat_pre).view(k, b)
+        self._branch_memo = (x, pre, in_dom)
         # Points no branch claims: evaluate all their branches (fallback).
         eval_mask = in_dom | (~in_dom.any(dim=0, keepdim=True))
         idx = eval_mask.reshape(-1).nonzero(as_tuple=True)[0]
@@ -2153,7 +2165,26 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             x[use_bg] = xb
             gen_out_of_domain[use_bg] = ~torch.isfinite(ljb)
         # non-literal log_j: base_distribution_log_prob(z) - log_j == log q(x)
-        log_q = self.log_prob(x, context=context)
+        # (as :meth:`log_prob`, keeping the per-expert densities and the
+        # group element of every draw for :meth:`level_cache_lookup`)
+        lps = [self.experts[j].log_prob(x, context=context) for j in range(act)]
+        lw = torch.log(self.proposal_weights[:act].clamp_min(1e-38))
+        log_q = self._blend_bg(
+            torch.logsumexp(torch.stack(lps) + lw[:, None], dim=0),
+            x,
+            context=context,
+        )
+        if context is None:
+            assign = [self.experts[j]._assign_branch(x) for j in range(act)]
+            self._level_cache = dict(
+                z=z.detach().cpu().numpy(),
+                x=x,
+                lps=torch.stack(lps),
+                element=[a[0] for a in assign],
+                claimed=[a[2] for a in assign],
+            )
+        for e in self.experts[:act]:
+            e._branch_memo = None
         if bool(gen_out_of_domain.any()):
             log_q = log_q.clone()
             log_q[gen_out_of_domain] = -float("inf")
@@ -2165,6 +2196,43 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     def forward_and_log_prob(self, x, context=None):
         z, _ = self.forward(x, context=context)
         return z, self.log_prob(x, context=context)
+
+    def level_cache_lookup(self, z):
+        """The rows of the last :meth:`inverse` call that generated the
+        latent points ``z`` (``[n, d]``), as ``(x, lps, element, claimed)``,
+        or ``None`` unless every row of ``z`` is found.  Lets
+        :meth:`GroupFlowProposalMixin.mixture_levels` reuse the per-expert
+        densities and group elements computed while sampling; the latent
+        rows identify the draws through the filters between the two."""
+        cache = getattr(self, "_level_cache", None)
+        if cache is None or z is None:
+            return None
+        key = cache["z"]
+        z = np.asarray(z, dtype=key.dtype)
+        if z.ndim != 2 or z.shape[1] != key.shape[1] or len(z) > len(key):
+            return None
+        # index on the first coordinate, then check the whole rows
+        index = {v: i for i, v in enumerate(key[:, 0].tolist())}
+        rows = np.fromiter(
+            (index.get(v, -1) for v in z[:, 0].tolist()), dtype=int, count=len(z)
+        )
+        if (rows < 0).any() or not np.array_equal(key[rows], z):
+            # a repeated first coordinate (float32): match whole rows
+            index = {row.tobytes(): i for i, row in enumerate(key)}
+            rows = np.fromiter(
+                (index.get(row.tobytes(), -1) for row in z),
+                dtype=int,
+                count=len(z),
+            )
+            if (rows < 0).any():
+                return None
+        rows = torch.as_tensor(rows, dtype=torch.long, device=cache["x"].device)
+        return (
+            cache["x"][rows],
+            cache["lps"][:, rows],
+            [e[rows] for e in cache["element"]],
+            [c[rows] for c in cache["claimed"]],
+        )
 
     def freeze_transform(self):
         for e in self._all_experts():
@@ -2920,7 +2988,7 @@ class GroupFlowProposalMixin:
             )
         )
 
-    def mixture_levels(self, x, log_q):
+    def mixture_levels(self, x, log_q, z=None):
         """Candidate (piece, level) of every point of ``x``, one per expert.
 
         A piece is an (expert, group element) pair -- index
@@ -2934,21 +3002,34 @@ class GroupFlowProposalMixin:
         point no element of an expert claims gets piece ``-1`` and that
         expert's unweighted density.  Used by the ``log_level_threshold``
         truncation rule.  Returns two ``(n, k)`` arrays.
+
+        With ``z``, the latent points that generated ``x`` in the flow's last
+        :meth:`inverse` call, the per-expert densities and group elements
+        computed there are reused rather than recomputed.
         """
         log_q = np.asarray(log_q, dtype=float)
         model = getattr(self.flow, "model", None)
         n = len(x)
         if model is None or not hasattr(model, "_assign_branch") or not n:
             return np.zeros((n, 1), dtype=int), log_q.reshape(n, 1)
-        xp = self._training_data_as_prime_tensor(x)[:n]
         experts = getattr(model, "experts", None)
         clustered = experts is not None and model._active() > 1
+        cached = None
+        if clustered and z is not None and hasattr(model, "level_cache_lookup"):
+            cached = model.level_cache_lookup(z)
+        if cached is not None:
+            xp, cached_lps, cached_element, cached_claimed = cached
+        else:
+            xp = self._training_data_as_prime_tensor(x)[:n]
         with torch.no_grad():
             if clustered:
                 act = model._active()
                 wrappers = [experts[j] for j in range(act)]
                 log_w = torch.log(model.proposal_weights[:act])
-                lps = torch.stack([e.log_prob(xp) for e in wrappers])
+                if cached is not None:
+                    lps = cached_lps
+                else:
+                    lps = torch.stack([e.log_prob(xp) for e in wrappers])
                 log_qm = model._blend_bg(
                     torch.logsumexp(lps + log_w[:, None], dim=0), xp
                 )
@@ -2958,7 +3039,10 @@ class GroupFlowProposalMixin:
                 log_qm = None
             pieces, levels = [], []
             for j, wrapper in enumerate(wrappers):
-                element, _, claimed = wrapper._assign_branch(xp)
+                if cached is not None:
+                    element, claimed = cached_element[j], cached_claimed[j]
+                else:
+                    element, _, claimed = wrapper._assign_branch(xp)
                 log_el = torch.where(
                     claimed,
                     torch.log(wrapper.proposal_weights)[element],
@@ -2988,6 +3072,11 @@ class GroupFlowProposalMixin:
     def populate(self, worst_point, *args, **kwargs):
         super().populate(worst_point, *args, **kwargs)
         model = getattr(self.flow, "model", None)
+        # per-batch sampling caches: not state, keep them out of checkpoints
+        if model is not None:
+            model._level_cache = None
+            for e in getattr(model, "experts", None) or []:
+                e._branch_memo = None
         if (
             getattr(model, "importance_weights", False)
             and getattr(self, "samples", None) is not None

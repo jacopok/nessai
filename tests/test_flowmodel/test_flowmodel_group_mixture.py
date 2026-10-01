@@ -2640,3 +2640,35 @@ def test_mixture_levels_of_a_clustered_mixture():
     _, level = prop.mixture_levels(np.zeros(len(x)), log_q)
     assert np.all(np.isneginf(level[:, 1]))
     np.testing.assert_allclose(level[:, 0], levels[1][:, 0], atol=1e-4)
+
+
+def test_mixture_levels_reuse_the_densities_of_the_last_inverse():
+    """Levels of draws identified by their latent points come from the
+    densities computed while sampling, and match a fresh computation, also
+    for a filtered subset of the draws; unknown latent points fall back."""
+    w = _k2(_clustered_wrapper(2), (0.6, 0.4))
+    torch.manual_seed(3)
+    z = torch.randn(200, w.num_features)
+    with torch.no_grad():
+        x, log_j = w.inverse(z)
+    keep = torch.isfinite(log_j) & (torch.arange(len(z)) % 3 != 0)
+    x, z = x[keep], z[keep]
+    with torch.no_grad():
+        log_q = w.log_prob(x).numpy()
+    prop = _pieces_proposal(w, x)
+    piece, level = prop.mixture_levels(np.zeros(len(x)), log_q)
+    lookups = []
+    original = w.level_cache_lookup
+    w.level_cache_lookup = lambda zz: lookups.append(original(zz)) or lookups[-1]
+    piece_c, level_c = prop.mixture_levels(
+        np.zeros(len(x)), log_q, z=z.numpy()
+    )
+    assert lookups[-1] is not None
+    np.testing.assert_array_equal(piece_c, piece)
+    np.testing.assert_allclose(level_c, level, atol=1e-4)
+    piece_f, level_f = prop.mixture_levels(
+        np.zeros(len(x)), log_q, z=z.numpy() + 1.0
+    )
+    assert lookups[-1] is None
+    np.testing.assert_array_equal(piece_f, piece)
+    np.testing.assert_allclose(level_f, level, atol=1e-6)

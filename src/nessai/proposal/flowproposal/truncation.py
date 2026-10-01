@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from copy import deepcopy
 
@@ -395,6 +396,18 @@ class MinLogQTruncation(BaseTruncationRule):
         return get_subset_arrays(keep, x, log_q, z)
 
 
+def _accepts_keyword(fn, name):
+    """Whether ``fn`` takes the keyword argument ``name``."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD
+        for p in params
+    )
+
+
 def _live_log_q(proposal):
     """``log q`` of the training (live) points under the density the pool is
     drawn from.
@@ -514,12 +527,15 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
         return dict(self._floors)
 
     @staticmethod
-    def _levels(proposal, x, log_q):
+    def _levels(proposal, x, log_q, z=None):
         log_q = np.asarray(log_q, dtype=float)
         fn = getattr(proposal, "mixture_levels", None)
         if fn is None:
             return np.zeros((len(x), 1), dtype=int), log_q[:, None]
-        pieces, levels = fn(x, log_q)
+        if z is not None and _accepts_keyword(fn, "z"):
+            pieces, levels = fn(x, log_q, z=z)
+        else:
+            pieces, levels = fn(x, log_q)
         return (
             np.asarray(pieces, dtype=int).reshape(len(x), -1),
             np.asarray(levels, dtype=float).reshape(len(x), -1),
@@ -608,7 +624,7 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
             )
 
     def apply_after_backward(self, proposal, x, log_q, z):
-        cand_pieces, cand_levels = self._levels(proposal, x, log_q)
+        cand_pieces, cand_levels = self._levels(proposal, x, log_q, z=z)
         keep = np.any(
             cand_levels > self._point_thresholds(cand_pieces), axis=1
         )

@@ -522,7 +522,7 @@ def _level_proposal(live_x, weights, with_pieces=True):
     proposal.forward_pass = MagicMock(
         side_effect=lambda x: (np.zeros((len(x), 1)), log_q_of(x)))
     proposal.compute_weights = MagicMock(side_effect=lambda x, log_q: -log_q)
-    def levels(x, log_q):
+    def levels(x, log_q, z=None):
         p, log_pi = pieces(x)
         return p[:, None], (np.asarray(log_q) - log_pi)[:, None]
 
@@ -630,7 +630,7 @@ def test_log_level_threshold_keeps_a_point_any_candidate_clears():
     # candidate 0: level -x (piece 0); candidate 1: level -x - 5 (piece 1),
     # except points with x > 2, where piece 0 has zero weight and piece 1
     # has level 0
-    def levels(x, log_q):
+    def levels(x, log_q, z=None):
         a = -x["x"].astype(float)
         b = a - 5.0
         far = x["x"] > 2
