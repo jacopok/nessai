@@ -43,8 +43,10 @@ Uncertainties
 * The acceptance of the current flow is described by a Gaussian posterior on
   ``(log A, k)`` from a weighted least-squares fit to binned log-acceptance
   with a conjugate Gaussian prior (from previous episodes).
-* The fresh acceptance ``A'`` after retraining is predicted from the last
-  few episodes with a Gaussian in ``log A'``.
+* The fresh acceptance ``A'`` after retraining is predicted with a Gaussian
+  in ``log A'`` from the acceptance measured at the start of the recent
+  episodes, including the one that is ending (see ``fresh_predictor``). Its
+  scatter is calibrated on the errors of the recent predictions.
 * Costs are convex in ``1/a`` so these enter through log-normal moments,
   e.g. ``E[1 / A'] = exp(-mu + sigma^2 / 2)``.
 * Costs ``c`` and ``T`` enter linearly, so only their means matter for the
@@ -131,6 +133,16 @@ class Episode:
     slope_var: float = np.nan
     predicted: float = np.nan
     """Log-acceptance predicted for this episode before it started"""
+
+
+def initial_level(counts, bin_size):
+    """Log-acceptance over the first ``bin_size`` iterations of an episode
+    and its variance (draws are geometric)."""
+    m = min(len(counts), bin_size)
+    if m == 0:
+        return np.nan, np.nan
+    a = m / float(np.sum(counts[:m]))
+    return float(np.log(a)), max(1.0 - a, 0.05) / m
 
 
 def _bin_counts(counts, bin_size):
@@ -344,6 +356,18 @@ class RetrainDecision:
         If true, limit the size of the next pool so that it is used up
         around the predicted optimal retraining time. Without this, the flow
         cannot be retrained more often than once per pool.
+    fresh_predictor : {'average', 'last', 'trend'}
+        How the acceptance of a freshly trained flow is predicted from the
+        acceptance measured over the first ``bin_size`` iterations of the
+        recent episodes (the one ending included):
+
+        * ``'average'``: weighted average of the last ``history_length``
+          episodes, halving the weight per older episode;
+        * ``'last'``: the episode that is ending;
+        * ``'trend'``: weighted linear fit in iteration over the last
+          ``history_length`` episodes, extrapolated to the current
+          iteration, with a Gaussian prior of width ``trend_slope_sd`` (per
+          ``nlive`` iterations) on the slope.
     """
 
     # Prior on the slope: acceptance tracks the prior volume, k = 1 / nlive
@@ -359,6 +383,13 @@ class RetrainDecision:
     # Weight of an episode relative to the one after it when predicting the
     # acceptance of a fresh flow, so the prediction follows the latest trend
     history_decay = 0.5
+    fresh_predictor = "average"
+    # Prior width on the slope of the 'trend' predictor, in log-acceptance
+    # per nlive iterations. Without it, back-to-back short episodes leave the
+    # slope unconstrained.
+    trend_slope_sd = 0.5
+    # Number of recent prediction errors that calibrate the scatter
+    error_window = 10
     # Episodes shorter than this are too noisy to enter the estimates;
     # episodes shorter than ``bin_size`` only inform the acceptance level
     min_episode_length = 5
@@ -379,6 +410,7 @@ class RetrainDecision:
         allow_reset=False,
         horizon=True,
         plan_pool=True,
+        fresh_predictor="average",
     ):
         self.nlive = nlive
         self.cost = RetrainCostModel(costs)
@@ -387,6 +419,9 @@ class RetrainDecision:
         self.allow_reset = allow_reset
         self.horizon = horizon
         self.plan_pool = plan_pool
+        if fresh_predictor not in ("average", "last", "trend"):
+            raise ValueError(f"Unknown fresh_predictor: {fresh_predictor}")
+        self.fresh_predictor = fresh_predictor
         self.next_poolsize = None
         self.episodes = []
         self.log = []
@@ -403,7 +438,7 @@ class RetrainDecision:
         if self.current is not None:
             self._finish_episode(self.current)
         units = epochs * n_train if epochs is not None else np.nan
-        warm = self._warm_level()
+        warm = self._warm_level(at=iteration)
         self.episodes.append(
             Episode(
                 start=iteration,
@@ -462,33 +497,71 @@ class RetrainDecision:
                 start = i
         return self._finished(self.episodes[start:-1])
 
-    def _warm_level(self):
+    def _level_history(self, include_current=True):
+        """``(iteration, log-acceptance, variance)`` at the start of the
+        recent episodes of the current lineage.
+
+        The running episode is included by default: the decision to retrain
+        is taken when it ends, so the next flow follows it.
+        """
+        start = 0
+        for i, e in enumerate(self.episodes):
+            if e.reset:
+                start = i
+        eps = self.episodes if include_current else self.episodes[:-1]
+        rows = []
+        for lineage in (eps[start:], eps):
+            rows = [
+                (e.start, *initial_level(e.counts, self.bin_size))
+                for e in lineage
+                if len(e.counts) >= self.min_episode_length
+            ]
+            if rows:
+                break
+        return rows
+
+    def _predict_level(self, rows, at):
+        rows = rows[-self.history_length :]
+        x = np.array([r[0] for r in rows], dtype=float)
+        y = np.array([r[1] for r in rows])
+        v = np.array([r[2] for r in rows])
+        if self.fresh_predictor == "last":
+            return float(y[-1])
+        w = 1.0 / (v + self.fresh_prior_sd**2)
+        if self.fresh_predictor == "average":
+            w = w * self.history_decay ** np.arange(len(rows))[::-1]
+            return float(np.sum(w * y) / np.sum(w))
+        # 'trend': centred on the target so the intercept is the prediction
+        X = np.stack([np.ones_like(x), (x - at) / self.nlive], axis=1)
+        prec = X.T @ (w[:, None] * X)
+        prec[1, 1] += 1.0 / self.trend_slope_sd**2
+        return float(np.linalg.solve(prec, X.T @ (w * y))[0])
+
+    def _warm_level(self, at=None, include_current=True):
         """Mean and predictive variance of log A for a warm retraining.
 
-        The mean is a weighted average over the recent episodes of the
-        current lineage: each episode is weighted by the inverse of its
-        variance (measurement plus the scatter of a single training) times
-        ``history_decay`` per more recent episode. The variance is calibrated
-        on the errors of the previous predictions made in the same way,
-        combined with a weak prior.
+        The mean comes from the acceptance at the start of the recent
+        episodes of the current lineage (see ``fresh_predictor``), predicted
+        at iteration ``at`` (default: now). The variance is calibrated on
+        the errors of the last ``error_window`` predictions, stored when
+        each episode started, combined with a weak prior.
         """
-        eps = self._lineage() or self._finished(self.episodes[:-1])
-        eps = eps[-self.history_length :]
-        if not eps:
+        rows = self._level_history(include_current=include_current)
+        if not rows:
             return None
-        levels = np.array([e.log_a0 for e in eps])
-        recency = self.history_decay ** np.arange(len(eps))[::-1]
-        w = recency / (
-            np.array([e.log_a0_var for e in eps]) + self.fresh_prior_sd**2
-        )
-        mu = float(np.sum(w * levels) / np.sum(w))
-        errors = np.array(
-            [
-                e.log_a0 - e.predicted
-                for e in self._finished(self.episodes[:-1])
-                if np.isfinite(e.predicted)
-            ]
-        )
+        if at is None:
+            ep = self.current
+            at = ep.start + len(ep.counts) if ep is not None else 0
+        mu = self._predict_level(rows, at)
+        errors = []
+        for e in self.episodes if include_current else self.episodes[:-1]:
+            if len(e.counts) >= self.min_episode_length and np.isfinite(
+                e.predicted
+            ):
+                errors.append(
+                    initial_level(e.counts, self.bin_size)[0] - e.predicted
+                )
+        errors = np.array(errors[-self.error_window :])
         w = self.fresh_prior_weight
         var = (w * self.fresh_prior_sd**2 + np.sum(errors**2)) / (
             w + len(errors)
@@ -610,7 +683,7 @@ class RetrainDecision:
     def current_fit(self):
         """Posterior of (log A, slope) for the current flow."""
         ep = self.current
-        fresh = self._warm_level()
+        fresh = self._warm_level(at=ep.start, include_current=False)
         if fresh is None:
             fresh = (np.log(0.1), self.log_a0_prior_sd**2)
         k_mean, k_var = self.slope()
@@ -697,10 +770,7 @@ class RetrainDecision:
             k_cur = -mean[1] if mean[1] < 0 else k
             # E[exp(-log a(s'))] integrated over the remaining iterations
             cost_continue = (
-                c
-                * np.exp(-log_a + 0.5 * sd**2)
-                * np.expm1(k_cur * h)
-                / k_cur
+                c * np.exp(-log_a + 0.5 * sd**2) * np.expm1(k_cur * h) / k_cur
             )
             cost_optimal = best["T"] + c / best["a"] * np.expm1(k * h) / k
             retrain = bool(cost_optimal < cost_continue)

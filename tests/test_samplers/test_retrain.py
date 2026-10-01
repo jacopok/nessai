@@ -395,3 +395,61 @@ def test_continue_not_logged_at_info(rng, caplog):
     caplog.clear()
     assert d.decide(it, 2000) is False
     assert not caplog.records
+
+
+def test_fresh_acceptance_uses_the_running_episode(rng):
+    """The flow that is ending informs the prediction for the next one."""
+    d = make_decision()
+    levels = [np.log(0.2)] * 4 + [np.log(0.02)]
+    run_episodes(d, rng, levels, 400)
+    # The running (last) episode is the only one at the low level
+    mu_last = make_decision(fresh_predictor="last")
+    run_episodes(mu_last, rng, levels, 400)
+    assert abs(mu_last.fresh_acceptance()[0] - np.log(0.02)) < 0.3
+    # Weighted average: the running episode carries the largest weight
+    mu = d.fresh_acceptance()[0]
+    assert np.log(0.02) < mu < 0.5 * (np.log(0.02) + np.log(0.2))
+    # The running flow's own prior excludes its data
+    assert d._warm_level(include_current=False)[0] > np.log(0.1)
+
+
+def test_fresh_acceptance_trend_extrapolates(rng):
+    """A steady decline is extrapolated by the trend, not by the average."""
+    nlive = 500
+    length = 250
+    slope = -0.6  # log-acceptance per nlive iterations
+    levels = [np.log(0.3) + slope * i * length / nlive for i in range(8)]
+    out = {}
+    for predictor in ("average", "trend"):
+        d = make_decision(nlive=nlive, fresh_predictor=predictor)
+        it = run_episodes(d, rng, levels, length)
+        out[predictor] = d._warm_level(at=it)[0]
+    truth = np.log(0.3) + slope * 8 * length / nlive
+    assert abs(out["trend"] - truth) < abs(out["average"] - truth)
+    assert abs(out["trend"] - truth) < 0.25
+
+
+def test_fresh_acceptance_spread_from_recent_errors(rng):
+    """The predictive scatter follows the recent prediction errors."""
+    d = make_decision(fresh_predictor="last")
+    noisy = np.log(0.1) + rng.choice([-1.0, 1.0], size=30)
+    run_episodes(d, rng, list(noisy), 200)
+    sd_noisy = np.sqrt(d.fresh_acceptance()[1])
+    run_episodes(d, rng, [np.log(0.1)] * d.error_window, 200)
+    sd_calm = np.sqrt(d.fresh_acceptance()[1])
+    assert sd_noisy > 1.0
+    assert sd_calm < 0.5
+
+
+def test_fresh_predictor_invalid():
+    with pytest.raises(ValueError, match="fresh_predictor"):
+        make_decision(fresh_predictor="median")
+
+
+def test_fresh_predictor_missing_after_unpickling(rng):
+    """Checkpoints from before the option fall back to the default."""
+    d = make_decision()
+    run_episodes(d, rng, [np.log(0.1)] * 3, 200)
+    del d.__dict__["fresh_predictor"]
+    d = pickle.loads(pickle.dumps(d))
+    assert d.fresh_acceptance() is not None
