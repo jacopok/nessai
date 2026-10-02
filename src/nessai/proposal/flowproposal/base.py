@@ -917,7 +917,9 @@ class BaseFlowProposal(RejectionProposal):
             output=block_output,
             plot=self._plot_training and plot,
         )
-        if isinstance(history, dict) and "loss" in history:
+        if isinstance(history, dict) and "epochs" in history:
+            self.last_training_epochs = history["epochs"]
+        elif isinstance(history, dict) and "loss" in history:
             self.last_training_epochs = len(history["loss"])
         else:
             self.last_training_epochs = None

@@ -2806,6 +2806,7 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
 
         full_model, full_opt = self.model, self._optimiser
         history = dict(loss=[], val_loss=[])
+        sample_epochs = 0
         try:
             for j in range(k):
                 sub = np.ascontiguousarray(samples[labels == j])
@@ -2831,6 +2832,7 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
                 )
                 history["loss"].append(hj["loss"])
                 history["val_loss"].append(hj["val_loss"])
+                sample_epochs += len(hj["loss"]) * sub.shape[0]
                 logger.info(
                     "Clustered group mixture: expert %d solo-trained on %d "
                     "pts (%d epochs, best val loss %.4g)",
@@ -2846,6 +2848,7 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
                 )
                 history["loss"].append(hb["loss"])
                 history["val_loss"].append(hb["val_loss"])
+                sample_epochs += len(hb["loss"]) * samples.shape[0]
                 model._bg_seen.fill_(True)
                 logger.info(
                     "Clustered group mixture: background expert trained on "
@@ -2856,6 +2859,10 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
                 )
         finally:
             self.model, self._optimiser = full_model, full_opt
+        # ``loss`` holds one history per expert, so its length is not the
+        # number of epochs: report the epochs over the whole training set
+        # that cost the same (the retrain decision's training units)
+        history["epochs"] = sample_epochs / max(samples.shape[0], 1)
 
         self.model.train()
         self.model.eval()

@@ -1737,6 +1737,13 @@ def test_clustered_trains_each_expert_independently(tmp_path):
 
     # one (loss, val_loss) history per expert
     assert len(history["loss"]) == 2 and len(history["val_loss"]) == 2
+    # the epochs over the whole set that cost the same (the retrain
+    # decision's training units), not the number of experts
+    labels = model.route_prime_array(data)
+    sizes = [int(np.sum(labels == j)) for j in range(2)]
+    expected = sum(len(h) * m for h, m in zip(history["loss"], sizes)) / n
+    assert history["epochs"] == pytest.approx(expected)
+    assert history["epochs"] > 2
     # both experts actually updated
     for j, b in enumerate(before):
         after = model.experts[j].base_flow.state_dict()
