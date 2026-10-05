@@ -2757,6 +2757,10 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
     #: ``importance_weights``.
     freeze_min_size = None
     importance_weights = False
+    #: An expert with fewer unique routed live points is not trained that
+    #: round: a training/validation split of a handful of points is
+    #: meaningless (and a single training row has no valid batch size).
+    min_expert_training_size = 5
     # Weight of an always-on background expert (trained on all data, blended in
     # at ``k >= 2``).  0 -> no background expert (default; byte-identical to the
     # plain clustered mixture).
@@ -2801,6 +2805,9 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
 
         output = kwargs.pop("output", None) or self.output
         os.makedirs(output, exist_ok=True)
+        groups = kwargs.pop("groups", None)
+        if groups is not None:
+            groups = np.asarray(groups)
         labels = model.route_prime_array(samples)
         k = model._n_active_experts()
 
@@ -2817,18 +2824,23 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
                         j, sub.shape[0],
                     )
                     continue
-                if sub.shape[0] < 2:
+                # mirror copies (boundary inversion with duplication) share
+                # a group: count the live points behind the rows
+                g_j = None if groups is None else groups[labels == j]
+                n_unique = sub.shape[0] if g_j is None else len(np.unique(g_j))
+                if n_unique < self.min_expert_training_size:
                     logger.warning(
-                        "Clustered group mixture: expert %d has %d routed "
-                        "points -- skipping its training this round",
-                        j, sub.shape[0],
+                        "Clustered group mixture: expert %d has %d unique "
+                        "routed points -- skipping its training this round",
+                        j, n_unique,
                     )
                     continue
                 self.model = model.experts[j]
                 self._optimiser = self.get_optimiser()
                 hj = super().train(
                     sub, plot=False,
-                    output=os.path.join(output, f"expert_{j}"), **kwargs,
+                    output=os.path.join(output, f"expert_{j}"), groups=g_j,
+                    **kwargs,
                 )
                 history["loss"].append(hj["loss"])
                 history["val_loss"].append(hj["val_loss"])
@@ -2844,7 +2856,8 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
                 self._optimiser = self.get_optimiser()
                 hb = super().train(
                     np.ascontiguousarray(samples), plot=False,
-                    output=os.path.join(output, "expert_bg"), **kwargs,
+                    output=os.path.join(output, "expert_bg"), groups=groups,
+                    **kwargs,
                 )
                 history["loss"].append(hb["loss"])
                 history["val_loss"].append(hb["val_loss"])

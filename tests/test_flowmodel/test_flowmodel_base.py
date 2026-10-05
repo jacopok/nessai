@@ -357,6 +357,7 @@ def test_training_with_conditional(data_dim, tmp_path):
         weights=None,
         conditional=conditional,
         use_dataloader=True,
+        groups=None,
     )
     fm._train.assert_called_once()
     assert fm._train.call_args_list[0][1]["is_conditional"] is True
@@ -847,3 +848,42 @@ def test_train_conditional_integration(tmp_path):
     conditional = np.random.randint(2, size=(100, 1))
 
     _ = flow.train(data, conditional=conditional)
+
+
+@pytest.mark.parametrize("val_size", [0.1, 0.3])
+def test_grouped_split_keeps_groups_together(val_size):
+    """Mirror copies of a sample never straddle the validation split."""
+    fm = create_autospec(FlowModel)
+    fm.rng = np.random.default_rng(1)
+    groups = np.tile(np.arange(50), 2)
+    idx, n = FlowModel._grouped_split(fm, groups, val_size, 100)
+    assert sorted(idx) == list(range(100))
+    train, val = set(groups[idx[:n]]), set(groups[idx[n:]])
+    assert not train & val
+    assert len(val) == round(val_size * 50)
+
+
+def test_grouped_split_invalid_shape():
+    fm = create_autospec(FlowModel)
+    fm.rng = np.random.default_rng(1)
+    with pytest.raises(ValueError, match="groups must have shape"):
+        FlowModel._grouped_split(fm, np.arange(5), 0.1, 10)
+
+
+def test_prep_data_with_groups(data_dim):
+    """``prep_data`` puts whole groups in the validation data."""
+    flow_config = dict(n_inputs=data_dim, n_blocks=1, n_neurons=4)
+    fm = FlowModel(flow_config=flow_config, output="./")
+    fm.initialise()
+    x = np.random.randn(10, data_dim)
+    rows = np.concatenate([x, -x])
+    groups = np.tile(np.arange(10), 2)
+    train, val, _ = fm.prep_data(
+        rows, val_size=0.2, batch_size=5, groups=groups
+    )
+    val = val.numpy()
+    assert val.shape[0] == 4
+    # each validation row's mirror copy is also in the validation data
+    for row in val:
+        assert np.isclose(val, -row, atol=1e-6).all(axis=1).any()
+

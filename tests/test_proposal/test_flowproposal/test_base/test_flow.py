@@ -56,6 +56,35 @@ def test_train_plot_false(mock_os_makedirs, proposal, model):
     proposal.flow.train.assert_called_once()
 
 
+@pytest.mark.parametrize("n_copies", [1, 2, 4])
+@patch("os.path.exists", return_value=False)
+@patch("os.makedirs")
+def test_train_groups_mirror_copies(
+    mock_os_makedirs, mock_exists, proposal, model, n_copies
+):
+    """Rows that rescaling appends as mirror copies (boundary inversion with
+    duplication, in blocks of ``len(x)``) are passed to the flow as groups so
+    the validation split keeps each live point's copies together."""
+    x = model.new_point(3)
+    x_prime = model.new_point(3 * n_copies)
+    proposal.output = "out"
+    proposal._plot_training = False
+    proposal.prime_parameters = model.names
+    proposal.save_training_data = False
+    proposal.training_count = 0
+    proposal.flow = MagicMock()
+    proposal.check_state = MagicMock()
+    proposal.rescale = MagicMock(return_value=(x_prime, np.zeros(len(x_prime))))
+    BaseFlowProposal.train(proposal, x, plot=False)
+    kwargs = proposal.flow.train.call_args[1]
+    if n_copies == 1:
+        assert "groups" not in kwargs
+    else:
+        np.testing.assert_array_equal(
+            kwargs["groups"], np.tile(np.arange(3), n_copies)
+        )
+
+
 @pytest.mark.parametrize("n", [1, 10])
 def test_forward_pass(proposal, model, n):
     """Test the forward pass method"""

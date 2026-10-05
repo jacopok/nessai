@@ -912,10 +912,18 @@ class BaseFlowProposal(RejectionProposal):
             x_prime, self.prime_parameters, copy=True
         )
 
+        train_kwargs = {}
+        n_rows = x_prime_array.shape[0]
+        if n_rows > len(x) and n_rows % len(x) == 0:
+            # boundary inversion with duplication appends mirror copies in
+            # blocks of ``len(x)`` rows: keep each live point's copies on the
+            # same side of the validation split
+            train_kwargs["groups"] = np.arange(n_rows) % len(x)
         history = self.flow.train(
             x_prime_array,
             output=block_output,
             plot=self._plot_training and plot,
+            **train_kwargs,
         )
         if isinstance(history, dict) and "epochs" in history:
             self.last_training_epochs = history["epochs"]

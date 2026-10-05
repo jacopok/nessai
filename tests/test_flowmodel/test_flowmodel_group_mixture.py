@@ -2679,3 +2679,71 @@ def test_mixture_levels_reuse_the_densities_of_the_last_inverse():
     assert lookups[-1] is None
     np.testing.assert_array_equal(piece_f, piece)
     np.testing.assert_allclose(level_f, level, atol=1e-6)
+
+
+def _duplicated_k2(tmp_path, n=600, small_fraction=0.25, seed=0):
+    fm = _ClusteredPeriodicFlowModel(
+        flow_config={"n_inputs": 2, "model": "realnvp", "n_blocks": 2,
+                     "n_neurons": 8},
+        training_config={"max_epochs": 3, "patience": 3, "batch_size": 200},
+        output=str(tmp_path),
+    )
+    fm.initialise()
+    rng = np.random.default_rng(seed)
+    y = np.where(rng.random(n) < 1 - small_fraction,
+                 rng.normal(2.5, 0.3, n), rng.normal(-2.5, 0.3, n))
+    x = np.stack([rng.uniform(0, 1, n), y], axis=1).astype(np.float32)
+    data = np.concatenate([x, x])          # two copies of every point
+    groups = np.tile(np.arange(n), 2)
+    t = torch.as_tensor(data)
+    fm.model.update_mixture_weights(t)
+    fm.model.update_base_standardisation(t)
+    assert fm.model._n_active_experts() == 2
+    return fm, data, groups
+
+
+def test_clustered_train_passes_each_expert_its_groups(tmp_path, monkeypatch):
+    """Each expert's validation split keeps its live points' copies
+    together: it trains with the groups of its own rows."""
+    from nessai.flowmodel.base import FlowModel
+
+    fm, data, groups = _duplicated_k2(tmp_path)
+    calls = []
+    original = FlowModel.train
+
+    def spy(self, samples, **kwargs):
+        calls.append((samples.shape[0], kwargs.get("groups")))
+        return original(self, samples, **kwargs)
+
+    monkeypatch.setattr(FlowModel, "train", spy)
+    fm.train(data, groups=groups)
+    labels = fm.model.route_prime_array(data)
+    assert len(calls) == 2
+    for j, (n_rows, g) in enumerate(calls):
+        np.testing.assert_array_equal(g, groups[labels == j])
+        assert n_rows == 2 * len(np.unique(g))
+
+
+def test_clustered_train_skips_expert_with_too_few_points(
+    tmp_path, monkeypatch, caplog
+):
+    """An expert with fewer than ``min_expert_training_size`` unique live
+    points is not trained: its copies count once."""
+    from nessai.flowmodel.base import FlowModel
+
+    fm, data, groups = _duplicated_k2(tmp_path)
+    labels = fm.model.route_prime_array(data)
+    n_small = min(len(np.unique(groups[labels == j])) for j in range(2))
+    monkeypatch.setattr(fm, "min_expert_training_size", n_small + 1)
+    calls = []
+    original = FlowModel.train
+
+    def spy(self, samples, **kwargs):
+        calls.append(samples.shape[0])
+        return original(self, samples, **kwargs)
+
+    monkeypatch.setattr(FlowModel, "train", spy)
+    with caplog.at_level(logging.WARNING):
+        fm.train(data, groups=groups)
+    assert len(calls) == 1
+    assert f"has {n_small} unique routed points" in caplog.text
