@@ -510,6 +510,7 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
         self.relax = float(relax)
         self._floors = {}
         self._floors_training = None
+        self._tightened = {}
         self._draws = []
 
     @property
@@ -570,7 +571,9 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
         training = getattr(proposal, "training_count", None)
         if training != self._floors_training:
             # a new flow: levels are not comparable with the old ones
+            self._log_floors()
             self._floors = {}
+            self._tightened = {}
             self._floors_training = training
             return
         if not self._draws:
@@ -609,11 +612,12 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
             if floor > self._threshold:
                 if self._floors.get(piece) != floor:
                     changed.append((int(piece), share, live_share))
+                    self._tightened[int(piece)] = (share, live_share)
                 self._floors[piece] = floor
             else:
                 self._floors.pop(piece, None)
         if changed:
-            logger.info(
+            logger.debug(
                 "Level threshold %.3f: %d piece(s) tightened (pool/live share: "
                 "%s)",
                 self._threshold,
@@ -622,6 +626,22 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
                     f"{p}: {s:.3g}/{l:.3g}" for p, s, l in changed[:8]
                 ),
             )
+
+    def _log_floors(self):
+        """Summarise the ending flow's floors (logged once per retrain)."""
+        tightened = getattr(self, "_tightened", None)
+        if not tightened:
+            return
+        worst = sorted(tightened.items(), key=lambda kv: -kv[1][0] / kv[1][1])
+        logger.info(
+            "Level threshold %.3f: %d piece(s) tightened during the last flow, "
+            "%d floor(s) at retrain (pool/live share at the last tightening, "
+            "most over-covered first: %s)",
+            self._threshold,
+            len(tightened),
+            len(self._floors),
+            ", ".join(f"{p}: {s:.3g}/{l:.3g}" for p, (s, l) in worst[:8]),
+        )
 
     def apply_after_backward(self, proposal, x, log_q, z):
         cand_pieces, cand_levels = self._levels(proposal, x, log_q, z=z)
