@@ -2,6 +2,7 @@
 Discrete group-mixture flow extension for nessai.
 """
 
+import copy
 import logging
 import math
 import os
@@ -1716,9 +1717,18 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         bg_weight=0.0,
         freeze_min_size=None,
         importance_weights=False,
+        warm_max_share=None,
     ):
         super().__init__()
         self.experts = torch.nn.ModuleList(experts)
+        # An expert holding at most this share of the live points is never
+        # reset (``--reset-flow``, a weights-only reset, a reset chosen by
+        # the retrain decision): a flow refitted from scratch on a few
+        # hundred points comes out far broader than one warm-started from
+        # its own previous fit.  ``None`` resets every expert.
+        self.warm_max_share = (
+            None if warm_max_share is None else float(warm_max_share)
+        )
         # An expert whose routed population drops below this is frozen: no
         # retraining, re-standardisation or group-weight update, but it keeps
         # proposing until its population is gone.  A flow fitted to a few
@@ -1896,12 +1906,20 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             return
         if len(self.experts) != len(old.experts):
             return
+        kept = torch.zeros_like(old._trained)
         for j, (new_e, old_e) in enumerate(zip(self.experts, old.experts)):
             new_e._carry_over_group_state(old_e)
-            if bool(old._frozen[j]):
-                # a frozen expert is never retrained, so a reset must not
-                # discard its flow: carry it over whole
+            if old.keeps_warm(j):
+                # a frozen expert is never retrained and a small one is
+                # warm-started only (``warm_max_share``): a reset must not
+                # discard its flow, so carry it over whole
                 new_e.load_state_dict(old_e.state_dict())
+                kept[j] = True
+                logger.info(
+                    "Clustered group mixture: expert %d (%.3f of the live "
+                    "points) keeps its flow through the reset",
+                    j, float(old.cluster_weights[j]),
+                )
         if self._bg_expert is not None and old._bg_expert is not None:
             self._bg_expert._carry_over_group_state(old._bg_expert)
         with torch.no_grad():
@@ -1916,9 +1934,9 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             self._pending_split_train.copy_(old._pending_split_train)
             self._bg_seen.copy_(old._bg_seen)
             self._frozen.copy_(old._frozen)
-            # only the frozen experts' flows are carried over whole; the
-            # rest are fresh and need a training pass before they may freeze
-            self._trained.copy_(old._trained & old._frozen)
+            # only the kept experts' flows are carried over whole; the rest
+            # are fresh and need a training pass before they may freeze
+            self._trained.copy_(old._trained & kept)
             self._proposal_weights.copy_(old._proposal_weights)
             self._proposal_weights_seen.copy_(old._proposal_weights_seen)
 
@@ -1966,6 +1984,36 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         """The real ``k`` -- experts that train per-cluster, even while a
         split is pending."""
         return int(self._n_active.item())
+
+    def keeps_warm(self, j):
+        """Whether expert ``j`` keeps its flow through a reset: it is
+        frozen, or (``k >= 2``) it holds at most :attr:`warm_max_share` of the
+        live points."""
+        if self._n_active_experts() < 2 or j >= self._n_active_experts():
+            return False
+        if bool(self._frozen[j]):
+            return True
+        share = getattr(self, "warm_max_share", None)
+        return share is not None and float(self.cluster_weights[j]) <= share
+
+    def expert_states_kept_on_reset(self):
+        """``{j: state_dict}`` of the experts that keep their flows through
+        a reset (:meth:`keeps_warm`)."""
+        kept = {}
+        for j in range(self._n_active_experts()):
+            if self.keeps_warm(j):
+                kept[j] = copy.deepcopy(self.experts[j].state_dict())
+                logger.info(
+                    "Clustered group mixture: expert %d (%.3f of the live "
+                    "points) keeps its flow through the reset",
+                    j, float(self.cluster_weights[j]),
+                )
+        return kept
+
+    def restore_expert_states(self, states):
+        """Load the flows saved by :meth:`expert_states_kept_on_reset`."""
+        for j, state in states.items():
+            self.experts[j].load_state_dict(state)
 
     def _bg_on(self):
         """True when the background expert should contribute to the mixture.
@@ -2913,6 +2961,7 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
             bg_weight=bg_weight,
             freeze_min_size=getattr(self, "freeze_min_size", None),
             importance_weights=getattr(self, "importance_weights", False),
+            warm_max_share=getattr(self, "warm_max_share", None),
         )
 
 
@@ -2928,6 +2977,7 @@ def make_clustered_group_mixture_flow(
     bg_weight=0.0,
     freeze_min_size=None,
     importance_weights=False,
+    warm_max_share=None,
     **kwargs,
 ):
     """:func:`make_group_mixture_flow` with a clustered base flow.
@@ -2950,8 +3000,10 @@ def make_clustered_group_mixture_flow(
     stops being retrained (and re-standardised) but keeps proposing until its
     population reaches zero.  ``importance_weights``: draw the experts with
     weights proportional to the prior mass of their supports, re-estimated
-    after every populate, instead of the live-point fractions.  All other
-    keyword arguments are passed straight through.
+    after every populate, instead of the live-point fractions.
+    ``warm_max_share``: an expert holding at most this share of the live
+    points keeps its flow through every reset (it is only ever
+    warm-started).  All other keyword arguments are passed straight through.
     """
     base_cls = make_group_mixture_flow(**kwargs)
 
@@ -2972,6 +3024,9 @@ def make_clustered_group_mixture_flow(
         None if freeze_min_size is None else int(freeze_min_size)
     )
     ClusteredCustom.importance_weights = bool(importance_weights)
+    ClusteredCustom.warm_max_share = (
+        None if warm_max_share is None else float(warm_max_share)
+    )
     return ClusteredCustom
 
 

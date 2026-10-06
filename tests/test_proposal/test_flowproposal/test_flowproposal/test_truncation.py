@@ -602,6 +602,42 @@ def test_log_level_threshold_tightens_an_overrepresented_piece():
     assert rule.floors == {}
 
 
+def test_log_level_threshold_pilot_sets_floors_before_first_pool():
+    """With ``pilot_size`` a new flow's floors come from pilot draws in
+    ``prepare``, so its first pool is already tightened."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    rng = np.random.default_rng(1)
+    live_x = np.r_[rng.uniform(0, 1, 990), -np.linspace(0.1, 0.2, 10)]
+    proposal, arr, log_q_of = _level_proposal(live_x, [0.5, 0.5])
+    proposal.drawsize = 5000
+
+    def backward_pass(z, rescale=True, return_z=False,
+                      return_unit_hypercube=False):
+        x = arr(z[:, 0])
+        return x, log_q_of(x), z
+
+    proposal.sample_latent_distribution = MagicMock(
+        side_effect=lambda n: rng.uniform(-1, 1, (n, 1)))
+    proposal.backward_pass = MagicMock(side_effect=backward_pass)
+
+    rule = LogLevelThresholdTruncation(
+        quantile=0.005, share_cap=4.0, pilot_size=20000)
+    rule.prepare(proposal, worst_point=None)
+    assert proposal.sample_latent_distribution.call_count == 4
+    assert list(rule.floors) == [1]
+    assert rule.floors[1] == pytest.approx(-(0.2**2))
+    # the pilot draws are not reused by the next prepare of the same flow
+    assert rule._draws == []
+    # a retrained flow gets a fresh pilot
+    proposal.training_count = 1
+    rule.prepare(proposal, worst_point=None)
+    assert proposal.sample_latent_distribution.call_count == 8
+    assert list(rule.floors) == [1]
+
+
 def test_log_level_threshold_rejects_cap_below_one():
     from nessai.proposal.flowproposal.truncation import (
         LogLevelThresholdTruncation,

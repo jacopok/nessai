@@ -2343,6 +2343,63 @@ def test_complete_reset_keeps_frozen_expert_flow(tmp_path):
     assert any(not torch.equal(other[k], old_other[k]) for k in old_other)
 
 
+_ClusteredWarmFlowModel = make_clustered_group_mixture_flow(
+    n_clusters_max=2, min_cluster_size=10, max_cluster_overlap=0.15,
+    k_grow_patience=1, warm_max_share=0.25,
+    group_action_fn=shift_group_action, group_size=N_PERIODS,
+    param_names=["x", "y"], in_fundamental_domain=in_fundamental_domain,
+)
+
+
+@pytest.mark.parametrize("permutations", [True, False])
+def test_reset_keeps_small_expert_flow(tmp_path, permutations):
+    """``warm_max_share``: an expert holding at most that share of the live
+    points keeps its flow through a complete or a weights-only reset; the
+    others are reset."""
+    fm = _ClusteredWarmFlowModel(
+        flow_config={"n_inputs": 2, "model": "realnvp", "n_blocks": 2,
+                     "n_neurons": 8},
+        training_config={"max_epochs": 2, "patience": 2, "batch_size": 200},
+        output=str(tmp_path),
+    )
+    fm.initialise()
+    assert fm.model.warm_max_share == 0.25
+    rng = np.random.default_rng(0)
+    fm.model.update_mixture_weights(_bimodal(1200, rng))
+    fm.model.finalise()
+    data = _lopsided(1200, 50, rng)
+    fm.model.update_mixture_weights(data)
+    j = _small_expert(fm.model, data)
+    assert fm.model.keeps_warm(j) and not fm.model.keeps_warm(1 - j)
+    assert not fm.model.is_frozen(j)
+    old = {k: v.clone() for k, v in fm.model.experts[j].state_dict().items()}
+    old_other = {
+        k: v.clone()
+        for k, v in fm.model.experts[1 - j].base_flow.state_dict().items()
+    }
+    fm.reset_model(weights=True, permutations=permutations)
+    new = fm.model.experts[j].state_dict()
+    assert all(torch.equal(new[k], old[k]) for k in old)
+    other = fm.model.experts[1 - j].base_flow.state_dict()
+    assert any(not torch.equal(other[k], old_other[k]) for k in old_other)
+    if permutations:
+        assert bool(fm.model._trained[j])
+        assert not bool(fm.model._trained[1 - j])
+
+
+def test_keeps_warm_off_by_default_and_at_one_expert():
+    w = _clustered_wrapper(2, max_cluster_overlap=0.1)
+    rng = np.random.default_rng(0)
+    data = _lopsided(800, 40, rng)
+    _split_then(w, rng, data)
+    assert int(w._n_active.item()) == 2
+    assert not any(w.keeps_warm(j) for j in range(2))
+    w.warm_max_share = 0.25
+    assert w.keeps_warm(_small_expert(w, data))
+    w._n_active.fill_(1)
+    assert not w.keeps_warm(0)
+
+
 # -- importance-estimated group-element weights -----------------------------
 def _imp_wrapper():
     w = _expert()

@@ -818,12 +818,20 @@ class FlowModel:
                 # bookkeeping accumulated over many rounds, so copy that
                 # state across into the freshly (re)constructed model.
                 carry_over(old_model)
-        elif weights:
-            self.model.apply(reset_weights)
-            logger.debug("Reset weights")
-        elif permutations:
-            self.model.apply(reset_permutations)
-            logger.debug("Reset linear transforms")
+        else:
+            # e.g. ClusteredGroupMixtureFlowWrapper: experts that are only
+            # ever warm-started keep their flows (the full reset above
+            # carries them over in ``_carry_over_group_state``)
+            keep = getattr(self.model, "expert_states_kept_on_reset", None)
+            kept = keep() if callable(keep) else {}
+            if weights:
+                self.model.apply(reset_weights)
+                logger.debug("Reset weights")
+            else:
+                self.model.apply(reset_permutations)
+                logger.debug("Reset linear transforms")
+            if kept:
+                self.model.restore_expert_states(kept)
         self._optimiser = self.get_optimiser()
         logger.debug("Resetting optimiser")
 

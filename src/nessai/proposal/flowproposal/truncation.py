@@ -479,7 +479,10 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
     but never above its lowest live point.  A symmetry image the likelihood is
     abandoning then stops holding a full-size copy of the support.  Floors are
     relaxed by ``relax`` when a piece falls well inside the cap, and are
-    reset whenever the flow is retrained.
+    reset whenever the flow is retrained.  With ``pilot_size``, a retrained
+    flow's floors are set before its first pool from that many latent draws
+    (flow draws only, no likelihood evaluations); otherwise its first pool
+    is drawn without floors.
 
     The proposal supplies ``mixture_levels(x, log_q) -> (pieces, levels)``,
     both of shape ``(n, k)``: one candidate (piece, level) per mixture
@@ -501,6 +504,7 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
         quantile: float = 0.005,
         share_cap: float | None = None,
         relax: float = 0.5,
+        pilot_size: int | None = None,
     ) -> None:
         super().__init__()
         self.quantile = float(quantile)
@@ -508,6 +512,7 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
             raise ValueError("share_cap must be >= 1")
         self.share_cap = None if share_cap is None else float(share_cap)
         self.relax = float(relax)
+        self.pilot_size = int(pilot_size) if pilot_size else 0
         self._floors = {}
         self._floors_training = None
         self._tightened = {}
@@ -575,7 +580,9 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
             self._floors = {}
             self._tightened = {}
             self._floors_training = training
-            return
+            if not getattr(self, "pilot_size", 0):
+                return
+            self._draws = self._pilot_draws(proposal)
         if not self._draws:
             return
         d_piece = np.concatenate([d[0] for d in self._draws])
@@ -626,6 +633,45 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
                     f"{p}: {s:.3g}/{l:.3g}" for p, s, l in changed[:8]
                 ),
             )
+
+    def _pilot_draws(self, proposal):
+        """Draws from a newly trained flow, kept and recorded as
+        :meth:`apply_after_backward` does, to set its floors before its
+        first pool.  Only this rule's support applies (the threshold is set
+        and there are no floors yet)."""
+        draws = []
+        batch = int(getattr(proposal, "drawsize", None) or 10_000)
+        n_drawn = n_kept = 0
+        while n_drawn < self.pilot_size:
+            n = min(batch, self.pilot_size - n_drawn)
+            z = proposal.sample_latent_distribution(n)
+            n_drawn += n
+            x, log_q, z = proposal.backward_pass(
+                z,
+                rescale=True,
+                return_z=True,
+                return_unit_hypercube=getattr(
+                    proposal, "map_to_unit_hypercube", False
+                ),
+            )
+            if not len(x):
+                continue
+            cand_pieces, cand_levels = self._levels(proposal, x, log_q, z=z)
+            keep = np.any(
+                cand_levels > self._point_thresholds(cand_pieces), axis=1
+            )
+            if not keep.any():
+                continue
+            pieces, level = self._best(cand_pieces[keep], cand_levels[keep])
+            log_w = proposal.compute_weights(x[keep], log_q[keep])
+            draws.append((pieces, level, np.asarray(log_w)))
+            n_kept += int(keep.sum())
+        logger.debug(
+            "Level threshold pilot: %d / %d draws in the support",
+            n_kept,
+            n_drawn,
+        )
+        return draws
 
     def _log_floors(self):
         """Summarise the ending flow's floors (logged once per retrain)."""
