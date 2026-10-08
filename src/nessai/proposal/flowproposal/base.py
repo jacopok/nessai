@@ -351,9 +351,55 @@ class BaseFlowProposal(RejectionProposal):
             self._plot_pool = False
             self._plot_training = False
 
+    @property
+    def circular_prime_parameters(self):
+        """Prime parameters that are angles for a circular flow."""
+        if self._reparameterisation is None:
+            return []
+        return [
+            p
+            for r in self._reparameterisation.values()
+            for p in getattr(r, "circular_parameters", [])
+            if p in self.prime_parameters
+        ]
+
+    @property
+    def latent_real_mask(self):
+        """Latent dimensions that are not circular.
+
+        The latent space of a coupling flow has one dimension per prime
+        parameter, in the same order; circular ones are uniform on
+        ``[-pi, pi)`` and excluded from the latent temperature and radius.
+        Read from the flow (``circular_features``) once it exists, so flows
+        whose circular coordinates are not prime parameters (e.g. the base
+        flow of a group mixture) are covered too.
+        """
+        model = getattr(getattr(self, "flow", None), "model", None)
+        features = getattr(model, "circular_features", None)
+        if features is None:
+            circular = set(self.circular_prime_parameters)
+            return np.array([p not in circular for p in self.prime_parameters])
+        mask = np.ones(self.prime_dims, dtype=bool)
+        mask[list(features)] = False
+        return mask
+
     def update_flow_config(self):
         """Update the flow configuration dictionary."""
         self.flow_config["n_inputs"] = self.prime_dims
+        circular = self.circular_prime_parameters
+        if circular:
+            ftype = str(self.flow_config.get("ftype") or "").lower()
+            if self.flow_config.get("flow") is None and not ftype.startswith(
+                "circular"
+            ):
+                raise ValueError(
+                    f"Parameters {circular} are circular: use a circular "
+                    "flow (flow_config['ftype'] = 'circular'), not "
+                    f"{self.flow_config.get('ftype')!r}."
+                )
+            self.flow_config["circular_features"] = [
+                self.prime_parameters.index(p) for p in circular
+            ]
 
     def initialise(self, resumed: bool = False) -> None:
         """
@@ -391,12 +437,21 @@ class BaseFlowProposal(RejectionProposal):
         self.initialised = True
 
     def sample_latent_distribution(self, n):
-        """Sample from the flow latent distribution with optional temperature."""
+        """Sample from the flow latent distribution with optional temperature.
+
+        The temperature widens the Gaussian latent dimensions only: circular
+        ones stay uniform.
+        """
         z = self.flow.sample_latent_distribution(n)
         temperature = getattr(self, "latent_temperature", None)
         if temperature in (None, 1.0):
             return z
-        return np.sqrt(temperature) * z
+        real = self.latent_real_mask
+        if real.all():
+            return np.sqrt(temperature) * z
+        z = np.array(z, copy=True)
+        z[:, real] *= np.sqrt(temperature)
+        return z
 
     def latent_log_prob(self, z, temperature=None):
         """Compute the latent log-probability under the effective density."""
@@ -406,8 +461,10 @@ class BaseFlowProposal(RejectionProposal):
             log_j = 0.0
         else:
             scale = np.sqrt(float(temperature))
-            z_in = z / scale
-            log_j = z.shape[-1] * np.log(scale)
+            real = self.latent_real_mask
+            z_in = np.array(z, copy=True)
+            z_in[..., real] /= scale
+            log_j = int(real.sum()) * np.log(scale)
         with torch.inference_mode():
             z_tensor = self.flow.numpy_array_to_tensor(z_in)
             log_p = self.flow.model.base_distribution_log_prob(z_tensor)
