@@ -188,6 +188,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         mode_factor_sizes=None,
         base_reparam=None,
         importance_weights=False,
+        circular_parameters=None,
+        base_symmetry=None,
     ):
         super().__init__()
         self.base_flow = base_flow
@@ -292,6 +294,59 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             if hasattr(base_reparam, "bind"):
                 base_reparam.bind(self.param_names)
         self.base_reparam = base_reparam
+
+        # Optional circular base-frame coordinates: parameters whose base-frame
+        # value ``t`` (after ``base_reparam`` and ``canonical_transform``) is an
+        # angle on ``[-pi, pi)``, modelled by a circular base flow (see
+        # :class:`~nessai.flows.circular.CircularNeuralSplineFlow`). Their
+        # standardisation is pinned to the identity, so the base flow sees the
+        # angles themselves.
+        self.circular_parameters = (
+            list(circular_parameters)
+            if isinstance(circular_parameters, (list, tuple))
+            else []
+        )
+        if self.circular_parameters:
+            if prime_space_action is None:
+                raise ValueError(
+                    "circular_parameters is only supported on the "
+                    "prime_space_action path."
+                )
+            both = set(self.circular_parameters) & set(self.reflect_parameters)
+            if both:
+                raise ValueError(
+                    f"Parameters {sorted(both)} cannot be both circular and "
+                    "reflected."
+                )
+        self._circular_idx = torch.empty(0, dtype=torch.long)
+        self._configure_circular()
+
+        # Optional symmetry of the base frame: an isometry ``h`` of the
+        # base-frame coordinates ``t`` (with ``h`` of unit Jacobian) whose
+        # images the base flow is summed over, ``q0_sym(t) = sum_k q0(h_k t)``.
+        # The canonical points then cover only part of the base frame (one
+        # image of each orbit of ``h``); a generative draw is folded onto that
+        # part. This lets a group element that acts on a circular coordinate
+        # with a twist on others (e.g. a half-turn of an azimuth that also
+        # flips an inclination) be folded without a seam: the base flow models
+        # the whole circle and the sum keeps the folded density continuous
+        # across the twisted identification. An object exposing
+        #   images(t) -> list of [N, d] tensors, the non-identity images
+        #   fold(t)   -> [N, d], the image of each row in the canonical part
+        #   bind(param_names)  optional
+        if base_symmetry is not None:
+            if prime_space_action is None:
+                raise ValueError(
+                    "base_symmetry is only supported on the "
+                    "prime_space_action path."
+                )
+            if self.reflect_parameters:
+                raise ValueError(
+                    "base_symmetry cannot be combined with reflect_parameters."
+                )
+            if hasattr(base_symmetry, "bind"):
+                base_symmetry.bind(self.param_names)
+        self.base_symmetry = base_symmetry
 
         # Coordinate bridge; defaults to the identity map so the wrapper is
         # usable without a proposal (e.g. in unit tests).
@@ -574,11 +629,42 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         else:
             self._sign_patterns = None
 
+    def _configure_circular(self):
+        """(Re)build the circular-dim indices from ``circular_parameters``."""
+        names = getattr(self, "circular_parameters", None) or []
+        missing = [p for p in names if p not in self.param_names]
+        if missing:
+            raise ValueError(
+                f"Circular parameters {missing} are not in the parameters "
+                f"{self.param_names}."
+            )
+        self._circular_idx = torch.tensor(
+            [self.param_names.index(p) for p in names], dtype=torch.long
+        )
+
+    @property
+    def circular_features(self):
+        """Indices of the base-frame (and latent) dimensions that are angles."""
+        idx = getattr(self, "_circular_idx", None)
+        return [] if idx is None else idx.tolist()
+
     def set_param_names(self, names):
         """Rebind the prime-parameter names (e.g. once the proposal knows the
         reparameterisation's true order) and refresh reflection indices."""
         self.param_names = list(names)
         self._configure_reflection()
+        self._configure_circular()
+        built = getattr(self.base_flow, "circular_features", None)
+        if built is not None and sorted(built) != sorted(
+            self.circular_features
+        ):
+            raise RuntimeError(
+                f"The circular base flow was built with circular inputs "
+                f"{sorted(built)}, but {self.circular_parameters} are at "
+                f"{sorted(self.circular_features)} in {self.param_names}: "
+                "build the flow model in this parameter order (its "
+                "``param_names``)."
+            )
         if self._canonical_transform is not None and hasattr(
             self._canonical_transform, "bind"
         ):
@@ -587,6 +673,9 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             self.base_reparam, "bind"
         ):
             self.base_reparam.bind(self.param_names)
+        symmetry = getattr(self, "base_symmetry", None)
+        if symmetry is not None and hasattr(symmetry, "bind"):
+            symmetry.bind(self.param_names)
 
     def set_coordinate_bridge(self, bridge):
         """Install a :class:`ReparamBridge`.
@@ -664,6 +753,13 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         canon[:, idx] = canon[:, idx].abs()
         return canon
 
+    def _fold_symmetry(self, t):
+        """Fold a base-frame draw onto the canonical part of ``base_symmetry``."""
+        symmetry = getattr(self, "base_symmetry", None)
+        if symmetry is None:
+            return t
+        return symmetry.fold(t)
+
     def _base_log_prob(self, canon, modes, context=None):
         """``log q0`` of standardised ``canon``, symmetrised over reflect dims.
 
@@ -679,6 +775,19 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         standardisation / reflection then act on ``t``.
         """
         t, log_j = self._canon_to_base(canon)
+        symmetry = getattr(self, "base_symmetry", None)
+        if symmetry is not None:
+            images = [t] + list(symmetry.images(t))
+            n = t.shape[0]
+            u_all = self._standardise(torch.cat(images, dim=0), modes)
+            ctx = (
+                None if context is None
+                else context.repeat(len(images), 1)
+            )
+            lp = self.base_flow.log_prob(u_all, context=ctx).view(
+                len(images), n
+            )
+            return torch.logsumexp(lp, dim=0) + log_j
         u = self._standardise(t, modes)
         if self._sign_patterns is None:
             return self.base_flow.log_prob(u, context=context) + log_j
@@ -820,6 +929,19 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         std[idx] = rms
         return mean, std
 
+    def _pin_circular(self, mean, std):
+        # Circular dims are angles on [-pi, pi) for the circular base flow:
+        # no standardisation.
+        idx = getattr(self, "_circular_idx", None)
+        if idx is None or not idx.numel():
+            return mean, std
+        idx = idx.to(mean.device)
+        mean = mean.clone()
+        std = std.clone()
+        mean[idx] = 0.0
+        std[idx] = 1.0
+        return mean, std
+
     @torch.no_grad()
     def update_base_standardisation(self, x, context=None):
         """Update the shared canonical standardisation from assigned points.
@@ -859,6 +981,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         mean = c.mean(dim=0)
         std = c.std(dim=0).clamp_min(self._min_canon_std)
         mean, std = self._pin_reflect(mean, std, c)
+        mean, std = self._pin_circular(mean, std)
 
         if bool(self._canon_seen):
             beta = self._canon_ema
@@ -1228,7 +1351,9 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         modes = Categorical(probs=self.proposal_weights).sample(
             (num_samples,)
         )
-        t = self._fold_reflect(self._destandardise(u, modes))
+        t = self._fold_symmetry(
+            self._fold_reflect(self._destandardise(u, modes))
+        )
         canon, _ = self._base_to_canon(t)
         x, fwd_logdet = self._apply_group_action(
             canon, modes, inverse=False
@@ -1264,7 +1389,9 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             n_draw = int(math.ceil(need / z_guess * 1.3)) + 32
             u = self.base_flow.sample(n_draw, context=context)
             modes = Categorical(probs=self.proposal_weights).sample((n_draw,))
-            t = self._fold_reflect(self._destandardise(u, modes))
+            t = self._fold_symmetry(
+                self._fold_reflect(self._destandardise(u, modes))
+            )
             canon, _ = self._base_to_canon(t)
             in_dom = self._in_domain(canon)
             n_drawn_tot += n_draw
@@ -1332,7 +1459,9 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         )
 
         u, _ = self.base_flow.inverse(z, context=context)
-        t = self._fold_reflect(self._destandardise(u, modes))
+        t = self._fold_symmetry(
+            self._fold_reflect(self._destandardise(u, modes))
+        )
         canon, _ = self._base_to_canon(t)
         x, fwd_logdet = self._apply_group_action(
             canon, modes, inverse=False
@@ -1397,6 +1526,10 @@ class GroupMixtureFlowModel(FlowModel):
     base_reparam_factory = None
     #: See :class:`DiscreteGroupMixtureFlowWrapper` ``importance_weights``.
     importance_weights = False
+    #: See :class:`DiscreteGroupMixtureFlowWrapper` ``circular_parameters``.
+    circular_parameters = None
+    #: See :class:`DiscreteGroupMixtureFlowWrapper` ``base_symmetry``.
+    base_symmetry = None
 
     def initialise(self):
         """Initialise the model and optimiser via :meth:`get_model`."""
@@ -1468,6 +1601,34 @@ class GroupMixtureFlowModel(FlowModel):
             "base_reparam_factory",
             getattr(self, "base_reparam_factory", None),
         )
+        circular_parameters = config_clean.pop(
+            "circular_parameters", getattr(self, "circular_parameters", None)
+        )
+        base_symmetry = config_clean.pop(
+            "base_symmetry", getattr(self, "base_symmetry", None)
+        )
+        if not isinstance(circular_parameters, (list, tuple)):
+            circular_parameters = None
+        if circular_parameters:
+            circular_parameters = list(circular_parameters)
+            missing = [p for p in circular_parameters if p not in param_names]
+            if missing:
+                raise ValueError(
+                    f"Circular parameters {missing} are not in the "
+                    f"parameters {param_names}."
+                )
+            ftype = str(config_clean.get("ftype") or "").lower()
+            if config_clean.get("flow") is None and not ftype.startswith(
+                "circular"
+            ):
+                raise ValueError(
+                    f"Circular base-frame parameters {circular_parameters} "
+                    "need a circular base flow (flow_config['ftype'] = "
+                    f"'circular'), not {config_clean.get('ftype')!r}."
+                )
+            config_clean["circular_features"] = [
+                list(param_names).index(p) for p in circular_parameters
+            ]
 
         if group_action_fn is None or group_size is None:
             raise ValueError(
@@ -1496,6 +1657,8 @@ class GroupMixtureFlowModel(FlowModel):
                 base_reparam_factory() if base_reparam_factory else None
             ),
             importance_weights=bool(getattr(self, "importance_weights", False)),
+            circular_parameters=circular_parameters,
+            base_symmetry=base_symmetry,
         )
 
 
@@ -1513,6 +1676,8 @@ def make_group_mixture_flow(
     mode_factor_sizes=None,
     base_reparam_factory=None,
     importance_weights=False,
+    circular_parameters=None,
+    base_symmetry=None,
 ):
     """Factory constructing a ``GroupMixtureFlowModel`` bound to a specific group.
 
@@ -1608,6 +1773,16 @@ def make_group_mixture_flow(
         (:meth:`~DiscreteGroupMixtureFlowWrapper.update_proposal_weights`),
         instead of the live-point fractions. The live-point fractions still
         decide which elements are active. Default ``False``.
+    circular_parameters : list of str, optional
+        Parameters whose base-frame coordinate (after ``base_reparam_factory``
+        and ``canonical_transform``) is an angle on ``[-pi, pi)``. The base
+        flow must then be circular (``flow_config['ftype'] = 'circular'``);
+        it receives their indices as ``circular_features`` and their
+        standardisation is pinned to the identity. Default: none.
+    base_symmetry : object, optional
+        A unit-Jacobian symmetry of the base frame summed over in the base
+        density, with generative draws folded onto its canonical part (see
+        :class:`DiscreteGroupMixtureFlowWrapper`). Default: none.
 
     Notes
     -----
@@ -1633,6 +1808,10 @@ def make_group_mixture_flow(
     )
     CustomGroupMixtureFlowModel.canonical_transform = canonical_transform
     CustomGroupMixtureFlowModel.importance_weights = bool(importance_weights)
+    CustomGroupMixtureFlowModel.circular_parameters = (
+        list(circular_parameters) if circular_parameters else None
+    )
+    CustomGroupMixtureFlowModel.base_symmetry = base_symmetry
     CustomGroupMixtureFlowModel.mode_factor_sizes = (
         [int(s) for s in mode_factor_sizes]
         if mode_factor_sizes is not None
@@ -1879,6 +2058,10 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     def param_names(self):
         return self.experts[0].param_names
 
+    @property
+    def circular_features(self):
+        return self.experts[0].circular_features
+
     def set_param_names(self, names):
         for e in self._all_experts():
             e.set_param_names(names)
@@ -1942,11 +2125,21 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
 
     # -- routing --------------------------------------------------------
     def _fold_to_base(self, x):
+        """Routing frame: the canonical transform of the canonical point.
+
+        Circular dims are set to zero: an angle on ``[-pi, pi)`` has no
+        Euclidean geometry for the nearest-centroid routing (a cluster on
+        the seam would be cut in two), so routing ignores them.
+        """
         e = self.experts[0]
         with torch.no_grad():
             assigned, pre, _ = e._assign_branch(x)
             canon = pre[assigned, torch.arange(x.shape[0], device=x.device)]
             t, _ = e._to_base(canon)
+            idx = getattr(e, "_circular_idx", None)
+            if idx is not None and idx.numel():
+                t = t.clone()
+                t[:, idx.to(t.device)] = 0.0
         return t
 
     @torch.no_grad()
