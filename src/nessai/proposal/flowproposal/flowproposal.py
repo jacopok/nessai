@@ -562,6 +562,18 @@ class FlowProposal(BaseFlowProposal):
             return x, log_prob, z
         return x, log_prob
 
+    def _warn_max_samples(self, max_samples):
+        """Warn that a pool stopped at ``max_samples`` draws, once per
+        training round: the pools of one flow all hit it alike."""
+        if getattr(self, "_max_samples_warned", None) == self.training_count:
+            logger.debug("Reached max samples (%s)", max_samples)
+            return
+        self._max_samples_warned = self.training_count
+        logger.warning(
+            "Reached max samples (%s); again for this flow at DEBUG",
+            max_samples,
+        )
+
     def populate(
         self,
         worst_point,
@@ -614,7 +626,7 @@ class FlowProposal(BaseFlowProposal):
             z = self._truncation_scheme.apply_latent(self, z)
             if not len(z):
                 if n_proposed > max_samples:
-                    logger.warning("Reached max samples (%s)", max_samples)
+                    self._warn_max_samples(max_samples)
                     break
                 continue
 
@@ -629,7 +641,7 @@ class FlowProposal(BaseFlowProposal):
             )
             if not len(x):
                 if n_proposed > max_samples:
-                    logger.warning("Reached max samples (%s)", max_samples)
+                    self._warn_max_samples(max_samples)
                     break
                 continue
 
@@ -642,7 +654,7 @@ class FlowProposal(BaseFlowProposal):
                 )
                 if not len(x):
                     if n_proposed > max_samples:
-                        logger.warning("Reached max samples (%s)", max_samples)
+                        self._warn_max_samples(max_samples)
                         break
                     continue
 
@@ -673,7 +685,7 @@ class FlowProposal(BaseFlowProposal):
                     accept = log_weights_rejection > log_u
                     n_accepted = np.sum(accept)
                 if n_proposed > max_samples:
-                    logger.warning("Reached max samples (%s)", max_samples)
+                    self._warn_max_samples(max_samples)
                     break
             else:
                 log_w = self._get_population_log_weights(
@@ -687,7 +699,7 @@ class FlowProposal(BaseFlowProposal):
                 n_accepted += n_accept_batch
                 logger.debug("n accepted: %s / %s", n_accepted, n_samples)
                 if n_proposed > max_samples:
-                    logger.warning("Reached max samples (%s)", max_samples)
+                    self._warn_max_samples(max_samples)
                     break
 
         if self.accumulate_weights:

@@ -847,11 +847,9 @@ class RetrainDecision:
                     kwargs.get("reason"),
                 )
             return
-        msg = self.format_decision(d)
+        logger.debug(self.format_decision(d))
         if retrain:
-            logger.info(msg)
-        else:
-            logger.debug(msg)
+            logger.info(self.format_decision_short(d))
 
     def format_decision(self, d):
         """One-line description of a logged decision and its inputs."""
@@ -892,6 +890,21 @@ class RetrainDecision:
             f"Costs: c={d['c']:.3g}s/point, T={d['T']:.3g}s -> "
             f"y={d['y']:.3g}, g*={d['g']:.3g}s/it, tau*={d['tau']:.0f} it"
             f"{reset}{pool}"
+        )
+
+    def format_decision_short(self, d):
+        """The retrain decision in one short line (INFO); the inputs are in
+        :meth:`format_decision` (DEBUG)."""
+        action = "Retraining"
+        if d.get("reset"):
+            action = "Resetting and retraining"
+        pool = ""
+        if d.get("poolsize") is not None:
+            pool = f"; next pool {d['poolsize']}"
+        return (
+            f"{action} at it {d['iteration']} ({d['since_training']} since "
+            f"last, {d['reason']} rule): acc {np.exp(d['log_a']):.3g} now vs "
+            f"{np.exp(d['fresh_log_a']):.3g} fresh{pool}"
         )
 
     def summary(self):

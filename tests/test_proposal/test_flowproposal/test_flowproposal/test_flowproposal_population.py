@@ -287,3 +287,17 @@ def test_population_weight_cap_mass_validation(proposal):
             proposal, 10, clip_population_weights=True,
             population_weight_cap_mass=0.01,
         )
+
+
+def test_max_samples_warning_once_per_training_round(caplog):
+    proposal = MagicMock(spec=FlowProposal)
+    proposal.training_count = 3
+    proposal._max_samples_warned = None
+    caplog.set_level("DEBUG", logger="nessai.proposal.flowproposal")
+    for _ in range(3):
+        FlowProposal._warn_max_samples(proposal, 10)
+    proposal.training_count = 4
+    FlowProposal._warn_max_samples(proposal, 10)
+    levels = [r.levelname for r in caplog.records
+              if "Reached max samples" in r.getMessage()]
+    assert levels == ["WARNING", "DEBUG", "DEBUG", "WARNING"]

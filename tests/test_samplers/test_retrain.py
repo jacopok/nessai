@@ -374,17 +374,23 @@ def test_sampling_with_benchmark_costs(
 
 
 def test_retrain_logs_calculation(rng, caplog):
-    """Every retrain is logged at info level with the inputs."""
-    caplog.set_level(logging.INFO, logger="nessai.samplers.retrain")
+    """Every retrain is logged in brief at info level, with the inputs at
+    debug level."""
+    caplog.set_level(logging.DEBUG, logger="nessai.samplers.retrain")
     d = make_decision(horizon=False, plan_pool=False, allow_reset=True)
     d.cost.provided["training"] = 1e-9
     it = run_episodes(d, rng, [np.log(0.3)] * 4, 300)
+    caplog.clear()
     assert d.decide(it, 2000) is True
-    msg = caplog.records[-1]
-    assert msg.levelno == logging.INFO
+    full, short = caplog.records[-2:]
+    assert full.levelno == logging.DEBUG
     for key in ("Retraining", "c*P=", "g**n=", "acc=", "decay=", "T=", "tau*="):
-        assert key in msg.getMessage()
-    assert "reset gain" in msg.getMessage()
+        assert key in full.getMessage()
+    assert "reset gain" in full.getMessage()
+    assert short.levelno == logging.INFO
+    assert f"etraining at it {it} (" in short.getMessage()
+    assert "rule): acc " in short.getMessage()
+    assert "fresh" in short.getMessage()
 
 
 def test_continue_not_logged_at_info(rng, caplog):

@@ -13,6 +13,7 @@ from nessai.flowmodel.group_mixture import (
     DiscreteGroupMixtureFlowWrapper,
     GroupFlowProposalMixin,
     GroupMixtureFlowModel,
+    _generator_entropy_note,
     ReparamBridge,
     make_group_mixture_flow,
 )
@@ -2618,7 +2619,7 @@ def test_element_importance_estimate_is_not_logged_per_populate(caplog):
         w.update_proposal_weights(_pool([300, 100, 0, 0],
                                         np.random.default_rng(10)))
     assert "importance" not in caplog.text
-    with caplog.at_level(logging.INFO, logger="nessai.flowmodel.group_mixture"):
+    with caplog.at_level(logging.DEBUG, logger="nessai.flowmodel.group_mixture"):
         GroupFlowProposalMixin._log_importance_summaries(w)
     assert "importance element weights from 400 pool points" in caplog.text
 
@@ -2627,9 +2628,49 @@ def test_clustered_importance_summaries_logged_at_retrain(caplog):
     w = _k2(_clustered_wrapper(2, importance_weights=True), (0.5, 0.5))
     w.update_proposal_weights(_pool([300, 100, 0, 0],
                                     np.random.default_rng(11)))
-    with caplog.at_level(logging.INFO, logger="nessai.flowmodel.group_mixture"):
+    with caplog.at_level(logging.DEBUG, logger="nessai.flowmodel.group_mixture"):
         GroupFlowProposalMixin._log_importance_summaries(w)
     assert "importance expert weights" in caplog.text
+
+
+def test_generator_entropy_note_is_per_generator(factor_wrapper):
+    p0 = torch.tensor([0.5, 0.25, 0.25])
+    p1 = torch.tensor([0.5, 0.5])
+    idx = factor_wrapper._mode_factor_index
+    with torch.no_grad():
+        factor_wrapper.weights.copy_(p0[idx[:, 0]] * p1[idx[:, 1]])
+    own = torch.ones(FACTOR_GROUP_SIZE)
+    assert _generator_entropy_note(factor_wrapper, own) == (
+        "weights Z3 1.500/1.585, Z2 1.000/1 bits; own draws 1.585, 1.000"
+    )
+    factor_wrapper._factor_empty_rounds[2] = (
+        factor_wrapper._weight_empty_patience
+    )
+    assert "Z3 1.500/1.585 (dropped [2])" in _generator_entropy_note(
+        factor_wrapper
+    )
+
+
+def test_retrain_summary_is_one_line_per_expert(caplog):
+    w = _k2(_clustered_wrapper(2), (0.7, 0.3))
+    w._last_cluster_sizes = [30, 12]
+    w._retrain_note = "split note"
+    w.experts[0]._last_training = dict(n=30, epochs=7, val_loss=1.25)
+    w.experts[1]._last_training = dict(n=None, frozen=True)
+    prop = _pieces_proposal(w, None)
+    prop.training_data = None
+    prop.last_training_history = None
+    with caplog.at_level(logging.DEBUG, logger="nessai.flowmodel.group_mixture"):
+        prop._log_retrain_summary(w, n_samples=200)
+    # (the untrained toy flows may also leak, which warns separately)
+    info = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert info[0] == "Group mixture: 2 experts, weights [0.7, 0.3]; split note"
+    assert info[1].startswith(
+        "  expert 0: 30 pts, 7 epochs (val loss 1.25); weights Z4 "
+    )
+    assert info[2].startswith("  expert 1: 12 pts, frozen; weights Z4 ")
+    assert all("own draws" in m and "leakage" in m for m in info[1:3])
+    assert "own draws failed" not in caplog.text
 
 
 # -- mixture pieces for the log_level_threshold truncation --------------------

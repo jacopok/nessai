@@ -1414,6 +1414,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             lqs.append(lq)
             n_have += x.shape[0]
         self._update_domain_mass(n_kept_tot, n_drawn_tot)
+        # this draw's in-domain share, for the retrain summary's leakage
+        self._last_draw_domain_fraction = n_kept_tot / max(n_drawn_tot, 1)
         if not xs:
             raise RuntimeError(
                 "Group-mixture truncated sampling drew no in-domain points: "
@@ -2830,18 +2832,24 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
                 k_cur, k, k_want,
             )
         elif k_want != k_cur:
-            logger.info(
+            logger.debug(
                 "Clustered group mixture: k held at %d (want %d; "
                 "grow streak %d/%d, shrink streak %d/%d)",
                 k, k_want,
                 int(self._k_grow_streak.item()), self.k_grow_patience,
                 int(self._k_shrink_streak.item()), self.k_shrink_patience,
             )
-        logger.info(
+        # unique live points per expert for the retrain summary
+        # (``_log_retrain_summary``), without mirror copies
+        n_u = getattr(self, "n_unique_rows", None)
+        self._last_cluster_sizes = np.bincount(
+            labels[:n_u] if n_u else labels, minlength=k
+        ).tolist()
+        logger.debug(
             "Clustered group mixture: k=%d, weights=%s, sizes=%s",
             k,
             np.round(self.cluster_weights[:k].cpu().numpy(), 3).tolist(),
-            np.bincount(labels, minlength=k).tolist(),
+            self._last_cluster_sizes,
         )
 
     def _match_clusters(self, centroids_std, prev_raw, mu, sd, spreads):
@@ -3028,6 +3036,10 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
         early stop.
         """
         model = self.model
+        for e in [*getattr(model, "experts", []),
+                  getattr(model, "_bg_expert", None)]:
+            if e is not None:
+                e._last_training = None
         if not (
             isinstance(model, ClusteredGroupMixtureFlowWrapper)
             and model._n_active_experts() >= 2
@@ -3059,7 +3071,10 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
             for j in range(k):
                 sub = np.ascontiguousarray(samples[labels == j])
                 if model.is_frozen(j):
-                    logger.info(
+                    model.experts[j]._last_training = dict(
+                        n=None, frozen=True
+                    )
+                    logger.debug(
                         "Clustered group mixture: expert %d frozen (%d "
                         "routed points) -- not retrained",
                         j, sub.shape[0],
@@ -3086,7 +3101,11 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
                 history["loss"].append(hj["loss"])
                 history["val_loss"].append(hj["val_loss"])
                 sample_epochs += len(hj["loss"]) * sub.shape[0]
-                logger.info(
+                model.experts[j]._last_training = dict(
+                    n=n_unique, epochs=len(hj["loss"]),
+                    val_loss=min(hj["val_loss"]) if hj["val_loss"] else None,
+                )
+                logger.debug(
                     "Clustered group mixture: expert %d solo-trained on %d "
                     "pts (%d epochs, best val loss %.4g)",
                     j, sub.shape[0], len(hj["loss"]),
@@ -3104,7 +3123,13 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
                 history["val_loss"].append(hb["val_loss"])
                 sample_epochs += len(hb["loss"]) * samples.shape[0]
                 model._bg_seen.fill_(True)
-                logger.info(
+                model._bg_expert._last_training = dict(
+                    n=(samples.shape[0] if groups is None
+                       else len(np.unique(groups))),
+                    epochs=len(hb["loss"]),
+                    val_loss=min(hb["val_loss"]) if hb["val_loss"] else None,
+                )
+                logger.debug(
                     "Clustered group mixture: background expert trained on "
                     "%d pts (%d epochs, best val loss %.4g, blend weight %.3g)",
                     samples.shape[0], len(hb["loss"]),
@@ -3221,6 +3246,51 @@ def make_clustered_group_mixture_flow(
         None if warm_max_share is None else float(warm_max_share)
     )
     return ClusteredCustom
+
+
+def _generator_entropy_note(model, own=None):
+    """``"weights Z8 2.998/3, Z4 2.000/2 bits; own draws 2.996, 1.999"``:
+    per generator of ``model``'s group (one for an unfactorised group), the
+    entropy of the marginal of the element weights in use, out of its
+    maximum, then that of ``own`` (counts per element of the model's own
+    draws).  A generator value the weights dropped (empty for
+    ``_weight_empty_patience`` rounds) is listed after it."""
+    sizes = getattr(model, "mode_factor_sizes", None)
+    if sizes:
+        index = model._mode_factor_index.cpu()
+        empty = model._factor_empty_rounds
+    else:
+        sizes = [model.group_size]
+        index = torch.arange(model.group_size).unsqueeze(1)
+        empty = getattr(model, "_empty_rounds", None)
+    patience = getattr(model, "_weight_empty_patience", 3)
+
+    def marginal_entropies(w):
+        w = w.detach().double().cpu()
+        out = []
+        for f, s in enumerate(sizes):
+            m = torch.zeros(s, dtype=torch.float64)
+            m.index_add_(0, index[:, f], w)
+            m = m[m > 0] / m.sum()
+            out.append(float(-(m * m.log2()).sum()))
+        return out
+
+    weights, off = [], 0
+    for s, h in zip(sizes, marginal_entropies(model.proposal_weights)):
+        item = f"Z{s} {h:.3f}/{np.log2(s):.4g}"
+        if empty is not None:
+            dropped = (empty[off : off + s] >= patience).nonzero()
+            dropped = dropped.flatten().cpu().tolist()
+            if dropped:
+                item += f" (dropped {dropped})"
+        weights.append(item)
+        off += s
+    note = f"weights {', '.join(weights)} bits"
+    if own is not None and float(own.sum()) > 0:
+        note += "; own draws " + ", ".join(
+            f"{h:.3f}" for h in marginal_entropies(own)
+        )
+    return note
 
 
 class GroupFlowProposalMixin:
@@ -3520,7 +3590,7 @@ class GroupFlowProposalMixin:
             else float("nan")
         )
         max_entropy = float(np.log2(model.group_size))
-        logger.info(
+        logger.debug(
             "Group-mixture post-train self-consistency: drew %d samples, "
             "%.3f non-finite log-prob, %.3f unclaimed (domain round-trip "
             "failure) of the rest; own-sample branch entropy %.3f / %.3f "
@@ -3532,6 +3602,102 @@ class GroupFlowProposalMixin:
             max_entropy,
             counts.to(torch.long).tolist(),
         )
+        self._log_retrain_summary(model)
+
+    @torch.no_grad()
+    def _log_retrain_summary(self, model, n_samples=2000):
+        """The training round in brief, at INFO; the detail behind each
+        number is logged at DEBUG where it is computed.
+
+        A clustered mixture gets a header (``k``, the cluster weights and
+        the clustering's ``_retrain_note``, e.g. the diagonal split's gain);
+        then one line per expert: its training points and epochs, for each
+        generator of the group the entropy (bits) of the marginal of the
+        element weights in use and of the expert's own fresh draws, the
+        fraction of those draws outside the fundamental domain (discarded
+        under truncation), and its ``base_reparam``'s ``_retrain_note``
+        (e.g. the adaptive domain's seams).  An expert leaking more than
+        0.1 also gets a warning.
+        """
+        experts = getattr(model, "experts", None)
+        if experts is None:
+            parts = [("Group mixture", model)]
+        else:
+            k = model._n_active_experts()
+            parts = [(f"  expert {j}", experts[j]) for j in range(k)]
+            if getattr(model, "_bg_on", lambda: False)():
+                parts.append(("  background expert", model._bg_expert))
+            head = f"Group mixture: {k} expert{'s' if k != 1 else ''}"
+            if k > 1:
+                w = model.cluster_weights[:k].cpu().numpy()
+                head += f", weights {[round(float(v), 2) for v in w]}"
+            note = getattr(model, "_retrain_note", None)
+            if note:
+                head += f"; {note}"
+            logger.info(head)
+        sizes = getattr(model, "_last_cluster_sizes", None)
+        history = getattr(self, "last_training_history", None)
+        for j, (tag, e) in enumerate(parts):
+            fields = [self._training_note(e, j, sizes, history, len(parts))]
+            try:
+                e._last_draw_domain_fraction = None
+                x, log_q = e.sample_and_log_prob(n_samples)
+                # truncated draws drop what falls outside the domain before
+                # any log-prob: their leakage is the share dropped; otherwise
+                # this draw's log-prob measured it (read before the
+                # assignment below, which overwrites it)
+                kept = getattr(e, "_last_draw_domain_fraction", None)
+                leak = (
+                    1.0 - kept if kept is not None
+                    else getattr(e, "_last_leakage_fraction", None)
+                )
+                finite = torch.isfinite(log_q)
+                assigned, _, claimed = e._assign_branch(x[finite])
+                own = torch.bincount(
+                    assigned[claimed], minlength=e.group_size
+                ).double()
+            except Exception:
+                logger.debug("%s: own draws failed", tag, exc_info=True)
+                own, leak = None, None
+            note = _generator_entropy_note(e, own)
+            if leak is not None:
+                note += f", leakage {leak:.3f}"
+            fields.append(note)
+            note = getattr(getattr(e, "base_reparam", None),
+                           "_retrain_note", None)
+            if note:
+                fields.append(note)
+            logger.info("%s: %s", tag, "; ".join(f for f in fields if f))
+            if leak is not None and leak > 0.1:
+                logger.warning(
+                    "%s: %.2f of the base flow's draws (latent temperature 1)"
+                    " fall outside the fundamental domain (discarded under "
+                    "truncation)",
+                    tag.strip(), leak,
+                )
+
+    def _training_note(self, e, j, sizes, history, n_parts):
+        """``"<n> pts, <epochs> epochs (val loss <v>)"`` for expert ``e``."""
+        tr = getattr(e, "_last_training", None)
+        if tr is not None:
+            if tr.get("frozen"):
+                n = sizes[j] if sizes is not None and j < len(sizes) else "?"
+                return f"{n} pts, frozen"
+            val = tr.get("val_loss")
+            return f"{tr['n']} pts, {tr['epochs']} epochs" + (
+                f" (val loss {val:.4g})" if val is not None else ""
+            )
+        if sizes is not None and j < len(sizes):
+            n = sizes[j]
+        else:
+            td = getattr(self, "training_data", None)
+            n = len(td) if td is not None else 0
+        if n_parts > 1 or not history or not history.get("loss"):
+            return f"{n} pts" + (", not trained" if n_parts > 1 else "")
+        val = history.get("val_loss")
+        return f"{n} pts, {len(history['loss'])} epochs" + (
+            f" (val loss {min(val):.4g})" if val else ""
+        )
 
     @staticmethod
     def _log_importance_summaries(flow_model):
@@ -3539,7 +3705,7 @@ class GroupFlowProposalMixin:
         retrain produced (once per retrain, not per populate)."""
         s = getattr(flow_model, "_last_importance_summary", None)
         if s is not None and "live" in s:
-            logger.info(
+            logger.debug(
                 "Clustered group mixture: importance expert weights %s "
                 "(live-point weights %s) from %d pool points",
                 s["weights"], s["live"], s["n_pool"],
@@ -3558,7 +3724,7 @@ class GroupFlowProposalMixin:
             s = getattr(e, "_last_importance_summary", None)
             if s is None:
                 continue
-            logger.info(
+            logger.debug(
                 "Group mixture%s: importance element weights from %.0f pool "
                 "points; entropy %.3f bits (live-point weights %.3f, uniform "
                 "over %d active %.3f); importance/live-point weight ratio "
@@ -3578,7 +3744,7 @@ class GroupFlowProposalMixin:
         frac_domain = getattr(flow_model, "_last_leakage_fraction_domain", 0.0)
         frac_rt = getattr(flow_model, "_last_leakage_fraction_roundtrip", 0.0)
         if frac is not None and frac > 0.1:
-            logger.warning(
+            logger.debug(
                 "Group-mixture leakage fraction: %.3f (out-of-domain %.3f, "
                 "non-round-trip %.3f) -- >0.1: the base flow is placing mass "
                 "outside the canonical fundamental domain (out-of-domain: "
@@ -3591,7 +3757,7 @@ class GroupFlowProposalMixin:
                 frac_rt,
             )
         elif frac is not None:
-            logger.info(
+            logger.debug(
                 "Group-mixture leakage fraction: %.3f (out-of-domain %.3f, "
                 "non-round-trip %.3f)",
                 frac,
@@ -3599,7 +3765,7 @@ class GroupFlowProposalMixin:
                 frac_rt,
             )
 
-        if not logger.isEnabledFor(logging.INFO):
+        if not logger.isEnabledFor(logging.DEBUG):
             return
         self._log_importance_summaries(flow_model)
         p = p.detach()
@@ -3608,7 +3774,7 @@ class GroupFlowProposalMixin:
         weights = np.array2string(
             p.cpu().numpy(), precision=3, separator=", ", suppress_small=True
         )
-        logger.info(
+        logger.debug(
             f"Group-mixture weight entropy: {entropy:.3f} bits "
             f"({entropy / np.log2(n):.3f} normalised); weights: {weights}"
         )
@@ -3630,7 +3796,7 @@ class GroupFlowProposalMixin:
                 int(counts[0].sum()) if counts is not None else None
             )
             if n_assigned is not None:
-                logger.info(
+                logger.debug(
                     "  factorised weights from %d assigned live points "
                     "(each generator's counts partition this same set):",
                     n_assigned,
@@ -3648,7 +3814,7 @@ class GroupFlowProposalMixin:
                     er = empty[offsets[f] : offsets[f] + size]
                     dropped = (er >= patience).nonzero(as_tuple=True)[0]
                     dropped = dropped.cpu().tolist()
-                logger.info(
+                logger.debug(
                     "  generator %d (Z%d): marginal %s%s%s "
                     "[entropy %.3f / %.3f bits]",
                     f,
