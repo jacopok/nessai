@@ -706,7 +706,9 @@ class FlowProposal(BaseFlowProposal):
 
         if self.adapt_latent_temperature and adapt_full_z:
             full_z = np.concatenate(adapt_full_z)
-            r_full = np.sqrt(np.sum(full_z**2, axis=-1))
+            r_full = np.sqrt(
+                np.sum(full_z[:, self.latent_real_mask] ** 2, axis=-1)
+            )
             log_w_full = np.full(full_z.shape[0], -np.inf)
             if adapt_surv_z:
                 surv_z = np.concatenate(adapt_surv_z)
@@ -852,7 +854,7 @@ class FlowProposal(BaseFlowProposal):
             result = optimise_latent_temperature(
                 log_w,
                 r,
-                self.prime_dims,
+                int(self.latent_real_mask.sum()),
                 temperature=current,
                 radius=self._latent_truncation_radius(),
                 **self.latent_temperature_kwargs,

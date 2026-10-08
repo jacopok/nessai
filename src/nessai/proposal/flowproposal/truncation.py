@@ -290,22 +290,46 @@ class LatentRadiusTruncation(BaseTruncationRule):
             "expansion_fraction": self.expansion_fraction,
         }
 
+    @staticmethod
+    def _real_mask(proposal):
+        """The Gaussian (non-circular) latent dimensions, or ``None`` when
+        the proposal does not say (every dimension is Gaussian)."""
+        real = getattr(proposal, "latent_real_mask", None)
+        return real if isinstance(real, np.ndarray) else None
+
+    def _real_dims(self, proposal, z):
+        real = self._real_mask(proposal)
+        if real is None or real.all():
+            return z
+        return z[..., real]
+
+    def _n_real_dims(self, proposal):
+        real = self._real_mask(proposal)
+        return proposal.prime_dims if real is None else int(real.sum())
+
     def configure(self, proposal) -> None:
+        n_real = self._n_real_dims(proposal)
+        if n_real < proposal.prime_dims:
+            logger.info(
+                "Latent radius over the %s non-circular latent dimensions",
+                n_real,
+            )
         if self.expansion_fraction and self.expansion_fraction is not None:
             logger.info(
                 "Overwriting latent-radius fuzz factor with expansion fraction"
             )
-            self.fuzz = (1 + self.expansion_fraction) ** (
-                1 / proposal.prime_dims
-            )
+            self.fuzz = (1 + self.expansion_fraction) ** (1 / max(n_real, 1))
             logger.info(f"New latent-radius fuzz factor: {self.fuzz}")
 
         if not self.constant_volume_mode:
             return
 
-        self.fixed_radius = compute_radius(
-            proposal.prime_dims, self.volume_fraction
-        )
+        if n_real == 0:
+            self.fixed_radius = np.inf
+            self.fuzz = 1.0
+            return
+
+        self.fixed_radius = compute_radius(n_real, self.volume_fraction)
         self.fuzz = 1.0
 
         if self.max_radius and self.max_radius < self.fixed_radius:
@@ -344,6 +368,7 @@ class LatentRadiusTruncation(BaseTruncationRule):
         worst_z = proposal.forward_pass(
             worst_point, rescale=True, compute_radius=True
         )[0]
+        worst_z = self._real_dims(proposal, worst_z)
         radius = float(np.sqrt(np.sum(worst_z**2.0, axis=-1)).max())
         if self.max_radius and radius > self.max_radius:
             radius = self.max_radius
@@ -357,7 +382,7 @@ class LatentRadiusTruncation(BaseTruncationRule):
         self._threshold = self.fuzz * radius
 
     def apply_latent(self, proposal, z):
-        radius = np.sqrt(np.sum(z**2.0, axis=-1))
+        radius = np.sqrt(np.sum(self._real_dims(proposal, z) ** 2.0, axis=-1))
         keep = radius <= self.threshold
         logger.debug(
             "Discarding %s latent samples outside radius threshold",

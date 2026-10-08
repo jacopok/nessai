@@ -145,9 +145,30 @@ def test_compute_latent_log_prob_with_temperature(proposal):
     proposal.flow.model.base_distribution_log_prob = MagicMock(
         return_value=torch.zeros(1, dtype=torch.get_default_dtype())
     )
+    proposal.latent_real_mask = np.array([True, True])
     out = BaseFlowProposal.latent_log_prob(proposal, z, temperature=4.0)
     proposal.flow.model.base_distribution_log_prob.assert_called_once()
     np.testing.assert_allclose(out, np.array([-np.log(2.0) * 2]))
+
+
+def test_compute_latent_log_prob_with_temperature_circular(proposal):
+    """The temperature does not rescale circular latent dimensions"""
+    z = np.array([[2.0, 3.0]])
+    proposal.flow = MagicMock()
+    proposal.flow.numpy_array_to_tensor = MagicMock(
+        side_effect=lambda x: torch.from_numpy(x).type(
+            torch.get_default_dtype()
+        )
+    )
+    proposal.flow.model = MagicMock()
+    proposal.flow.model.base_distribution_log_prob = MagicMock(
+        return_value=torch.zeros(1, dtype=torch.get_default_dtype())
+    )
+    proposal.latent_real_mask = np.array([True, False])
+    out = BaseFlowProposal.latent_log_prob(proposal, z, temperature=4.0)
+    z_in = proposal.flow.numpy_array_to_tensor.call_args[0][0]
+    np.testing.assert_allclose(z_in, np.array([[1.0, 3.0]]))
+    np.testing.assert_allclose(out, np.array([-np.log(2.0)]))
 
 
 @pytest.mark.parametrize("temperature", [None, 1.0])
