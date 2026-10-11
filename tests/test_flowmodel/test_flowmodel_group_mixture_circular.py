@@ -313,3 +313,142 @@ def test_rebinding_to_another_order_is_refused(shift_wrapper):
     shift_wrapper.set_param_names(["a", "y"])
     with pytest.raises(RuntimeError, match="parameter order"):
         shift_wrapper.set_param_names(["y", "a"])
+
+
+# -- Möbius standardisation of the circular dims ------------------------------
+
+
+def test_mobius_inverse_and_jacobian():
+    from nessai.flowmodel.group_mixture import (
+        mobius_destandardise,
+        mobius_standardise,
+    )
+
+    psi = torch.linspace(-math.pi, math.pi, 1001)[:, None]
+    scale = torch.tensor([0.03])
+    phi, log_det = mobius_standardise(psi, scale)
+    assert phi.min() >= -math.pi and phi.max() <= math.pi
+    back, log_det_inv = mobius_destandardise(phi, scale)
+    np.testing.assert_allclose(back, psi, atol=1e-10)
+    np.testing.assert_allclose(log_det_inv, -log_det, atol=1e-8)
+    h = 1e-6
+    fd = (
+        mobius_standardise(psi + h, scale)[0]
+        - mobius_standardise(psi - h, scale)[0]
+    ) / (2 * h)
+    inner = psi.abs() < math.pi - 1e-3
+    np.testing.assert_allclose(
+        log_det[inner], torch.log(fd[inner]), rtol=1e-5, atol=1e-6
+    )
+    # the identity at scale 1
+    phi, log_det = mobius_standardise(psi, torch.tensor([1.0]))
+    np.testing.assert_allclose(phi, psi, atol=1e-12)
+    np.testing.assert_allclose(log_det, 0.0, atol=1e-12)
+
+
+def test_fit_mobius_scale():
+    from nessai.flowmodel.group_mixture import (
+        fit_mobius_scale,
+        mobius_standardise,
+    )
+
+    torch.manual_seed(1)
+    sigma = torch.tensor([0.01, 0.3, 1.0])
+    psi = _wrap(sigma * torch.randn(20000, 3))
+    scale = fit_mobius_scale(psi)
+    phi, _ = mobius_standardise(psi, scale)
+    np.testing.assert_allclose(torch.cos(phi).mean(0), 0.0, atol=1e-6)
+    # scale-equivariant for narrow peaks
+    assert float(scale[0] / sigma[0]) == pytest.approx(
+        float(scale[1] / sigma[1]), rel=0.05
+    )
+    # a sample spread over the circle stays (close to) the identity
+    flat = torch.rand(5000, 1) * TWO_PI - math.pi
+    assert float(fit_mobius_scale(flat)) == pytest.approx(1.0, abs=0.1)
+    # one with zero mean cosine about its mean direction keeps it exactly
+    pair = torch.tensor([[-math.pi / 2], [math.pi / 2]])
+    assert float(fit_mobius_scale(pair)) == pytest.approx(1.0)
+
+
+def _standardised(wrapper, a_centre, a_width, y_mean=0.4, n=4000):
+    """Turn on the Möbius standardisation, fitted to a narrow peak in ``a``."""
+    torch.manual_seed(5)
+    wrapper.circular_standardisation = True
+    a = torch.remainder(a_centre + a_width * torch.randn(n) + 1.0, 2.0) - 1.0
+    x = torch.stack([a, y_mean + 0.5 * torch.randn(n)], dim=1)
+    wrapper.update_base_standardisation(x)
+    return wrapper
+
+
+def test_standardised_shift_fit(shift_wrapper):
+    # a ~ -0.5 is the middle of the domain [-1, 0): t = 2 pi (a + 1) - pi = 0
+    _standardised(shift_wrapper, -0.5, 0.01)
+    mu, scale = shift_wrapper._canon_mean[0], shift_wrapper._canon_std[0]
+    assert float(mu) == pytest.approx(0.0, abs=0.01)
+    # t has width 2 pi * 0.01; a Gaussian peak gets scale ~0.3 sigma (the
+    # median of |psi| / 2)
+    assert float(scale) / (TWO_PI * 0.01) == pytest.approx(0.3, abs=0.05)
+    assert float(shift_wrapper._canon_mean[1]) == pytest.approx(0.4, abs=0.05)
+
+
+@pytest.mark.parametrize("centre", [-0.5, -0.02])
+def test_standardised_shift_density(shift_wrapper, centre):
+    """Normalised, consistent with sampling and the latent round trip, also
+    with the peak next to the fold (the base-frame seam)."""
+    _standardised(shift_wrapper, centre, 0.05)
+    assert _grid_integral(shift_wrapper, -1.0, 1.0, n=1200) == pytest.approx(
+        1.0, abs=3e-3
+    )
+    with torch.no_grad():
+        x, log_q = shift_wrapper.sample_and_log_prob(2000)
+        np.testing.assert_allclose(
+            log_q, shift_wrapper.log_prob(x), atol=1e-8
+        )
+        z = shift_wrapper.sample_latent_distribution(500)
+        x, log_j = shift_wrapper.inverse(z)
+        log_q = shift_wrapper.base_distribution_log_prob(z) - log_j
+        np.testing.assert_allclose(
+            log_q, shift_wrapper.log_prob(x), atol=1e-8
+        )
+
+
+def test_standardised_twist_density(twist_wrapper):
+    _standardised(twist_wrapper, 0.2, 0.05)
+    assert _grid_integral(twist_wrapper, 0.0, 1.0, n=1200) == pytest.approx(
+        1.0, abs=3e-3
+    )
+    with torch.no_grad():
+        x, log_q = twist_wrapper.sample_and_log_prob(2000)
+        np.testing.assert_allclose(
+            log_q, twist_wrapper.log_prob(x), atol=1e-8
+        )
+
+
+def test_standardised_ema_follows_the_circle(shift_wrapper):
+    """The location is averaged along the circle, not across it."""
+    # t = 2 pi (a + 1) - pi: a = -0.99 / -0.01 sit either side of t = -/+ pi
+    _standardised(shift_wrapper, -0.99, 0.002)
+    first = float(shift_wrapper._canon_mean[0])
+    _standardised(shift_wrapper, -0.01, 0.002)
+    mu = float(shift_wrapper._canon_mean[0])
+    assert abs(first) > 3.0 and abs(mu) > 3.0
+
+
+def test_standardisation_off_by_default(shift_wrapper):
+    assert not shift_wrapper.circular_standardisation
+    model_cls = make_group_mixture_flow(
+        half_shift,
+        2,
+        ["a", "y"],
+        prime_space_action=half_shift,
+        prime_space_in_domain=half_shift_domain,
+        canonical_transform=AngleOfA(),
+        circular_parameters=["a"],
+        circular_standardisation=True,
+    )
+    model = model_cls.__new__(model_cls)
+    wrapper = model.get_model(
+        {"n_inputs": 2, "n_neurons": 8, "n_blocks": 2, "n_layers": 1,
+         "ftype": "circular"}
+    )
+    assert wrapper.circular_standardisation

@@ -20,6 +20,65 @@ from .base import FlowModel
 logger = logging.getLogger(__name__)
 
 
+def _wrap_angle(x):
+    """Wrap angles to ``[-pi, pi)``."""
+    return torch.remainder(x + math.pi, 2.0 * math.pi) - math.pi
+
+
+def mobius_standardise(psi, scale):
+    """Circle diffeomorphism ``psi -> phi`` that spreads a peak at 0 of
+    width ~``scale`` over the whole circle.
+
+    It is the Möbius map ``z -> (z - rho) / (1 - rho z)`` of the unit circle
+    with ``rho = (1 - scale) / (1 + scale)``, written as
+    ``tan(phi / 2) = tan(psi / 2) / scale``: the identity at ``scale = 1``,
+    ``phi ~ psi / scale`` near 0, and it pushes a uniform angle forward to
+    the wrapped Cauchy of concentration ``rho``. ``psi`` must lie on
+    ``[-pi, pi]``. Returns ``(phi, log|dphi/dpsi|)`` elementwise.
+    """
+    s, c = torch.sin(0.5 * psi), torch.cos(0.5 * psi)
+    phi = 2.0 * torch.atan2(s, scale * c)
+    log_det = torch.log(scale) - torch.log((scale * c) ** 2 + s**2)
+    return phi, log_det
+
+
+def mobius_destandardise(phi, scale):
+    """Inverse of :func:`mobius_standardise`: ``(psi, log|dpsi/dphi|)``."""
+    s, c = torch.sin(0.5 * phi), torch.cos(0.5 * phi)
+    psi = 2.0 * torch.atan2(scale * s, c)
+    log_det = torch.log(scale) - torch.log(s**2 * scale**2 + c**2)
+    return psi, log_det
+
+
+def fit_mobius_scale(psi, min_scale=1e-6, iterations=60):
+    """Scale of :func:`mobius_standardise` that leaves ``psi`` (``[N, D]``
+    angles centred on their mean direction) with zero mean cosine.
+
+    The mapped sample then has zero mean resultant (its mean sine vanishes
+    too for a symmetric peak): this is the maximum-likelihood wrapped Cauchy,
+    the circular analogue of fitting a Gaussian's mean and std. The mean
+    cosine grows monotonically with the scale; a sample whose mean cosine is
+    already <= 0 at the identity (spread over the whole circle) keeps
+    ``scale = 1``.
+    """
+    s2 = torch.sin(0.5 * psi) ** 2
+    c2 = torch.cos(0.5 * psi) ** 2
+
+    def mean_cos(scale):
+        a2 = scale**2 * c2
+        return ((a2 - s2) / (a2 + s2)).mean(dim=0)
+
+    lo = torch.full_like(psi[0], math.log(min_scale))
+    hi = torch.zeros_like(psi[0])
+    for _ in range(iterations):
+        mid = 0.5 * (lo + hi)
+        up = mean_cos(torch.exp(mid)) < 0
+        lo = torch.where(up, mid, lo)
+        hi = torch.where(up, hi, mid)
+    scale = torch.exp(hi)
+    return torch.where(mean_cos(torch.ones_like(hi)) <= 0, 1.0, scale)
+
+
 class ReparamBridge:
     """Map between the flow's ``prime`` coords and the user's ``physical`` coords.
 
@@ -190,6 +249,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         importance_weights=False,
         circular_parameters=None,
         base_symmetry=None,
+        circular_standardisation=False,
     ):
         super().__init__()
         self.base_flow = base_flow
@@ -300,7 +360,12 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         # angle on ``[-pi, pi)``, modelled by a circular base flow (see
         # :class:`~nessai.flows.circular.CircularNeuralSplineFlow`). Their
         # standardisation is pinned to the identity, so the base flow sees the
-        # angles themselves.
+        # angles themselves, unless ``circular_standardisation``: then each is
+        # rotated to its mean direction and spread over the circle by a
+        # Möbius map fitted to the live points (``mobius_standardise``),
+        # whose location and scale take the place of the mean and std in
+        # ``_canon_mean`` / ``_canon_std``.
+        self.circular_standardisation = bool(circular_standardisation)
         self.circular_parameters = (
             list(circular_parameters)
             if isinstance(circular_parameters, (list, tuple))
@@ -730,14 +795,54 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         t, _ = self._canon_to_base(canon)
         return self._standardise(t)
 
+    def _mobius_idx(self, device):
+        """Indices of the Möbius-standardised circular dims, or ``None``."""
+        if not getattr(self, "circular_standardisation", False):
+            return None
+        idx = getattr(self, "_circular_idx", None)
+        if idx is None or not idx.numel():
+            return None
+        return idx.to(device)
+
     def _standardise(self, t, modes=None):
-        return (t - self._canon_mean) / self._canon_std
+        u = (t - self._canon_mean) / self._canon_std
+        idx = self._mobius_idx(t.device)
+        if idx is None:
+            return u
+        phi, _ = mobius_standardise(
+            _wrap_angle(t[:, idx] - self._canon_mean[idx]),
+            self._canon_std[idx],
+        )
+        return u.index_copy(1, idx, phi)
 
     def _destandardise(self, u, modes=None):
-        return u * self._canon_std + self._canon_mean
+        t = u * self._canon_std + self._canon_mean
+        idx = self._mobius_idx(u.device)
+        if idx is None:
+            return t
+        psi, _ = mobius_destandardise(
+            _wrap_angle(u[:, idx]), self._canon_std[idx]
+        )
+        return t.index_copy(1, idx, _wrap_angle(psi + self._canon_mean[idx]))
+
+    def _circular_log_det(self, t):
+        """Per-point ``log|du/dt|`` of the Möbius-standardised dims (0 if
+        none); the affine dims' constant is :meth:`_canon_log_det`."""
+        idx = self._mobius_idx(t.device)
+        if idx is None:
+            return t.new_zeros(t.shape[0])
+        _, log_det = mobius_standardise(
+            _wrap_angle(t[:, idx] - self._canon_mean[idx]),
+            self._canon_std[idx],
+        )
+        return log_det.sum(dim=1)
 
     def _canon_log_det(self, modes=None):
-        return -torch.log(self._canon_std).sum()
+        log_std = torch.log(self._canon_std)
+        idx = self._mobius_idx(log_std.device)
+        if idx is not None:
+            log_std = log_std.index_fill(0, idx, 0.0)
+        return -log_std.sum()
 
     def _fold_reflect(self, canon):
         """Fold canonical coords back to the positive side of each reflect wall.
@@ -779,16 +884,20 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         if symmetry is not None:
             images = [t] + list(symmetry.images(t))
             n = t.shape[0]
-            u_all = self._standardise(torch.cat(images, dim=0), modes)
+            t_all = torch.cat(images, dim=0)
+            u_all = self._standardise(t_all, modes)
             ctx = (
                 None if context is None
                 else context.repeat(len(images), 1)
             )
-            lp = self.base_flow.log_prob(u_all, context=ctx).view(
-                len(images), n
-            )
+            lp = (
+                self.base_flow.log_prob(u_all, context=ctx)
+                + self._circular_log_det(t_all)
+            ).view(len(images), n)
             return torch.logsumexp(lp, dim=0) + log_j
         u = self._standardise(t, modes)
+        # reflect dims are never circular: the sign patterns leave this alone
+        log_j = log_j + self._circular_log_det(t)
         if self._sign_patterns is None:
             return self.base_flow.log_prob(u, context=context) + log_j
         p = self._sign_patterns.shape[0]
@@ -929,17 +1038,26 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         std[idx] = rms
         return mean, std
 
-    def _pin_circular(self, mean, std):
+    def _pin_circular(self, mean, std, data):
         # Circular dims are angles on [-pi, pi) for the circular base flow:
-        # no standardisation.
+        # no standardisation, or the Möbius map's location (the mean
+        # direction) and scale (see ``mobius_standardise``).
         idx = getattr(self, "_circular_idx", None)
         if idx is None or not idx.numel():
             return mean, std
         idx = idx.to(mean.device)
         mean = mean.clone()
         std = std.clone()
-        mean[idx] = 0.0
-        std[idx] = 1.0
+        if not getattr(self, "circular_standardisation", False):
+            mean[idx] = 0.0
+            std[idx] = 1.0
+            return mean, std
+        theta = data[:, idx]
+        mu = torch.atan2(torch.sin(theta).mean(0), torch.cos(theta).mean(0))
+        mean[idx] = mu
+        std[idx] = fit_mobius_scale(
+            _wrap_angle(theta - mu), min_scale=self._min_canon_std
+        )
         return mean, std
 
     @torch.no_grad()
@@ -981,12 +1099,23 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         mean = c.mean(dim=0)
         std = c.std(dim=0).clamp_min(self._min_canon_std)
         mean, std = self._pin_reflect(mean, std, c)
-        mean, std = self._pin_circular(mean, std)
+        mean, std = self._pin_circular(mean, std, c)
 
         if bool(self._canon_seen):
             beta = self._canon_ema
+            idx = self._mobius_idx(mean.device)
+            if idx is not None:
+                # average the mean direction along the circle
+                mean = mean.index_copy(
+                    0,
+                    idx,
+                    self._canon_mean[idx]
+                    + _wrap_angle(mean[idx] - self._canon_mean[idx]),
+                )
             self._canon_mean.mul_(1 - beta).add_(beta * mean)
             self._canon_std.mul_(1 - beta).add_(beta * std)
+            if idx is not None:
+                self._canon_mean[idx] = _wrap_angle(self._canon_mean[idx])
         else:
             self._canon_mean.copy_(mean)
             self._canon_std.copy_(std)
@@ -1532,6 +1661,9 @@ class GroupMixtureFlowModel(FlowModel):
     circular_parameters = None
     #: See :class:`DiscreteGroupMixtureFlowWrapper` ``base_symmetry``.
     base_symmetry = None
+    #: See :class:`DiscreteGroupMixtureFlowWrapper`
+    #: ``circular_standardisation``.
+    circular_standardisation = False
 
     def initialise(self):
         """Initialise the model and optimiser via :meth:`get_model`."""
@@ -1609,6 +1741,10 @@ class GroupMixtureFlowModel(FlowModel):
         base_symmetry = config_clean.pop(
             "base_symmetry", getattr(self, "base_symmetry", None)
         )
+        circular_standardisation = config_clean.pop(
+            "circular_standardisation",
+            getattr(self, "circular_standardisation", False),
+        )
         if not isinstance(circular_parameters, (list, tuple)):
             circular_parameters = None
         if circular_parameters:
@@ -1661,6 +1797,7 @@ class GroupMixtureFlowModel(FlowModel):
             importance_weights=bool(getattr(self, "importance_weights", False)),
             circular_parameters=circular_parameters,
             base_symmetry=base_symmetry,
+            circular_standardisation=bool(circular_standardisation),
         )
 
 
@@ -1680,6 +1817,7 @@ def make_group_mixture_flow(
     importance_weights=False,
     circular_parameters=None,
     base_symmetry=None,
+    circular_standardisation=False,
 ):
     """Factory constructing a ``GroupMixtureFlowModel`` bound to a specific group.
 
@@ -1780,11 +1918,18 @@ def make_group_mixture_flow(
         and ``canonical_transform``) is an angle on ``[-pi, pi)``. The base
         flow must then be circular (``flow_config['ftype'] = 'circular'``);
         it receives their indices as ``circular_features`` and their
-        standardisation is pinned to the identity. Default: none.
+        standardisation is pinned to the identity (see
+        ``circular_standardisation``). Default: none.
     base_symmetry : object, optional
         A unit-Jacobian symmetry of the base frame summed over in the base
         density, with generative draws folded onto its canonical part (see
         :class:`DiscreteGroupMixtureFlowWrapper`). Default: none.
+    circular_standardisation : bool, optional
+        Standardise the circular parameters too: rotate each to its mean
+        direction and spread it over the circle with the Möbius map fitted to
+        the live points (:func:`mobius_standardise`), so a narrow angle
+        reaches the base flow's uniform latent as an O(1) shape rather than a
+        spike. Default ``False``.
 
     Notes
     -----
@@ -1814,6 +1959,9 @@ def make_group_mixture_flow(
         list(circular_parameters) if circular_parameters else None
     )
     CustomGroupMixtureFlowModel.base_symmetry = base_symmetry
+    CustomGroupMixtureFlowModel.circular_standardisation = bool(
+        circular_standardisation
+    )
     CustomGroupMixtureFlowModel.mode_factor_sizes = (
         [int(s) for s in mode_factor_sizes]
         if mode_factor_sizes is not None
