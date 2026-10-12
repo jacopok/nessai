@@ -509,6 +509,15 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
     (flow draws only, no likelihood evaluations); otherwise its first pool
     is drawn without floors.
 
+    With ``prior_relative``, the level is ``log q(x) - log pi_p(x) -
+    log prior(x)``: the support is a threshold on the piece's density
+    relative to the prior, the region where ``f_p`` concentrates the most
+    mass per unit prior mass.  The pool is rejection-sampled to the prior on
+    the support, so on a plain ``log q`` threshold the draws from where the
+    flow is broad but the prior is large (e.g. the far distance tail) get
+    the largest weights and fill the pool; thresholding ``f_p / prior``
+    instead removes those first, and bounds the weights by ``exp(-t)``.
+
     The proposal supplies ``mixture_levels(x, log_q) -> (pieces, levels)``,
     both of shape ``(n, k)``: one candidate (piece, level) per mixture
     component that can generate ``x`` (e.g. per overlapping expert), with
@@ -530,6 +539,7 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
         share_cap: float | None = None,
         relax: float = 0.5,
         pilot_size: int | None = None,
+        prior_relative: bool = False,
     ) -> None:
         super().__init__()
         self.quantile = float(quantile)
@@ -538,6 +548,7 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
         self.share_cap = None if share_cap is None else float(share_cap)
         self.relax = float(relax)
         self.pilot_size = int(pilot_size) if pilot_size else 0
+        self.prior_relative = bool(prior_relative)
         self._floors = {}
         self._floors_training = None
         self._tightened = {}
@@ -557,22 +568,32 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
         """Per-piece level floors above the global threshold."""
         return dict(self._floors)
 
-    @staticmethod
-    def _levels(proposal, x, log_q, z=None):
+    def _levels(self, proposal, x, log_q, z=None, log_w=None):
+        """Candidate (piece, level) pairs of ``x``; ``log_w`` (the weights
+        ``compute_weights`` gives ``x``) saves recomputing the prior."""
         log_q = np.asarray(log_q, dtype=float)
         fn = getattr(proposal, "mixture_levels", None)
-        if fn is None or not len(x):
+        if not len(x):
             # an empty batch (a failed backward pass) cannot be reshaped
             # with -1 below: give it one (empty) candidate column
-            return np.zeros((len(x), 1), dtype=int), log_q.reshape(len(x), 1)
-        if z is not None and _accepts_keyword(fn, "z"):
+            return np.zeros((0, 1), dtype=int), log_q.reshape(0, 1)
+        if fn is None:
+            pieces, levels = np.zeros(len(x), dtype=int), log_q
+        elif z is not None and _accepts_keyword(fn, "z"):
             pieces, levels = fn(x, log_q, z=z)
         else:
             pieces, levels = fn(x, log_q)
-        return (
-            np.asarray(pieces, dtype=int).reshape(len(x), -1),
-            np.asarray(levels, dtype=float).reshape(len(x), -1),
-        )
+        pieces = np.asarray(pieces, dtype=int).reshape(len(x), -1)
+        levels = np.asarray(levels, dtype=float).reshape(len(x), -1)
+        # rules pickled before the option existed have no attribute
+        if getattr(self, "prior_relative", False):
+            if log_w is None:
+                log_w = proposal.compute_weights(x, log_q)
+            log_p = np.asarray(log_w, dtype=float) + log_q
+            levels = np.where(
+                np.isfinite(log_p)[:, None], levels - log_p[:, None], -np.inf
+            )
+        return pieces, levels
 
     @staticmethod
     def _best(pieces, levels):
@@ -683,15 +704,17 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
             )
             if not len(x):
                 continue
-            cand_pieces, cand_levels = self._levels(proposal, x, log_q, z=z)
+            log_w = np.asarray(proposal.compute_weights(x, log_q))
+            cand_pieces, cand_levels = self._levels(
+                proposal, x, log_q, z=z, log_w=log_w
+            )
             keep = np.any(
                 cand_levels > self._point_thresholds(cand_pieces), axis=1
             )
             if not keep.any():
                 continue
             pieces, level = self._best(cand_pieces[keep], cand_levels[keep])
-            log_w = proposal.compute_weights(x[keep], log_q[keep])
-            draws.append((pieces, level, np.asarray(log_w)))
+            draws.append((pieces, level, log_w[keep]))
             n_kept += int(keep.sum())
         logger.debug(
             "Level threshold pilot: %d / %d draws in the support",
@@ -717,13 +740,21 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
         )
 
     def apply_after_backward(self, proposal, x, log_q, z):
-        cand_pieces, cand_levels = self._levels(proposal, x, log_q, z=z)
+        log_w = None
+        if getattr(self, "prior_relative", False) and len(x):
+            log_w = np.asarray(proposal.compute_weights(x, log_q))
+        cand_pieces, cand_levels = self._levels(
+            proposal, x, log_q, z=z, log_w=log_w
+        )
         keep = np.any(
             cand_levels > self._point_thresholds(cand_pieces), axis=1
         )
         if self.share_cap is not None and keep.any():
             pieces, level = self._best(cand_pieces[keep], cand_levels[keep])
-            log_w = proposal.compute_weights(x[keep], log_q[keep])
+            if log_w is None:
+                log_w = proposal.compute_weights(x[keep], log_q[keep])
+            else:
+                log_w = log_w[keep]
             if self._draws is None:
                 self._draws = []
             self._draws.append((pieces, level, np.asarray(log_w)))

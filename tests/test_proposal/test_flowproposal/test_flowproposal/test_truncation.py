@@ -705,3 +705,40 @@ def test_log_level_threshold_keeps_nothing_from_an_empty_batch():
     out, log_q, z = rule.apply_after_backward(
         proposal, np.array([]), np.array([]), np.array([]))
     assert len(out) == len(log_q) == len(z) == 0
+
+
+def test_log_level_threshold_prior_relative():
+    """With ``prior_relative`` the level is taken relative to the prior: a
+    draw where the prior is large and the flow broad is cut first."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    rng = np.random.default_rng(2)
+    live_x = rng.uniform(-1, 1, 1000)
+    proposal, arr, log_q_of = _level_proposal(live_x, [0.5, 0.5])
+
+    def log_prior(x):
+        return 2.0 * x["x"]
+
+    proposal.compute_weights = MagicMock(
+        side_effect=lambda x, log_q: log_prior(x) - log_q)
+    rule = LogLevelThresholdTruncation(quantile=0.1, prior_relative=True)
+    rule.prepare(proposal, worst_point=None)
+    assert rule.threshold == pytest.approx(
+        np.quantile(-live_x**2 - 2.0 * live_x, 0.1))
+    x = arr(np.linspace(-1, 1, 2001))
+    out, _, _ = rule.apply_after_backward(
+        proposal, x, log_q_of(x), np.zeros((len(x), 1)))
+    level = -out["x"] ** 2 - 2.0 * out["x"]
+    assert np.all(level > rule.threshold)
+    assert len(out) == np.sum(-x["x"] ** 2 - 2.0 * x["x"] > rule.threshold)
+    # weights in the support are bounded by exp(-threshold) (here w_piece
+    # = 1/2 for both pieces)
+    log_w = log_prior(out) - log_q_of(out)
+    assert np.all(log_w < -rule.threshold - np.log(0.5))
+
+    # a rule pickled before the option existed thresholds log q - log w_p
+    del rule.prior_relative
+    rule.prepare(proposal, worst_point=None)
+    assert rule.threshold == pytest.approx(np.quantile(-live_x**2, 0.1))
