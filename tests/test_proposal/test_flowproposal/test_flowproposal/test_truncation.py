@@ -683,3 +683,25 @@ def test_log_level_threshold_keeps_a_point_any_candidate_clears():
     out, _, _ = rule.apply_after_backward(
         proposal, x, -x["x"], np.zeros((4, 1)))
     np.testing.assert_array_equal(out["x"], [0.2, 3.0])
+
+
+def test_log_level_threshold_keeps_nothing_from_an_empty_batch():
+    """A failed backward pass returns plain empty arrays; the rule must pass
+    them through rather than fail to reshape the empty levels."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    live_x = np.linspace(-1, 1, 101)
+    proposal, _, _ = _level_proposal(live_x, [0.3, 0.7])
+    proposal.mixture_levels = MagicMock(
+        side_effect=lambda x, log_q, z=None: (
+            np.zeros((len(x), 1), dtype=int),
+            np.asarray(log_q).reshape(len(x), 1),
+        )
+    )
+    rule = LogLevelThresholdTruncation(quantile=0.2, share_cap=4.0)
+    rule.prepare(proposal, worst_point=None)
+    out, log_q, z = rule.apply_after_backward(
+        proposal, np.array([]), np.array([]), np.array([]))
+    assert len(out) == len(log_q) == len(z) == 0

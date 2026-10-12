@@ -12,6 +12,7 @@ from nessai.proposal import FlowProposal
 from nessai.proposal.flowproposal.truncation import (
     LatentRadiusTruncation,
     LikelihoodThresholdTruncation,
+    LogLevelThresholdTruncation,
     MinLogQTruncation,
     TruncationScheme,
 )
@@ -301,3 +302,39 @@ def test_max_samples_warning_once_per_training_round(caplog):
     levels = [r.levelname for r in caplog.records
               if "Reached max samples" in r.getMessage()]
     assert levels == ["WARNING", "DEBUG", "DEBUG", "WARNING"]
+
+
+def test_populate_continues_after_failed_backward_pass(
+    proposal, rng, point, samples
+):
+    """An AssertionError in the flow inverse makes backward_pass return plain
+    empty arrays; populate must skip that batch, with a level threshold too."""
+    configure_population_test_proposal(proposal, rng, samples)
+    proposal._truncation_scheme = TruncationScheme(
+        [LogLevelThresholdTruncation(quantile=0.0)]
+    )
+    proposal.latent_temperature = None
+    proposal.forward_pass = MagicMock(
+        return_value=(np.zeros((2, 2)), np.array([0.0, -1.0]))
+    )
+    proposal.mixture_levels = MagicMock(
+        side_effect=lambda x, log_q, z=None: (
+            np.zeros((len(x), 1), dtype=int),
+            np.asarray(log_q).reshape(len(x), 1),
+        )
+    )
+    proposal.flow.sample_latent_distribution.return_value = np.zeros((1, 2))
+    proposal.backward_pass = MagicMock(
+        side_effect=[
+            (np.array([]), np.array([]), np.array([])),
+            (samples([(1.0, 1.0)]), np.array([0.5]), np.zeros((1, 2))),
+        ]
+    )
+    proposal.model.batch_evaluate_log_likelihood.return_value = np.array([1.0])
+
+    FlowProposal.populate(
+        proposal, point(0.0, 0.0, logl=0.5), n_samples=1, plot=False
+    )
+
+    assert proposal.backward_pass.call_count == 2
+    assert proposal.x.size == 1

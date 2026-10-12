@@ -561,8 +561,10 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
     def _levels(proposal, x, log_q, z=None):
         log_q = np.asarray(log_q, dtype=float)
         fn = getattr(proposal, "mixture_levels", None)
-        if fn is None:
-            return np.zeros((len(x), 1), dtype=int), log_q[:, None]
+        if fn is None or not len(x):
+            # an empty batch (a failed backward pass) cannot be reshaped
+            # with -1 below: give it one (empty) candidate column
+            return np.zeros((len(x), 1), dtype=int), log_q.reshape(len(x), 1)
         if z is not None and _accepts_keyword(fn, "z"):
             pieces, levels = fn(x, log_q, z=z)
         else:

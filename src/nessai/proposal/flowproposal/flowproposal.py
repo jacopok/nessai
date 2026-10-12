@@ -636,9 +636,12 @@ class FlowProposal(BaseFlowProposal):
                 return_z=True,
                 return_unit_hypercube=self.map_to_unit_hypercube,
             )
-            x, log_q, z = self._truncation_scheme.apply_after_backward(
-                self, x, log_q, z
-            )
+            # backward_pass returns plain empty arrays when the flow inverse
+            # fails: skip the truncation stages for them
+            if len(x):
+                x, log_q, z = self._truncation_scheme.apply_after_backward(
+                    self, x, log_q, z
+                )
             if not len(x):
                 if n_proposed > max_samples:
                     self._warn_max_samples(max_samples)
@@ -815,6 +818,8 @@ class FlowProposal(BaseFlowProposal):
                 return_z=True,
                 return_unit_hypercube=self.map_to_unit_hypercube,
             )
+            if not len(x):
+                return -np.inf
             x, log_q, z = self._truncation_scheme.apply_after_backward(
                 self, x, log_q, z
             )
