@@ -2845,3 +2845,52 @@ def test_clustered_train_skips_expert_with_too_few_points(
         fm.train(data, groups=groups)
     assert len(calls) == 1
     assert f"has {n_small} unique routed points" in caplog.text
+
+
+@pytest.mark.parametrize("n_experts", [1, 2])
+def test_log_prob_at_element_of_reflection(n_experts):
+    """A reflection the group action does not touch (``y -> -y`` against
+    shifts in ``x``) keeps each draw's group element: the density at the
+    reflected point, given the element cached by :meth:`inverse`, is the full
+    :meth:`log_prob`."""
+    if n_experts == 1:
+        w = _expert()
+        w.eval()
+    else:
+        w = _clustered_wrapper(2)
+        with torch.no_grad():
+            w._n_active.fill_(2)
+            w._clustering_seen.fill_(True)
+            w.cluster_weights.copy_(torch.tensor([0.3, 0.7]))
+            w._centroids[:2].copy_(torch.tensor([[0.0, -2.0], [0.0, 2.0]]))
+    torch.manual_seed(1)
+    z = torch.randn(256, 2)
+    with torch.no_grad():
+        x, log_j = w.inverse(z)
+        keep = torch.isfinite(log_j)
+        assert keep.any()
+        x, z = x[keep], z[keep]
+        element = w.element_lookup(z.numpy())
+        assert element is not None and len(element) == n_experts
+        mirror = x * torch.tensor([1.0, -1.0])
+        fast = w.log_prob_at_element(mirror, element)
+        full = w.log_prob(mirror)
+    finite = torch.isfinite(full)
+    assert finite.any()
+    assert torch.equal(torch.isfinite(fast), finite)
+    assert torch.allclose(fast[finite], full[finite], atol=1e-5)
+    # a row missing from the cache: no elements
+    assert w.element_lookup(np.full((1, 2), 99.0, dtype=np.float32)) is None
+
+
+def test_log_prob_at_element_falls_back_off_domain():
+    """A wrong element (pre-image outside the domain) is caught: the row gets
+    the full :meth:`log_prob`."""
+    w = _expert()
+    w.eval()
+    x = torch.tensor([[2.5, 0.3], [0.5, -0.2]])
+    wrong = torch.tensor([0, 3])
+    with torch.no_grad():
+        assert torch.allclose(
+            w.log_prob_at_element(x, wrong), w.log_prob(x), atol=1e-6
+        )

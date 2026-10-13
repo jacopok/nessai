@@ -186,6 +186,32 @@ class ReparamBridge:
         return prime_t, L
 
 
+def _cached_rows(key, z):
+    """Indices of the rows ``z`` in ``key`` (both ``[n, d]`` arrays), or
+    ``None`` unless every row of ``z`` is found."""
+    if key is None or z is None:
+        return None
+    z = np.asarray(z, dtype=key.dtype)
+    if z.ndim != 2 or z.shape[1] != key.shape[1] or len(z) > len(key):
+        return None
+    # index on the first coordinate, then check the whole rows
+    index = {v: i for i, v in enumerate(key[:, 0].tolist())}
+    rows = np.fromiter(
+        (index.get(v, -1) for v in z[:, 0].tolist()), dtype=int, count=len(z)
+    )
+    if (rows < 0).any() or not np.array_equal(key[rows], z):
+        # a repeated first coordinate (float32): match whole rows
+        index = {row.tobytes(): i for i, row in enumerate(key)}
+        rows = np.fromiter(
+            (index.get(row.tobytes(), -1) for row in z),
+            dtype=int,
+            count=len(z),
+        )
+        if (rows < 0).any():
+            return None
+    return rows
+
+
 def _identity_bridge(param_names, dtype, device):
     """Identity :class:`ReparamBridge`, for standalone (no-proposal) use."""
 
@@ -1604,8 +1630,63 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         log_q = self._mixture_log_prob_from_canonical(
             canon, modes, x, -fwd_logdet, context
         )
+        if context is None:
+            # the group element of every draw, for :meth:`element_lookup`
+            self._element_cache = dict(
+                z=z.detach().cpu().numpy(), element=modes
+            )
         log_j = latent_log_prob - log_q
         return x, log_j
+
+    def element_lookup(self, z):
+        """The group element (as a one-entry list, as the clustered
+        wrapper's per-expert lists) that generated each latent row ``z`` in
+        the last :meth:`inverse` call, or ``None`` unless every row is
+        found."""
+        cache = getattr(self, "_element_cache", None)
+        if cache is None:
+            return None
+        rows = _cached_rows(cache["z"], z)
+        if rows is None:
+            return None
+        rows = torch.as_tensor(
+            rows, dtype=torch.long, device=cache["element"].device
+        )
+        return [cache["element"][rows]]
+
+    def log_prob_at_element(self, x, element, context=None):
+        """:meth:`log_prob` of ``x`` given the group element whose inverse
+        maps each row into the fundamental domain.
+
+        Skips the search over the group (``group_size`` actions and domain
+        checks per point): a single inverse action and domain check per
+        point, then the base flow. A row whose pre-image by ``element`` is
+        not in the domain gets the full :meth:`log_prob`. For a point on a
+        domain boundary (claimed by several elements) only ``element``'s
+        branch is counted, a measure-zero difference. ``element`` may also
+        be the one-entry list :meth:`element_lookup` returns.
+        """
+        if isinstance(element, (list, tuple)):
+            (element,) = element
+        pre, conj_logdet = self._apply_group_action(x, element, inverse=True)
+        lp = (
+            torch.log(self.proposal_weights[element])
+            + self._base_log_prob(pre, element, context=context)
+            + self._canon_log_det(element)
+            + conj_logdet
+        )
+        if self.in_fundamental_domain is not None or self.uses_prime_space_action:
+            miss = ~self._in_domain(pre)
+            miss |= ~torch.isfinite(pre).all(dim=-1)
+            if bool(miss.any()):
+                lp = lp.clone()
+                lp[miss] = self._raw_log_prob(
+                    x[miss],
+                    context=None if context is None else context[miss],
+                )
+        if self._truncate:
+            lp = lp - self._log_domain_mass
+        return lp
 
     def sample(self, n, context=None):
         x, _ = self.sample_and_log_prob(n, context=context)
@@ -2616,31 +2697,48 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         cache = getattr(self, "_level_cache", None)
         if cache is None or z is None:
             return None
-        key = cache["z"]
-        z = np.asarray(z, dtype=key.dtype)
-        if z.ndim != 2 or z.shape[1] != key.shape[1] or len(z) > len(key):
+        rows = _cached_rows(cache["z"], z)
+        if rows is None:
             return None
-        # index on the first coordinate, then check the whole rows
-        index = {v: i for i, v in enumerate(key[:, 0].tolist())}
-        rows = np.fromiter(
-            (index.get(v, -1) for v in z[:, 0].tolist()), dtype=int, count=len(z)
-        )
-        if (rows < 0).any() or not np.array_equal(key[rows], z):
-            # a repeated first coordinate (float32): match whole rows
-            index = {row.tobytes(): i for i, row in enumerate(key)}
-            rows = np.fromiter(
-                (index.get(row.tobytes(), -1) for row in z),
-                dtype=int,
-                count=len(z),
-            )
-            if (rows < 0).any():
-                return None
         rows = torch.as_tensor(rows, dtype=torch.long, device=cache["x"].device)
         return (
             cache["x"][rows],
             cache["lps"][:, rows],
             [e[rows] for e in cache["element"]],
             [c[rows] for c in cache["claimed"]],
+        )
+
+    def element_lookup(self, z):
+        """Each active expert's group element of the draws that the last
+        :meth:`inverse` call generated from the latent rows ``z``, or
+        ``None`` unless every row is found."""
+        if self._active() == 1:
+            return self.experts[0].element_lookup(z)
+        cached = self.level_cache_lookup(z)
+        return None if cached is None else cached[2]
+
+    def log_prob_at_element(self, x, element, context=None):
+        """:meth:`log_prob` given each active expert's group element of every
+        row (``element``: one tensor per expert, as :meth:`element_lookup`):
+        each expert skips its search over the group."""
+        act = self._active()
+        if act == 1:
+            return self.experts[0].log_prob_at_element(
+                x, element[0], context=context
+            )
+        lw = torch.log(self.proposal_weights[:act].clamp_min(1e-38))
+        lps = torch.stack(
+            [
+                self.experts[j].log_prob_at_element(
+                    x, element[j], context=context
+                )
+                + lw[j]
+                for j in range(act)
+            ],
+            dim=0,
+        )
+        return self._blend_bg(
+            torch.logsumexp(lps, dim=0), x, context=context
         )
 
     def freeze_transform(self):

@@ -8,6 +8,7 @@ import math
 import warnings
 
 import numpy as np
+import torch
 from scipy.special import logsumexp
 
 from ... import config
@@ -581,7 +582,7 @@ class FlowProposal(BaseFlowProposal):
 
         if sum_sides and len(x):
             log_q_sides = self.mirror_log_q(
-                x, drawn_prime=x_array, drawn_log_q=log_prob
+                x, drawn_prime=x_array, drawn_log_q=log_prob, z=z
             )
             if log_q_sides.shape[0] > 1:
                 log_prob = logsumexp(log_q_sides, axis=0)
@@ -590,7 +591,7 @@ class FlowProposal(BaseFlowProposal):
             return x, log_prob, z
         return x, log_prob
 
-    def mirror_log_q(self, x, drawn_prime=None, drawn_log_q=None):
+    def mirror_log_q(self, x, drawn_prime=None, drawn_log_q=None, z=None):
         """Pool density of each physical point of ``x`` on each side of the
         boundary inversion: an ``(n_sides, len(x))`` array, one row per copy
         the rescale makes of ``x`` (one without duplication).
@@ -600,7 +601,12 @@ class FlowProposal(BaseFlowProposal):
         ``drawn_prime`` (the prime-space points the draws were generated at,
         ``[len(x), dims]``) and ``drawn_log_q`` (their density), each draw's
         own side keeps that density and only the other sides go through the
-        flow.
+        flow. With ``z`` too (their latent points), a flow model that knows
+        the group element of each draw (``element_lookup`` and
+        ``log_prob_at_element``, the group-mixture flows) scores the other
+        sides at the same element: the boundary inversion and the group
+        action act on different coordinates, so a point and its mirror image
+        share their element.
         """
         n = len(x)
         x_prime, log_j = self.rescale(x.copy())
@@ -630,7 +636,27 @@ class FlowProposal(BaseFlowProposal):
             todo[own, np.arange(n)] = False
         rows = todo.ravel()
         temperature = getattr(self, "latent_temperature", None)
-        if temperature in (None, 1.0):
+        model = getattr(self.flow, "model", None)
+        element = None
+        if (
+            z is not None
+            and drawn_prime is not None
+            and temperature in (None, 1.0)
+            and hasattr(model, "element_lookup")
+        ):
+            element = model.element_lookup(z)
+        if element is not None:
+            # row r of the other sides is a copy of point r mod n
+            point = np.nonzero(todo)[1]
+            x_t = self.flow.numpy_array_to_tensor(arr[rows])
+            point_t = torch.as_tensor(point, device=x_t.device)
+            model.eval()
+            with torch.inference_mode():
+                lq = model.log_prob_at_element(
+                    x_t, [e[point_t] for e in element]
+                )
+            lq = lq.cpu().numpy().astype(np.float64)
+        elif temperature in (None, 1.0):
             lq = self.flow.log_prob(arr[rows])
         else:
             z, lq = self.flow.forward_and_log_prob(arr[rows])
