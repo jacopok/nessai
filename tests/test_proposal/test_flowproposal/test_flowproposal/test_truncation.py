@@ -494,9 +494,9 @@ def test_log_proposal_threshold_uses_tempered_live_log_q(temperature):
 
 
 def test_log_proposal_threshold_prior_relative():
-    """With ``prior_relative`` the threshold is on ``log q - log prior``:
-    the kept draws have log-weights below ``-threshold``, whatever their
-    ``log q``."""
+    """With ``prior_relative`` the threshold is on ``log q - log prior``,
+    over the live points and their boundary-inversion mirror copies: the kept
+    draws have log-weights below ``-threshold``, whatever their ``log q``."""
     from nessai.livepoint import empty_structured_array
     from nessai.proposal.flowproposal.truncation import (
         LogProposalThresholdTruncation,
@@ -535,7 +535,9 @@ def test_log_proposal_threshold_prior_relative():
 
     rule = LogProposalThresholdTruncation(quantile=0.1, prior_relative=True)
     rule.prepare(proposal, worst_point=None)
-    live_level = log_q_of(live) - log_prior(live)
+    # each mirror row is paired with its live point's prior
+    live_level = np.concatenate([
+        log_q_of(live), -(live["x"] + 4) ** 2]) - np.tile(log_prior(live), 2)
     assert rule.threshold == pytest.approx(np.quantile(live_level, 0.1))
 
     x = arr(np.linspace(-1, 1, 2001))

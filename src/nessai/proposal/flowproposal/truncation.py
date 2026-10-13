@@ -488,11 +488,20 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
 
     def prepare(self, proposal, worst_point, radius=None):
         live_points, log_q = _live_log_q(proposal)
-        if getattr(self, "prior_relative", False):
-            # rows past ``len(live_points)`` are boundary-inversion mirror
-            # copies, which have no prior of their own: the quantile is over
-            # the live points (as ``log_level_threshold``'s)
-            log_q = np.asarray(log_q)[: len(live_points)]
+        log_q = np.asarray(log_q)
+        if getattr(self, "prior_relative", False) and len(live_points):
+            # Boundary inversion with duplication appends mirror copies of
+            # the live points in blocks of ``len(live_points)`` rows (row r
+            # is a copy of live point r mod n). A draw is weighted with the
+            # density of the side it was drawn on, so the quantile is over
+            # every side's density, each paired with its live point's prior.
+            n = len(live_points)
+            if len(log_q) % n:
+                raise RuntimeError(
+                    f"{len(log_q)} rows of log q for {n} live points: not "
+                    "whole blocks of mirror copies"
+                )
+            live_points = np.tile(live_points, len(log_q) // n)
         level = self._levels(proposal, live_points, log_q)
         self._threshold = float(np.quantile(level, self.quantile))
 
