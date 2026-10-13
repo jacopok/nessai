@@ -488,6 +488,11 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
 
     def prepare(self, proposal, worst_point, radius=None):
         live_points, log_q = _live_log_q(proposal)
+        if getattr(self, "prior_relative", False):
+            # rows past ``len(live_points)`` are boundary-inversion mirror
+            # copies, which have no prior of their own: the quantile is over
+            # the live points (as ``log_level_threshold``'s)
+            log_q = np.asarray(log_q)[: len(live_points)]
         level = self._levels(proposal, live_points, log_q)
         self._threshold = float(np.quantile(level, self.quantile))
 

@@ -518,10 +518,20 @@ def test_log_proposal_threshold_prior_relative():
     proposal = MagicMock()
     proposal.training_data = live
     proposal.latent_temperature = None
+    # the flow's rescale appends a boundary-inversion mirror copy of every
+    # point (x -> -x - 4, far below the live points' log q): forward_pass
+    # returns twice as many rows as the live points
     proposal.forward_pass = MagicMock(
-        side_effect=lambda x: (np.zeros((len(x), 1)), log_q_of(x)))
-    proposal.compute_weights = MagicMock(
-        side_effect=lambda x, log_q: log_prior(x) - log_q)
+        side_effect=lambda x: (
+            np.zeros((2 * len(x), 1)),
+            np.concatenate([log_q_of(x), -(x["x"] + 4) ** 2]),
+        ))
+
+    def compute_weights(x, log_q):
+        assert len(x) == len(log_q)
+        return log_prior(x) - log_q
+
+    proposal.compute_weights = MagicMock(side_effect=compute_weights)
 
     rule = LogProposalThresholdTruncation(quantile=0.1, prior_relative=True)
     rule.prepare(proposal, worst_point=None)
@@ -534,10 +544,12 @@ def test_log_proposal_threshold_prior_relative():
     assert len(out) == np.sum(log_q_of(x) - log_prior(x) > rule.threshold)
     assert np.all(log_prior(out) - log_q_of(out) < -rule.threshold)
 
-    # a rule pickled before the option existed thresholds log q
+    # a rule pickled before the option existed thresholds log q, over the
+    # mirror copies too
     del rule.prior_relative
     rule.prepare(proposal, worst_point=None)
-    assert rule.threshold == pytest.approx(np.quantile(log_q_of(live), 0.1))
+    assert rule.threshold == pytest.approx(np.quantile(
+        np.concatenate([log_q_of(live), -(live["x"] + 4) ** 2]), 0.1))
 
 
 # -- log_level_threshold ------------------------------------------------------
