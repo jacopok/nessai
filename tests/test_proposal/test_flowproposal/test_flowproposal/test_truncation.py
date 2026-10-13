@@ -493,6 +493,53 @@ def test_log_proposal_threshold_uses_tempered_live_log_q(temperature):
     assert rule.threshold == pytest.approx(np.quantile(expected, 0.5))
 
 
+def test_log_proposal_threshold_prior_relative():
+    """With ``prior_relative`` the threshold is on ``log q - log prior``:
+    the kept draws have log-weights below ``-threshold``, whatever their
+    ``log q``."""
+    from nessai.livepoint import empty_structured_array
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    def arr(v):
+        a = empty_structured_array(len(v), names=["x"])
+        a["x"] = v
+        return a
+
+    def log_q_of(x):
+        return -x["x"] ** 2
+
+    def log_prior(x):
+        return 2.0 * x["x"]
+
+    rng = np.random.default_rng(3)
+    live = arr(rng.uniform(-1, 1, 1000))
+    proposal = MagicMock()
+    proposal.training_data = live
+    proposal.latent_temperature = None
+    proposal.forward_pass = MagicMock(
+        side_effect=lambda x: (np.zeros((len(x), 1)), log_q_of(x)))
+    proposal.compute_weights = MagicMock(
+        side_effect=lambda x, log_q: log_prior(x) - log_q)
+
+    rule = LogProposalThresholdTruncation(quantile=0.1, prior_relative=True)
+    rule.prepare(proposal, worst_point=None)
+    live_level = log_q_of(live) - log_prior(live)
+    assert rule.threshold == pytest.approx(np.quantile(live_level, 0.1))
+
+    x = arr(np.linspace(-1, 1, 2001))
+    out, _, _ = rule.apply_after_backward(
+        proposal, x, log_q_of(x), np.zeros((len(x), 1)))
+    assert len(out) == np.sum(log_q_of(x) - log_prior(x) > rule.threshold)
+    assert np.all(log_prior(out) - log_q_of(out) < -rule.threshold)
+
+    # a rule pickled before the option existed thresholds log q
+    del rule.prior_relative
+    rule.prepare(proposal, worst_point=None)
+    assert rule.threshold == pytest.approx(np.quantile(log_q_of(live), 0.1))
+
+
 # -- log_level_threshold ------------------------------------------------------
 def _level_proposal(live_x, weights, with_pieces=True):
     """Mock two-piece proposal on a line: piece 1 is x < 0, the flow level is

@@ -456,25 +456,43 @@ def _live_log_q(proposal):
 
 
 class LogProposalThresholdTruncation(BaseTruncationRule):
-    """Truncate samples using the current log-proposal threshold."""
+    """Truncate samples using the current log-proposal threshold.
+
+    With ``prior_relative`` the thresholded quantity is ``log q - log prior``
+    (minus the rejection-sampling log-weight) instead of ``log q``: the
+    support then caps the weights at ``exp(-threshold)``, dropping first the
+    draws where the flow is broad but the prior large.
+    """
 
     name = "log_proposal_threshold"
     _transient_defaults = {"_threshold": np.nan}
 
-    def __init__(self, quantile: float = 0.05) -> None:
+    def __init__(
+        self, quantile: float = 0.05, prior_relative: bool = False
+    ) -> None:
         super().__init__()
         self.quantile = float(quantile)
+        self.prior_relative = bool(prior_relative)
 
     @property
     def threshold(self) -> float:
         return self._threshold
 
+    def _levels(self, proposal, x, log_q):
+        log_q = np.asarray(log_q, dtype=float)
+        # rules pickled before the option existed have no attribute
+        if not getattr(self, "prior_relative", False) or not len(x):
+            return log_q
+        log_w = np.asarray(proposal.compute_weights(x, log_q), dtype=float)
+        return np.where(np.isfinite(log_w), -log_w, -np.inf)
+
     def prepare(self, proposal, worst_point, radius=None):
-        _, log_q = _live_log_q(proposal)
-        self._threshold = float(np.quantile(log_q, self.quantile))
+        live_points, log_q = _live_log_q(proposal)
+        level = self._levels(proposal, live_points, log_q)
+        self._threshold = float(np.quantile(level, self.quantile))
 
     def apply_after_backward(self, proposal, x, log_q, z):
-        keep = log_q > self.threshold
+        keep = self._levels(proposal, x, log_q) > self.threshold
         logger.debug(
             "Accepting %s / %s samples above log-proposal threshold",
             int(keep.sum()),
