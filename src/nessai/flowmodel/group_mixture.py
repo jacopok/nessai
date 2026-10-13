@@ -2642,14 +2642,29 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         else:
             use_bg = torch.zeros(n, dtype=torch.bool, device=z.device)
         fg = (~use_bg).nonzero(as_tuple=True)[0]
+        # each expert's own draws: its density there and their group element
+        # are known from its inverse, so only the other experts search the
+        # group for them
+        reuse = context is None and getattr(
+            self, "reuse_generator_density", True
+        )
+        own = [None] * act
         if fg.numel():
             assign = self._draw_assignments(fg.numel(), z.device)
             for j in range(act):
                 sub = fg[assign == j]
                 if sub.numel():
-                    xj, ljj = self.experts[j].inverse(z[sub], context=context)
+                    expert = self.experts[j]
+                    xj, ljj = expert.inverse(z[sub], context=context)
                     x[sub] = xj
                     gen_out_of_domain[sub] = ~torch.isfinite(ljj)
+                    if reuse:
+                        lp_own = (
+                            expert.base_distribution_log_prob(z[sub]) - ljj
+                        )
+                        own[j] = (
+                            sub, lp_own, expert._element_cache["element"]
+                        )
         if bool(use_bg.any()):
             xb, ljb = self._bg_expert.inverse(z[use_bg], context=context)
             x[use_bg] = xb
@@ -2657,7 +2672,34 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         # non-literal log_j: base_distribution_log_prob(z) - log_j == log q(x)
         # (as :meth:`log_prob`, keeping the per-expert densities and the
         # group element of every draw for :meth:`level_cache_lookup`)
-        lps = [self.experts[j].log_prob(x, context=context) for j in range(act)]
+        lps, elements, claimed = [], [], []
+        for j in range(act):
+            expert = self.experts[j]
+            if own[j] is None:
+                lps.append(expert.log_prob(x, context=context))
+                if context is None:
+                    a = expert._assign_branch(x)
+                    elements.append(a[0])
+                    claimed.append(a[2])
+                continue
+            sub, lp_own, el_own = own[j]
+            others = torch.ones(n, dtype=torch.bool, device=z.device)
+            others[sub] = False
+            lp = x.new_full((n,), -float("inf"))
+            lp[sub] = lp_own
+            el = torch.zeros(n, dtype=torch.long, device=z.device)
+            el[sub] = el_own
+            cl = torch.zeros(n, dtype=torch.bool, device=z.device)
+            cl[sub] = torch.isfinite(lp_own)
+            if bool(others.any()):
+                xo = x[others]
+                lp[others] = expert.log_prob(xo)
+                a = expert._assign_branch(xo)
+                el[others] = a[0]
+                cl[others] = a[2]
+            lps.append(lp)
+            elements.append(el)
+            claimed.append(cl)
         lw = torch.log(self.proposal_weights[:act].clamp_min(1e-38))
         log_q = self._blend_bg(
             torch.logsumexp(torch.stack(lps) + lw[:, None], dim=0),
@@ -2665,13 +2707,12 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             context=context,
         )
         if context is None:
-            assign = [self.experts[j]._assign_branch(x) for j in range(act)]
             self._level_cache = dict(
                 z=z.detach().cpu().numpy(),
                 x=x,
                 lps=torch.stack(lps),
-                element=[a[0] for a in assign],
-                claimed=[a[2] for a in assign],
+                element=elements,
+                claimed=claimed,
             )
         for e in self.experts[:act]:
             e._branch_memo = None
