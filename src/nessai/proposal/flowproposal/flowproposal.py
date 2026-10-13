@@ -144,7 +144,8 @@ class FlowProposal(BaseFlowProposal):
         and should be configured via :code:`truncation_methods` and
         :code:`truncation_kwargs` instead.
     drawsize : int, optional
-        The number of samples to draw from the flow when populating the pool.
+        The number of samples to draw from the flow per batch when populating
+        the pool, at most the pool size (default: the initial pool size).
     truncate_log_q : bool, optional
         Whether to truncate the log q values when populating the pool. This
         argument is deprecated and should be configured via
@@ -724,7 +725,8 @@ class FlowProposal(BaseFlowProposal):
         adapt_surv_log_w = []
 
         while n_accepted < n_samples:
-            z = self.sample_latent_distribution(self.drawsize)
+            # a batch is never larger than the pool: ``drawsize`` caps it
+            z = self.sample_latent_distribution(min(self.drawsize, n_samples))
             n_batch = z.shape[0]
             n_proposed += n_batch
             if self.adapt_latent_temperature:
