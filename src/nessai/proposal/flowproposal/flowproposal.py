@@ -11,7 +11,7 @@ import numpy as np
 from scipy.special import logsumexp
 
 from ... import config
-from ...livepoint import empty_structured_array
+from ...livepoint import empty_structured_array, live_points_to_array
 from ...utils.structures import get_subset_arrays
 from ...utils.temperature import optimise_latent_temperature
 from .base import BaseFlowProposal
@@ -191,6 +191,15 @@ class FlowProposal(BaseFlowProposal):
         (counted before truncation, as ``max_samples`` is), the cap is
         lowered to that yield, so the pool always fills within
         ``max_samples`` draws; the prior mass then under-sampled is logged.
+    sum_mirror_density : bool, optional
+        With a reparameterisation that duplicates the points by boundary
+        inversion, a draw on either side of the boundary is folded back to the
+        same physical point, so the pool's density there is the flow's
+        density summed over the point and its mirror copies. If true, the
+        draws (and the live points the truncation rules are set on) are
+        scored with that sum, at one more flow evaluation per draw; if false,
+        a draw is scored with the density of the side it was drawn on, which
+        overstates its weight by ``1 + q_mirror / q_side``.
     **kwargs
         Additional keyword arguments to pass to the base class.
     """
@@ -223,9 +232,11 @@ class FlowProposal(BaseFlowProposal):
         truncation_kwargs=None,
         clip_population_weights=False,
         population_weight_cap_mass=None,
+        sum_mirror_density=False,
         **kwargs,
     ):
         super().__init__(model, poolsize=poolsize, **kwargs)
+        self.sum_mirror_density = bool(sum_mirror_density)
         logger.debug("Initialising FlowProposal")
         self._warn_for_deprecated_latent_prior(latent_prior)
 
@@ -550,17 +561,86 @@ class FlowProposal(BaseFlowProposal):
         for i, parameter in enumerate(self.prime_parameters):
             x[parameter] = x_array[:, i]
 
+        # proposals pickled before the option existed have no attribute
+        sum_sides = (
+            getattr(self, "sum_mirror_density", False)
+            and rescale
+            and not return_unit_hypercube
+        )
         if rescale:
             x, log_J = self.inverse_rescale(
                 x, return_unit_hypercube=return_unit_hypercube
             )
             log_prob -= log_J
-            if not return_unit_hypercube:
+            if sum_sides:
+                x, z, log_prob, x_array = self.check_prior_bounds(
+                    x, z, log_prob, x_array
+                )
+            elif not return_unit_hypercube:
                 x, z, log_prob = self.check_prior_bounds(x, z, log_prob)
+
+        if sum_sides and len(x):
+            log_q_sides = self.mirror_log_q(
+                x, drawn_prime=x_array, drawn_log_q=log_prob
+            )
+            if log_q_sides.shape[0] > 1:
+                log_prob = logsumexp(log_q_sides, axis=0)
 
         if return_z:
             return x, log_prob, z
         return x, log_prob
+
+    def mirror_log_q(self, x, drawn_prime=None, drawn_log_q=None):
+        """Pool density of each physical point of ``x`` on each side of the
+        boundary inversion: an ``(n_sides, len(x))`` array, one row per copy
+        the rescale makes of ``x`` (one without duplication).
+
+        Scored at the pool's latent temperature, as ``backward_pass`` scores
+        the draws (the flow's own density is untempered). With
+        ``drawn_prime`` (the prime-space points the draws were generated at,
+        ``[len(x), dims]``) and ``drawn_log_q`` (their density), each draw's
+        own side keeps that density and only the other sides go through the
+        flow.
+        """
+        n = len(x)
+        x_prime, log_j = self.rescale(x.copy())
+        arr = live_points_to_array(
+            x_prime, names=self.prime_parameters, copy=True
+        )
+        if arr.ndim == 1:
+            arr = arr[:, np.newaxis]
+        log_j = np.asarray(log_j, dtype=float)
+        if len(arr) % n:
+            raise RuntimeError(
+                f"{len(arr)} rows of log q for {n} points: not whole blocks "
+                "of mirror copies"
+            )
+        # boundary inversion with duplication appends the mirror copies in
+        # blocks of ``len(x)`` rows
+        k = len(arr) // n
+        todo = np.ones((k, n), dtype=bool)
+        log_q = np.empty((k, n))
+        if drawn_prime is not None and k > 1:
+            drawn_prime = np.asarray(drawn_prime, dtype=float).reshape(n, -1)
+            dist = np.sum(
+                (arr.reshape(k, n, -1) - drawn_prime[None]) ** 2, axis=-1
+            )
+            own = np.argmin(dist, axis=0)
+            log_q[own, np.arange(n)] = drawn_log_q
+            todo[own, np.arange(n)] = False
+        rows = todo.ravel()
+        temperature = getattr(self, "latent_temperature", None)
+        if temperature in (None, 1.0):
+            lq = self.flow.log_prob(arr[rows])
+        else:
+            z, lq = self.flow.forward_and_log_prob(arr[rows])
+            lq = (
+                lq
+                + self.latent_log_prob(z, temperature)
+                - self.latent_log_prob(z, None)
+            )
+        log_q[todo] = np.asarray(lq, dtype=float) + log_j[rows]
+        return log_q
 
     def _warn_max_samples(self, max_samples):
         """Warn that a pool stopped at ``max_samples`` draws, once per

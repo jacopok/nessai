@@ -382,3 +382,50 @@ def test_rescaling_integration_no_rescaling(tmp_path, model):
 
     assert_structured_arrays_equal(x_prime, x)
     assert_structured_arrays_equal(x_recon, x_prime)
+
+
+@pytest.mark.parametrize("sum_mirror_density", [False, True])
+@pytest.mark.integration_test
+@pytest.mark.timeout(60)
+def test_sum_mirror_density(tmp_path, model, flow_config, sum_mirror_density):
+    """With boundary inversion by duplication a draw is folded back from any
+    side: with ``sum_mirror_density`` it is scored with the flow's density
+    summed over the sides (as are the live points the truncation rules use),
+    otherwise with the side it was drawn on."""
+    from scipy.special import logsumexp
+
+    from nessai.proposal.flowproposal.truncation import _live_log_q
+
+    output = tmp_path / "flowproposal"
+    output.mkdir()
+    fp = FlowProposal(
+        model,
+        output=output,
+        flow_config=flow_config,
+        plot=False,
+        poolsize=100,
+        reparameterisations="inversion-duplicate",
+        sum_mirror_density=sum_mirror_density,
+    )
+    fp.initialise()
+    live = model.new_point(100)
+    fp.train(live, plot=False)
+
+    z = fp.sample_latent_distribution(200)
+    x, log_q = fp.backward_pass(z)
+    sides = fp.mirror_log_q(x)
+    assert sides.shape[0] > 1
+    if sum_mirror_density:
+        np.testing.assert_allclose(log_q, logsumexp(sides, axis=0), atol=1e-5)
+    else:
+        # the density of the side the draw came from
+        assert np.all(np.min(np.abs(sides - log_q), axis=0) < 1e-3)
+        assert np.all(log_q < logsumexp(sides, axis=0))
+
+    live_points, live_log_q = _live_log_q(fp)
+    expected = (
+        logsumexp(fp.mirror_log_q(live_points), axis=0)
+        if sum_mirror_density
+        else fp.mirror_log_q(live_points).ravel()
+    )
+    np.testing.assert_allclose(live_log_q, expected)

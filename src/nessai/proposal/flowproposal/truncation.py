@@ -7,6 +7,7 @@ import logging
 from copy import deepcopy
 
 import numpy as np
+from scipy.special import logsumexp
 
 from ...utils import compute_radius
 from ...utils.structures import get_subset_arrays
@@ -444,6 +445,13 @@ def _live_log_q(proposal):
     is taken from them.
     """
     live_points = proposal.training_data.copy()
+    if getattr(proposal, "sum_mirror_density", False) is True and len(
+        live_points
+    ):
+        # the draws are scored with the density summed over the sides of the
+        # boundary inversion: so are the live points
+        sides = proposal.mirror_log_q(live_points)
+        return live_points, logsumexp(sides, axis=0)
     z, log_q = proposal.forward_pass(live_points)
     temperature = getattr(proposal, "latent_temperature", None)
     if temperature not in (None, 1.0):
