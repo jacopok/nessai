@@ -434,9 +434,22 @@ def _accepts_keyword(fn, name):
     )
 
 
+def _threshold_points(proposal):
+    """The live points the truncation thresholds are taken from: the
+    sampler's current live points with ``threshold_from_live_points``,
+    otherwise the flow's training data (the live points at the last
+    training, which lag the current ones by up to a training interval)."""
+    live = getattr(proposal, "current_live_points", None)
+    if getattr(proposal, "threshold_from_live_points", False) is True and (
+        live is not None and len(live)
+    ):
+        return live
+    return proposal.training_data
+
+
 def _live_log_q(proposal):
-    """``log q`` of the training (live) points under the density the pool is
-    drawn from.
+    """``log q`` of the live points (:func:`_threshold_points`) under the
+    density the pool is drawn from.
 
     ``backward_pass`` scores draws with the *tempered* latent density
     (``latent_log_prob(z, latent_temperature)``) while ``forward_pass``
@@ -444,7 +457,7 @@ def _live_log_q(proposal):
     the live points are rescored at the same temperature before a threshold
     is taken from them.
     """
-    live_points = proposal.training_data.copy()
+    live_points = _threshold_points(proposal).copy()
     if getattr(proposal, "sum_mirror_density", False) is True and len(
         live_points
     ):
@@ -470,21 +483,66 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
     (minus the rejection-sampling log-weight) instead of ``log q``: the
     support then caps the weights at ``exp(-threshold)``, dropping first the
     draws where the flow is broad but the prior large.
+
+    ``mode`` (prior-relative only) is what happens to the draws above the
+    cap: ``"drop"`` discards them, so the pool follows the prior on the
+    support only, and the region where the flow undercovers the live points
+    (``quantile`` of them) is never proposed; ``"clip"`` keeps them with
+    their weight clipped to the cap, so the pool follows ``min(p, c q)``
+    everywhere: no excluded region, at the cost of the likelihood calls
+    spent on the clipped part of the pool (``clipped_share``). In clip mode
+    a clipped draw whose latent the flow's forward map does not return to
+    (``roundtrip_tolerance`` on the latent norm; a numerical failure of the
+    inverse, whose density is then wrong) is discarded.
+
+    ``prepare`` records the live points outside the cap:
+    ``excluded_live_fraction`` and ``excluded_live_mean_rank`` (their mean
+    likelihood rank in [0, 1]; 0.5 if spread evenly). A rank well below 0.5
+    means the excluded region lies at the low-likelihood edge, which biases
+    the compression of a drop cut.
     """
 
     name = "log_proposal_threshold"
     _transient_defaults = {"_threshold": np.nan}
+    _modes = ("drop", "clip")
 
     def __init__(
-        self, quantile: float = 0.05, prior_relative: bool = False
+        self,
+        quantile: float = 0.05,
+        prior_relative: bool = False,
+        mode: str = "drop",
+        roundtrip_tolerance: float | None = 2.0,
     ) -> None:
         super().__init__()
         self.quantile = float(quantile)
         self.prior_relative = bool(prior_relative)
+        if mode not in self._modes:
+            raise ValueError(f"mode must be one of {self._modes}")
+        if mode == "clip" and not self.prior_relative:
+            raise ValueError("mode='clip' requires prior_relative=True")
+        self.mode = mode
+        self.roundtrip_tolerance = (
+            None if roundtrip_tolerance is None else float(roundtrip_tolerance)
+        )
+        self.excluded_live_fraction = np.nan
+        self.excluded_live_mean_rank = np.nan
+        self.roundtrip_discarded = 0
 
     @property
     def threshold(self) -> float:
         return self._threshold
+
+    @property
+    def clip(self) -> bool:
+        # rules pickled before the option existed have no attribute
+        return getattr(self, "mode", "drop") == "clip"
+
+    @property
+    def log_weight_cap(self) -> float:
+        """The cap on the rejection log-weights in clip mode, else ``inf``."""
+        if self.clip and np.isfinite(self._threshold):
+            return -self._threshold
+        return np.inf
 
     def _levels(self, proposal, x, log_q):
         log_q = np.asarray(log_q, dtype=float)
@@ -512,15 +570,64 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
             live_points = np.tile(live_points, len(log_q) // n)
         level = self._levels(proposal, live_points, log_q)
         self._threshold = float(np.quantile(level, self.quantile))
+        self._record_excluded(live_points, level)
+
+    def _record_excluded(self, live_points, level):
+        """Fraction and mean likelihood rank of the live points (and mirror
+        copies) below the threshold."""
+        self.excluded_live_fraction = np.nan
+        self.excluded_live_mean_rank = np.nan
+        if not len(level) or "logL" not in (live_points.dtype.names or ()):
+            return
+        logl = np.asarray(live_points["logL"], dtype=float)
+        rank = np.argsort(np.argsort(logl, kind="stable"), kind="stable")
+        rank = rank / max(len(rank) - 1, 1)
+        if len(level) != len(rank):
+            # mirror copies: blocks of ``len(live_points)`` rows
+            if len(level) % len(rank):
+                return
+            rank = np.tile(rank, len(level) // len(rank))
+        out = level < self._threshold
+        self.excluded_live_fraction = float(out.mean())
+        if out.any():
+            self.excluded_live_mean_rank = float(rank[out].mean())
 
     def apply_after_backward(self, proposal, x, log_q, z):
-        keep = self._levels(proposal, x, log_q) > self.threshold
+        levels = self._levels(proposal, x, log_q)
+        keep = levels > self.threshold
+        if self.clip:
+            # non-finite weights are dropped in either mode
+            keep = np.isfinite(levels) & self._roundtrip_keep(
+                proposal, x, z, ~keep
+            )
         logger.debug(
-            "Accepting %s / %s samples above log-proposal threshold",
+            "Accepting %s / %s samples (log-proposal threshold, %s)",
             int(keep.sum()),
             len(x),
+            getattr(self, "mode", "drop"),
         )
         return get_subset_arrays(keep, x, log_q, z)
+
+    def _roundtrip_keep(self, proposal, x, z, above):
+        """Keep every draw except the ones above the cap that fail the
+        round-trip check (only those: below the cap a wrong density costs
+        nothing, it is rejected or dropped like any other)."""
+        keep = np.ones(len(x), dtype=bool)
+        tol = getattr(self, "roundtrip_tolerance", None)
+        if tol is None or z is None or not above.any():
+            return keep
+        from .latent_distortion import roundtrip_gap
+
+        idx = np.flatnonzero(above)
+        gap = roundtrip_gap(proposal, x[idx], np.asarray(z)[idx])
+        if gap is None:
+            return keep
+        bad = idx[~(gap <= tol)]
+        keep[bad] = False
+        self.roundtrip_discarded = (
+            getattr(self, "roundtrip_discarded", 0) + len(bad)
+        )
+        return keep
 
 
 class LogLevelThresholdTruncation(BaseTruncationRule):
@@ -959,6 +1066,13 @@ class TruncationScheme:
         for rule in self.rules:
             x, log_q, z = rule.apply_after_likelihood(proposal, x, log_q, z)
         return x, log_q, z
+
+    @property
+    def log_weight_cap(self) -> float:
+        """The tightest cap on the rejection log-weights set by a rule in
+        clip mode (``inf`` if none)."""
+        caps = [getattr(rule, "log_weight_cap", np.inf) for rule in self.rules]
+        return float(min(caps, default=np.inf))
 
     def reset(self) -> None:
         for rule in self.rules:

@@ -1,5 +1,6 @@
 """Base proposal class that contains common methods."""
 
+import datetime
 import logging
 import os
 from abc import abstractmethod
@@ -940,6 +941,8 @@ class BaseFlowProposal(RejectionProposal):
         """
         if not self.initialised:
             raise RuntimeError(f"{self.__name__} is not initialised.")
+        # the flow trains (and the mixture weights are set) undistorted
+        self._clear_latent_distortion()
 
         if (plot and self._plot_training) or self.save_training_data:
             block_output = os.path.join(
@@ -998,6 +1001,74 @@ class BaseFlowProposal(RejectionProposal):
 
         self.populated = False
         self.training_count += 1
+        self._update_latent_distortion()
+
+    def _clear_latent_distortion(self):
+        """Remove the latent distortion from the flow (see
+        :meth:`_update_latent_distortion`)."""
+        if not getattr(self, "latent_distortion", None):
+            return
+        model = getattr(getattr(self, "flow", None), "model", None)
+        if hasattr(model, "set_latent_distortion"):
+            model.set_latent_distortion(None)
+        self.latent_distortion_params = None
+
+    def _update_latent_distortion(self):
+        """Fit the latent distortion to the training data and install it
+        in the flow if it passes the checks (``latent_distortion`` option of
+        :class:`FlowProposal`)."""
+        mode = getattr(self, "latent_distortion", None)
+        if not mode:
+            return
+        from .latent_distortion import fit_and_check, supports_distortion
+
+        model = self.flow.model
+        info = dict(mode=mode, training_count=int(self.training_count))
+        if not supports_distortion(model):
+            info.update(accepted=False, reason="flow model not supported")
+        else:
+            scheme = getattr(self, "_truncation_scheme", None)
+            rule = scheme.get_rule("log_proposal_threshold") if scheme else None
+            quantile = rule.quantile if rule is not None else 0.01
+            kwargs = dict(getattr(self, "latent_distortion_kwargs", {}) or {})
+            kwargs.setdefault("mode", mode)
+            st = datetime.datetime.now()
+            live = getattr(self, "current_live_points", None)
+            x = live if live is not None and len(live) else self.training_data
+            mu, ls, fit_info = fit_and_check(self, x, quantile, **kwargs)
+            info.update(fit_info)
+            info["time"] = (datetime.datetime.now() - st).total_seconds()
+            if mu is not None:
+                model.set_latent_distortion(mu, ls)
+                self.latent_distortion_params = (mu, ls)
+                real = np.asarray(self.latent_real_mask, dtype=bool)
+                sig = np.exp(ls[:, real])
+                info.update(
+                    sigma_min=float(sig.min()),
+                    sigma_max=float(sig.max()),
+                    mu_max=float(np.abs(mu[:, real]).max()),
+                )
+        if not hasattr(self, "latent_distortion_history"):
+            self.latent_distortion_history = []
+        self.latent_distortion_history.append(info)
+        if info.get("accepted"):
+            logger.info(
+                "Latent distortion (%s): held-out threshold gain %.2f nats, "
+                "excluded %.3g; sigma %.2f-%.2f, |mu| <= %.2f (%.1f s)",
+                mode,
+                info["heldout_gain"],
+                info["heldout_excluded"],
+                info["sigma_min"],
+                info["sigma_max"],
+                info["mu_max"],
+                info["time"],
+            )
+        else:
+            logger.info(
+                "Latent distortion (%s) not used: %s",
+                mode,
+                info.get("reason"),
+            )
 
     def _post_train_diagnostics(self):
         """Hook called immediately after :meth:`FlowModel.train` completes.
@@ -1360,6 +1431,11 @@ class BaseFlowProposal(RejectionProposal):
                 self.flow.reload_weights(weights_file)
         else:
             logger.warning("Could not reload weights for flow")
+        params = getattr(self, "latent_distortion_params", None)
+        if params is not None:
+            model = getattr(getattr(self, "flow", None), "model", None)
+            if hasattr(model, "set_latent_distortion"):
+                model.set_latent_distortion(*params)
 
     def reset(self):
         """Reset the proposal"""

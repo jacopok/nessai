@@ -202,6 +202,23 @@ class FlowProposal(BaseFlowProposal):
         scored with that sum, at one more flow evaluation per draw; if false,
         a draw is scored with the density of the side it was drawn on, which
         overstates its weight by ``1 + q_mirror / q_side``.
+    threshold_from_live_points : bool
+        If true, the truncation thresholds are taken from the sampler's
+        current live points (set as ``current_live_points`` before each
+        populate) instead of the flow's training data, the live points at
+        the last training: those lag the current ones by up to a training
+        interval, so the threshold is stale.
+    latent_distortion : {None, 'temperature', 'shared', 'expert'}
+        Fit an affine latent distortion (``z' = mu + sigma z`` per real
+        latent dim; ``'temperature'``: one sigma; ``'shared'``: per dim;
+        ``'expert'``: per expert and dim) after every training, to raise the
+        low tail of the live points' ``log q' - log p``, and draw and score
+        the pool with it. Needs a flow model with the distortion hooks (the
+        group-mixture flows) and no latent temperature. A fit that fails the
+        held-out or exactness checks leaves the identity. See
+        :mod:`nessai.proposal.flowproposal.latent_distortion`.
+    latent_distortion_kwargs : dict, optional
+        Options of :func:`~nessai.proposal.flowproposal.latent_distortion.fit_and_check`.
     **kwargs
         Additional keyword arguments to pass to the base class.
     """
@@ -235,10 +252,19 @@ class FlowProposal(BaseFlowProposal):
         clip_population_weights=False,
         population_weight_cap_mass=None,
         sum_mirror_density=False,
+        threshold_from_live_points=False,
+        latent_distortion=None,
+        latent_distortion_kwargs=None,
         **kwargs,
     ):
         super().__init__(model, poolsize=poolsize, **kwargs)
         self.sum_mirror_density = bool(sum_mirror_density)
+        self.threshold_from_live_points = bool(threshold_from_live_points)
+        self.current_live_points = None
+        self.configure_latent_distortion(
+            latent_distortion, latent_distortion_kwargs, latent_temperature
+        )
+        self.population_truncation_history = []
         logger.debug("Initialising FlowProposal")
         self._warn_for_deprecated_latent_prior(latent_prior)
 
@@ -669,6 +695,53 @@ class FlowProposal(BaseFlowProposal):
         log_q[todo] = np.asarray(lq, dtype=float) + log_j[rows]
         return log_q
 
+    def configure_latent_distortion(
+        self, latent_distortion=None, latent_distortion_kwargs=None,
+        latent_temperature=None,
+    ) -> None:
+        """Validate and store the latent-distortion settings."""
+        from .latent_distortion import MODES
+
+        if latent_distortion is not None:
+            if latent_distortion not in MODES:
+                raise ValueError(
+                    f"latent_distortion must be None or one of {MODES}"
+                )
+            if latent_temperature not in (None, 1.0):
+                raise ValueError(
+                    "latent_distortion replaces the latent temperature: "
+                    "set latent_temperature to None or 1"
+                )
+        self.latent_distortion = latent_distortion
+        self.latent_distortion_kwargs = dict(latent_distortion_kwargs or {})
+        self.latent_distortion_params = None
+        self.latent_distortion_history = []
+
+    def _record_truncation_diagnostics(self, n_clipped, log_cap) -> None:
+        """Per pool: the clipped share of the pool (clip mode) and the live
+        points outside the log-proposal cut."""
+        n = len(self.x) if self.x is not None else 0
+        self.population_clipped_share = (
+            n_clipped / n if np.isfinite(log_cap) and n else np.nan
+        )
+        rule = self._truncation_scheme.get_rule("log_proposal_threshold")
+        entry = dict(
+            populated_count=int(self.populated_count),
+            training_count=int(self.training_count),
+            clipped_share=float(self.population_clipped_share),
+            excluded_live_fraction=float(
+                getattr(rule, "excluded_live_fraction", np.nan)
+            ),
+            excluded_live_mean_rank=float(
+                getattr(rule, "excluded_live_mean_rank", np.nan)
+            ),
+            roundtrip_discarded=int(getattr(rule, "roundtrip_discarded", 0)),
+        )
+        if not hasattr(self, "population_truncation_history"):
+            self.population_truncation_history = []
+        self.population_truncation_history.append(entry)
+        logger.debug("Pool truncation diagnostics: %s", entry)
+
     def _warn_max_samples(self, max_samples):
         """Warn that a pool stopped at ``max_samples`` draws, once per
         training round: the pools of one flow all hit it alike."""
@@ -723,6 +796,9 @@ class FlowProposal(BaseFlowProposal):
         adapt_full_z = []
         adapt_surv_z = []
         adapt_surv_log_w = []
+        log_cap = self._truncation_scheme.log_weight_cap
+        clipped_all = np.empty(0, dtype=bool)
+        n_clipped = 0
 
         while n_accepted < n_samples:
             # a batch is never larger than the pool: ``drawsize`` caps it
@@ -770,6 +846,12 @@ class FlowProposal(BaseFlowProposal):
                     continue
 
             log_w = self.compute_weights(x, log_q)
+            # clip mode of a truncation rule: weights above the cap are
+            # clipped to it instead of the draws being dropped
+            clipped = np.zeros(len(log_w), dtype=bool)
+            if np.isfinite(log_cap):
+                clipped = log_w > log_cap
+                log_w = np.minimum(log_w, log_cap)
 
             if self.adapt_latent_temperature:
                 adapt_surv_z.append(np.asarray(z, dtype=float))
@@ -778,6 +860,7 @@ class FlowProposal(BaseFlowProposal):
             if self.accumulate_weights:
                 samples = np.concatenate([samples, x])
                 log_weights = np.concatenate([log_weights, log_w])
+                clipped_all = np.concatenate([clipped_all, clipped])
                 log_weights_rejection = self._get_population_log_weights(
                     log_weights,
                     min_yield=n_proposed * n_samples / max_samples,
@@ -807,6 +890,7 @@ class FlowProposal(BaseFlowProposal):
                 n_accept_batch = accept.sum()
                 m = min(n_samples - n_accepted, n_accept_batch)
                 samples[n_accepted : n_accepted + m] = x[accept][:m]
+                n_clipped += int(clipped[accept][:m].sum())
                 n_accepted += n_accept_batch
                 logger.debug("n accepted: %s / %s", n_accepted, n_samples)
                 if n_proposed > max_samples:
@@ -824,8 +908,10 @@ class FlowProposal(BaseFlowProposal):
             logger.debug("Total number of samples: %s", samples.size)
             n_accepted = np.sum(accept)
             self.x = samples[accept][:n_samples]
+            n_clipped = int(clipped_all[accept][:n_samples].sum())
         else:
             self.x = samples[: min(n_accepted, n_samples)]
+        self._record_truncation_diagnostics(n_clipped, log_cap)
 
         if self.adapt_latent_temperature and adapt_full_z:
             full_z = np.concatenate(adapt_full_z)
@@ -1028,7 +1114,10 @@ class FlowProposal(BaseFlowProposal):
         self._truncation_scheme.reset()
 
     def __getstate__(self):
-        return super().__getstate__()
+        state = super().__getstate__()
+        # a reference to the sampler's live points, which it pickles itself
+        state["current_live_points"] = None
+        return state
 
     def __setstate__(self, state):
         # Back-fill the latent-temperature-adaptation attributes for resume
@@ -1041,4 +1130,11 @@ class FlowProposal(BaseFlowProposal):
         state.setdefault("latent_temperature_validation_size", None)
         state.setdefault("latent_temperature_warmup", 2)
         state.setdefault("latent_temperature_history", [])
+        state.setdefault("threshold_from_live_points", False)
+        state.setdefault("current_live_points", None)
+        state.setdefault("latent_distortion", None)
+        state.setdefault("latent_distortion_kwargs", {})
+        state.setdefault("latent_distortion_params", None)
+        state.setdefault("latent_distortion_history", [])
+        state.setdefault("population_truncation_history", [])
         self.__dict__.update(state)

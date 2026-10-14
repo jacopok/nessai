@@ -917,7 +917,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 else context.repeat(len(images), 1)
             )
             lp = (
-                self.base_flow.log_prob(u_all, context=ctx)
+                self._base_flow_log_prob(u_all, context=ctx)
                 + self._circular_log_det(t_all)
             ).view(len(images), n)
             return torch.logsumexp(lp, dim=0) + log_j
@@ -925,12 +925,12 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         # reflect dims are never circular: the sign patterns leave this alone
         log_j = log_j + self._circular_log_det(t)
         if self._sign_patterns is None:
-            return self.base_flow.log_prob(u, context=context) + log_j
+            return self._base_flow_log_prob(u, context=context) + log_j
         p = self._sign_patterns.shape[0]
         n, f = u.shape
         signs = self._sign_patterns.to(u.dtype)
         u_rep = (u.unsqueeze(0) * signs.unsqueeze(1)).reshape(p * n, f)
-        lp = self.base_flow.log_prob(u_rep, context=context).view(p, n)
+        lp = self._base_flow_log_prob(u_rep, context=context).view(p, n)
         return torch.logsumexp(lp, dim=0) + log_j
 
     def _apply_group_action(self, z_flat, modes_flat, inverse):
@@ -1404,6 +1404,85 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             self._log_domain_mass.fill_(log_z)
             self._domain_mass_seen = True
 
+    # Latent distortion (``set_latent_distortion``): the expert draws its
+    # base-flow latent as ``z' = mu + sigma * z`` with ``z`` standard, and
+    # scores with ``N(z'; mu, sigma^2)`` instead of ``N(z'; 0, I)``: an extra
+    # elementwise affine layer at the latent end of the base flow, so the
+    # density stays exact on every path (inverse, log_prob, at_element).
+    # Plain attributes, not buffers: the weights files keep their keys, and
+    # the proposal re-applies its stored distortion after a reload.
+    _latent_mu = None
+    _latent_log_sigma = None
+
+    def set_latent_distortion(self, mu=None, log_sigma=None):
+        """Set (``mu``, ``log_sigma``: ``[dims]`` arrays) or clear (``None``)
+        the latent distortion of the base flow."""
+        if mu is None:
+            self._latent_mu = self._latent_log_sigma = None
+            return
+        p = next(self.base_flow.parameters())
+        self._latent_mu = torch.as_tensor(mu, dtype=p.dtype, device=p.device)
+        self._latent_log_sigma = torch.as_tensor(
+            log_sigma, dtype=p.dtype, device=p.device
+        )
+
+    @property
+    def latent_distortion(self):
+        """``(mu, log_sigma)`` as numpy arrays, or ``None``."""
+        if self._latent_mu is None:
+            return None
+        return (
+            self._latent_mu.detach().cpu().numpy(),
+            self._latent_log_sigma.detach().cpu().numpy(),
+        )
+
+    def _distort_latent(self, z):
+        if self._latent_mu is None:
+            return z
+        return self._latent_mu + torch.exp(self._latent_log_sigma) * z
+
+    def _base_flow_log_prob(self, u, context=None):
+        """``base_flow.log_prob`` with the latent distortion applied."""
+        if self._latent_mu is None:
+            return self.base_flow.log_prob(u, context=context)
+        if context is not None:
+            raise NotImplementedError(
+                "latent distortion with a conditional flow"
+            )
+        noise, logabsdet = self.base_flow._transform(u)
+        std = (noise - self._latent_mu) / torch.exp(self._latent_log_sigma)
+        return (
+            self.base_flow._distribution.log_prob(std)
+            - self._latent_log_sigma.sum()
+            + logabsdet
+        )
+
+    @property
+    def supports_latent_components(self):
+        """Whether :meth:`latent_components` decomposes :meth:`log_prob`
+        exactly: one base-flow latent per point (no sign patterns or
+        symmetry images summed over)."""
+        return (
+            self._sign_patterns is None
+            and getattr(self, "base_symmetry", None) is None
+        )
+
+    @torch.no_grad()
+    def latent_components(self, x):
+        """``(log q(x), z(x))``: the undistorted density of prime points
+        ``x`` and the base-flow latent of each, for fitting a distortion:
+        under ``(mu, sigma)`` the density is ``log q(x) + Delta(z(x))``,
+        ``Delta(z) = sum_i log N(z_i; mu_i, sigma_i^2) - log N(z_i; 0, 1)``
+        (exact when :attr:`supports_latent_components`)."""
+        saved = self._latent_mu, self._latent_log_sigma
+        self._latent_mu = self._latent_log_sigma = None
+        try:
+            lp = self.log_prob(x)
+            z, _ = self.forward(x)
+        finally:
+            self._latent_mu, self._latent_log_sigma = saved
+        return lp, z
+
     def _mixture_log_prob_from_canonical(
         self,
         canon,
@@ -1600,9 +1679,14 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         assigned, pre, _ = self._assign_branch(x)
         canon = pre[assigned, torch.arange(x.shape[0], device=x.device)]
         t, _ = self._canon_to_base(canon)
-        return self.base_flow.forward(
+        z, log_j = self.base_flow.forward(
             self._standardise(t, assigned), context=context
         )
+        if self._latent_mu is not None:
+            # the latent the (distorted) draws are generated from
+            z = (z - self._latent_mu) / torch.exp(self._latent_log_sigma)
+            log_j = log_j - self._latent_log_sigma.sum()
+        return z, log_j
 
     def inverse(self, z, context=None):
         # ``log_j`` is set so that
@@ -1615,7 +1699,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             (z.shape[0],)
         )
 
-        u, _ = self.base_flow.inverse(z, context=context)
+        u, _ = self.base_flow.inverse(self._distort_latent(z), context=context)
         t = self._fold_symmetry(
             self._fold_reflect(self._destandardise(u, modes))
         )
@@ -2497,6 +2581,53 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
 
     def sample_latent_distribution(self, n, context=None):
         return self.experts[0].sample_latent_distribution(n, context=context)
+
+    def set_latent_distortion(self, mu=None, log_sigma=None):
+        """Per active expert latent distortion (``mu``, ``log_sigma``:
+        ``[experts, dims]``), or ``None`` to clear it on every expert (see
+        :meth:`DiscreteGroupMixtureFlowWrapper.set_latent_distortion`)."""
+        for j, e in enumerate(self.experts):
+            if mu is None or j >= len(mu):
+                e.set_latent_distortion(None)
+            else:
+                e.set_latent_distortion(mu[j], log_sigma[j])
+
+    @property
+    def latent_distortion(self):
+        act = self._active()
+        d = [self.experts[j].latent_distortion for j in range(act)]
+        if all(x is None for x in d):
+            return None
+        dims = self.num_features
+        mu = np.stack([np.zeros(dims) if x is None else x[0] for x in d])
+        ls = np.stack([np.zeros(dims) if x is None else x[1] for x in d])
+        return mu, ls
+
+    @property
+    def supports_latent_components(self):
+        return not self._bg_on() and all(
+            self.experts[j].supports_latent_components
+            for j in range(self._active())
+        )
+
+    @torch.no_grad()
+    def latent_components(self, x):
+        """``(lp [n, experts], z [n, experts, dims])``: each active expert's
+        undistorted ``log pi_j + log q_j(x)`` and base-flow latent; the
+        mixture density under a distortion is ``logsumexp_j (lp_j +
+        Delta_j(z_j))``."""
+        act = self._active()
+        # one active expert: log_prob is that expert's alone (no weight)
+        lw = (
+            torch.zeros(1, dtype=x.dtype, device=x.device) if act == 1
+            else torch.log(self.proposal_weights[:act].clamp_min(1e-38))
+        )
+        lps, zs = [], []
+        for j in range(act):
+            lp, z = self.experts[j].latent_components(x)
+            lps.append(lp + lw[j])
+            zs.append(z)
+        return torch.stack(lps, dim=-1), torch.stack(zs, dim=-2)
 
     # -- generative --------------------------------------------------
     def _draw_assignments(self, n, device):
