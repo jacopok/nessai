@@ -20,8 +20,12 @@ SIGMA_MAX]``) and L2-regularised towards the identity.
 Checks before a fit is used (otherwise the identity is kept):
 
 * a fit on one random half of the live points must raise the threshold on
-  the other half (``min_gain``) without excluding more than
-  ``max_excluded_factor * quantile`` of it;
+  the other half (``min_gain``), and the fraction of that half its cut
+  excludes may exceed the identity's (threshold from the first half too) by
+  at most ``max_excess_factor * quantile``: the paired difference, since
+  the excluded fraction of either alone is a count of a few points, too
+  noisy to gate on (on the v7x_v4 live sets the identity's alone exceeds
+  2 quantiles in some splits);
 * the decomposition must reproduce the flow's own distorted density on a
   subset of the live points (``exactness_tolerance``).
 
@@ -48,21 +52,26 @@ MODES = ("temperature", "shared", "expert")
 
 DEFAULT_KWARGS = dict(
     mode="expert",
-    tail=0.02,
-    reg=0.3,
+    tail=0.14,
+    reg=0.0035,
     steps=400,
     lr=0.05,
     min_gain=0.0,
-    max_excluded_factor=2.0,
+    max_excess_factor=1.0,
     exactness_tolerance=1e-3,
     n_exactness=500,
     seed=1234,
 )
-# tail / regularisation per mode (from the cross-validated replays)
+# tail / regularisation per mode. Expert: from a tuning study over the live
+# sets of the nine replicate_Delta_v7x_v4 checkpoints, scored by the
+# held-out, gated threshold gain weighted by each run's population time
+# (xG_inference population_acceptance/tune_distortion.py: 0.71 -> 0.60 of
+# the undistorted population time on fresh splits; the optimal tail is
+# 0.1-0.2, a fit to the lowest 2% overfits); the others from the replays.
 MODE_DEFAULTS = {
     "temperature": dict(tail=0.01, reg=1e-3),
     "shared": dict(tail=0.05, reg=0.03),
-    "expert": dict(tail=0.02, reg=0.3),
+    "expert": dict(tail=0.14, reg=0.0035),
 }
 
 
@@ -258,14 +267,20 @@ def fit_and_check(proposal, x, quantile, **kwargs):
     )
     t_a = np.quantile(levels(mu_a, ls_a, a), quantile)
     outside = float(np.mean(lev_b < t_a))
-    info.update(heldout_gain=gain, heldout_excluded=outside)
+    outside_id = float(np.mean(
+        levels(zero, zero, b) < np.quantile(levels(zero, zero, a), quantile)
+    ))
+    excess = outside - outside_id
+    info.update(heldout_gain=gain, heldout_excluded=outside,
+                heldout_excess=excess)
     if not gain > opts["min_gain"]:
         info["reason"] = f"held-out gain {gain:.3g} <= {opts['min_gain']}"
         return None, None, info
-    if outside > opts["max_excluded_factor"] * quantile:
+    if excess > opts["max_excess_factor"] * quantile:
         info["reason"] = (
-            f"held-out excluded fraction {outside:.3g} > "
-            f"{opts['max_excluded_factor']} x {quantile}"
+            f"held-out excluded fraction {outside:.3g} exceeds the "
+            f"identity's ({outside_id:.3g}) by more than "
+            f"{opts['max_excess_factor']} x {quantile}"
         )
         return None, None, info
 
