@@ -188,3 +188,30 @@ def test_fit_broadens_for_wide_target(mode):
                        - log_p, 0.01)
     new = np.quantile(LD.log_q_distorted(lp, z, mu, ls, real) - log_p, 0.01)
     assert new > base + 1.0
+
+
+def test_roundtrip_failure_keeps_draws(monkeypatch, caplog):
+    """A failing round-trip check does not stop the population: the draws
+    are kept and a warning is logged once."""
+    from nessai.proposal.flowproposal import latent_distortion
+
+    rng = np.random.default_rng(5)
+    proposal = _proposal(_arr(rng.uniform(-1, 1, 1000)))
+    rule = LogProposalThresholdTruncation(
+        quantile=0.05, prior_relative=True, mode="clip"
+    )
+    rule.prepare(proposal, worst_point=None)
+
+    def boom(*args):
+        raise IndexError("table lookup")
+
+    monkeypatch.setattr(latent_distortion, "roundtrip_gap", boom)
+    x = _arr(np.linspace(-1.5, 1.5, 31))
+    log_q = -x["x"] ** 2
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            out, _, _ = rule.apply_after_backward(
+                proposal, x, log_q, np.zeros((len(x), 1))
+            )
+            assert len(out) == len(x)
+    assert sum("Round-trip check failed" in r.message for r in caplog.records) == 1

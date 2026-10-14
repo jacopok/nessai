@@ -305,7 +305,13 @@ def roundtrip_gap(proposal, x, z):
     if not supports_distortion(model) or not len(x):
         return None
     real = np.asarray(proposal.latent_real_mask, dtype=bool)
+    n = len(x)
+    if n == 1:
+        # some reparameterisations' table lookups fail on a single point
+        x, z = np.concatenate([x, x]), np.concatenate([z, z])
     lpf, zf = components(proposal, x)  # (sides, n, E, D), undistorted noise
+    lpf, zf = lpf[:, :n], zf[:, :n]
+    z = np.asarray(z)[:n]
     zf = np.where(np.isfinite(lpf)[..., None], zf, np.inf)
     dist = model.latent_distortion
     if dist is not None:

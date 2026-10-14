@@ -1441,6 +1441,18 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             return z
         return self._latent_mu + torch.exp(self._latent_log_sigma) * z
 
+    def _base_flow_sample(self, n, context=None):
+        """``base_flow.sample`` with the latent distortion applied."""
+        if self._latent_mu is None:
+            return self.base_flow.sample(n, context=context)
+        z = torch.as_tensor(
+            np.asarray(self.base_flow.sample_latent_distribution(n)),
+            dtype=self._latent_mu.dtype,
+            device=self._latent_mu.device,
+        )
+        u, _ = self.base_flow.inverse(self._distort_latent(z), context=context)
+        return u
+
     def _base_flow_log_prob(self, u, context=None):
         """``base_flow.log_prob`` with the latent distortion applied."""
         if self._latent_mu is None:
@@ -1581,7 +1593,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     def sample_and_log_prob(self, num_samples, context=None):
         if self._truncate:
             return self._sample_and_log_prob_truncated(num_samples, context)
-        u = self.base_flow.sample(num_samples, context=context)
+        u = self._base_flow_sample(num_samples, context=context)
         modes = Categorical(probs=self.proposal_weights).sample(
             (num_samples,)
         )
@@ -1621,7 +1633,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                     torch.exp(self._log_domain_mass).clamp(min=1e-3)
                 )
             n_draw = int(math.ceil(need / z_guess * 1.3)) + 32
-            u = self.base_flow.sample(n_draw, context=context)
+            u = self._base_flow_sample(n_draw, context=context)
             modes = Categorical(probs=self.proposal_weights).sample((n_draw,))
             t = self._fold_symmetry(
                 self._fold_reflect(self._destandardise(u, modes))

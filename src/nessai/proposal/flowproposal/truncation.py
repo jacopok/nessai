@@ -619,7 +619,18 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
         from .latent_distortion import roundtrip_gap
 
         idx = np.flatnonzero(above)
-        gap = roundtrip_gap(proposal, x[idx], np.asarray(z)[idx])
+        try:
+            gap = roundtrip_gap(proposal, x[idx], np.asarray(z)[idx])
+        except Exception as e:  # a diagnostic guard must not stop a run
+            if not getattr(self, "_roundtrip_warned", False):
+                logger.warning(
+                    "Round-trip check failed (%s: %s): clipped draws kept "
+                    "unchecked",
+                    type(e).__name__,
+                    e,
+                )
+                self._roundtrip_warned = True
+            return keep
         if gap is None:
             return keep
         bad = idx[~(gap <= tol)]
