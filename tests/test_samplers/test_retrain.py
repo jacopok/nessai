@@ -329,6 +329,34 @@ def test_measure_retrain_costs_without_population(
     assert model["population"] == pytest.approx(0.02)
 
 
+def test_measure_retrain_costs_with_pool(
+    integration_model, flow_config, tmp_path
+):
+    """The likelihood is timed on a pool of n_pool processes, as in the
+    run, and the pool is closed afterwards."""
+    from unittest.mock import patch
+
+    from nessai.samplers.retrain_benchmark import measure_retrain_costs
+
+    configure = integration_model.configure_pool
+    with patch.object(
+        integration_model, "configure_pool", side_effect=configure
+    ) as mock_configure:
+        costs = measure_retrain_costs(
+            integration_model,
+            nlive=100,
+            flow_config=flow_config,
+            epochs=2,
+            measure_population=False,
+            n_pool=2,
+        )
+    mock_configure.assert_called_once_with(n_pool=2)
+    assert costs["likelihood"] > 0
+    assert integration_model.pool is None
+    assert not integration_model._pool_configured
+    assert integration_model.likelihood_evaluations == 0
+
+
 @pytest.mark.slow_integration_test
 def test_retrain_benchmark_cli(tmp_path):
     from nessai.samplers.retrain_benchmark import main

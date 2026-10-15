@@ -16,6 +16,11 @@ The measurement takes roughly the time of one training plus one pool
 population. The per-iteration overhead of the sampler, which the in-run
 measurement includes in the population cost, is not measured, so the
 population cost is slightly underestimated.
+
+The costs are wall-clock times, as measured during the run: with
+``n_pool`` the likelihood is evaluated on a pool of that many processes, as
+it is in the run, rather than serially, which would overestimate its cost by
+about the parallel speed-up.
 """
 
 import argparse
@@ -61,6 +66,7 @@ def measure_retrain_costs(
     filename=None,
     output=None,
     measure_population=True,
+    n_pool=None,
     **kwargs,
 ):
     """Measure the unit costs of likelihood, pool population and training.
@@ -96,6 +102,10 @@ def measure_retrain_costs(
         weights can be far more heavy-tailed than any of the run's, which
         makes its population cost unrepresentative with a mass-controlled
         weight cap (``population_weight_cap_mass``).
+    n_pool : int, optional
+        Number of processes of the run's likelihood pool. If the model has
+        no pool, one with this many processes is used for the benchmark
+        and closed afterwards. If the model already has a pool, it is used.
     kwargs :
         Other keyword arguments of the run. Those accepted by the proposal
         class (e.g. ``poolsize``, ``reparameterisations``) are used.
@@ -121,6 +131,15 @@ def measure_retrain_costs(
     model_rng = getattr(model, "rng", None)
     model.rng = rng
     tmp = None
+    own_pool = False
+    if (
+        n_pool is not None
+        and n_pool > 1
+        and getattr(model, "pool", None) is None
+        and not getattr(model, "_pool_configured", False)
+    ):
+        model.configure_pool(n_pool=n_pool)
+        own_pool = True
     if output is None:
         tmp = tempfile.TemporaryDirectory()
         output = tmp.name
@@ -135,7 +154,10 @@ def measure_retrain_costs(
         )
         proposal.initialise()
 
-        # Likelihood
+        # Likelihood. A first batch warms up the pool workers (imports,
+        # caches), which the run pays only once.
+        warm = model.new_point(N=2 * (getattr(model, "n_pool", None) or 1))
+        model.batch_evaluate_log_likelihood(warm)
         x = model.new_point(N=max(n_likelihood, nlive))
         x["logP"] = model.batch_evaluate_log_prior(x)
         t0 = model.likelihood_evaluation_time
@@ -172,6 +194,8 @@ def measure_retrain_costs(
             n_points = max(int(proposal.samples.size), 1)
             population = max(t_pop - t_like_pop, 0.0) / n_points
     finally:
+        if own_pool:
+            model.close_pool()
         model.likelihood_evaluations = n_evals
         model.likelihood_evaluation_time = t_evals
         model.rng = model_rng
