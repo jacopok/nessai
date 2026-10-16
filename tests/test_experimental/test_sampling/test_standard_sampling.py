@@ -16,7 +16,7 @@ def test_sampling_with_clusteringflowproposal(integration_model, tmp_path):
         maximum_uninformed=100,
         seed=1234,
         max_iteration=200,
-        flow_proposal_class="clusteringflowproposal",
+        flow_class="clusteringflowproposal",
     )
     fp.run()
     assert isinstance(fp.ns.proposal, ClusteringFlowProposal)
