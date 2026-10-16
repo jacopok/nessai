@@ -107,7 +107,7 @@ class NestedSampler(BaseNestedSampler):
     uninformed_proposal_kwargs : dict, ({})
         Dictionary of keyword argument to pass to the class use for
         the initial sampling when it is initialised.
-    flow_class : :obj:`nessai.proposal.FlowProposal`
+    flow_proposal_class : :obj:`nessai.proposal.FlowProposal`
         Class to use for flow-based proposal method
     flow_config : dict ({})
         Dictionary used to configure instance of `nessai.flowmodel.FlowModel`,
