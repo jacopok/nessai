@@ -735,6 +735,7 @@ class FlowProposal(BaseFlowProposal):
             excluded_live_mean_rank=float(
                 getattr(rule, "excluded_live_mean_rank", np.nan)
             ),
+            lost_live_mass=float(getattr(rule, "lost_live_mass", np.nan)),
             roundtrip_discarded=int(getattr(rule, "roundtrip_discarded", 0)),
         )
         if not hasattr(self, "population_truncation_history"):

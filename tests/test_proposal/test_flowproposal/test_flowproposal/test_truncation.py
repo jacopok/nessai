@@ -554,6 +554,84 @@ def test_log_proposal_threshold_prior_relative():
         np.concatenate([log_q_of(live), -(live["x"] + 4) ** 2]), 0.1))
 
 
+def _prior_relative_proposal(live_x):
+    """Mock proposal on a line with log q = -x**2 and a flat prior, so the
+    level (log q - log prior) of a point is -x**2."""
+    from nessai.livepoint import empty_structured_array
+
+    live = empty_structured_array(len(live_x), names=["x"])
+    live["x"] = live_x
+    proposal = MagicMock()
+    proposal.training_data = live
+    proposal.latent_temperature = None
+    proposal.forward_pass = MagicMock(
+        side_effect=lambda x: (np.zeros((len(x), 1)), -x["x"] ** 2))
+    proposal.compute_weights = MagicMock(side_effect=lambda x, log_q: -log_q)
+    return proposal
+
+
+@pytest.mark.parametrize("mode", ["clip", "drop"])
+def test_log_proposal_threshold_lost_mass(mode):
+    """``lost_mass`` sets the threshold at which the live points' mean lost
+    share is the target: ``1 - min(1, c / w)`` in clip mode, the share below
+    the threshold (a quantile) in drop mode."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    live_x = np.random.default_rng(4).normal(size=2000)
+    proposal = _prior_relative_proposal(live_x)
+    level = -live_x**2
+    rule = LogProposalThresholdTruncation(
+        quantile=0.5, prior_relative=True, mode=mode, lost_mass=0.01)
+    rule.prepare(proposal, worst_point=None)
+    t = rule.threshold
+    if mode == "clip":
+        lost = np.mean(1 - np.minimum(1, np.exp(level - t)))
+        assert lost == pytest.approx(0.01, rel=1e-4)
+        # the clip only underweights the points beyond its cap, so losing as
+        # much needs a lower cap (higher threshold) than the drop's quantile
+        assert t > np.quantile(level, 0.01)
+        assert rule.log_weight_cap == -t
+    else:
+        assert t == pytest.approx(np.quantile(level, 0.01))
+    assert rule.lost_live_mass == pytest.approx(0.01, rel=1e-3)
+
+
+def test_log_proposal_threshold_lost_mass_recorded_with_quantile():
+    """Set by ``quantile``, the rule still records the mass it loses."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    live_x = np.random.default_rng(5).normal(size=2000)
+    rule = LogProposalThresholdTruncation(
+        quantile=0.005, prior_relative=True, mode="clip")
+    rule.prepare(_prior_relative_proposal(live_x), worst_point=None)
+    level = -live_x**2
+    expected = np.mean(1 - np.minimum(1, np.exp(level - rule.threshold)))
+    assert rule.lost_live_mass == pytest.approx(expected)
+    assert 0 < rule.lost_live_mass < 0.005
+
+
+def test_log_proposal_threshold_lost_mass_validation_and_old_pickles():
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    with pytest.raises(ValueError, match="prior_relative"):
+        LogProposalThresholdTruncation(lost_mass=0.01)
+    with pytest.raises(ValueError, match=r"\(0, 1\)"):
+        LogProposalThresholdTruncation(prior_relative=True, lost_mass=1.5)
+    # a rule pickled before the option existed uses its quantile
+    live_x = np.random.default_rng(6).normal(size=500)
+    rule = LogProposalThresholdTruncation(
+        quantile=0.1, prior_relative=True, mode="clip")
+    del rule.lost_mass
+    rule.prepare(_prior_relative_proposal(live_x), worst_point=None)
+    assert rule.threshold == pytest.approx(np.quantile(-live_x**2, 0.1))
+
+
 # -- log_level_threshold ------------------------------------------------------
 def _level_proposal(live_x, weights, with_pieces=True):
     """Mock two-piece proposal on a line: piece 1 is x < 0, the flow level is

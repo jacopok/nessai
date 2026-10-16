@@ -495,11 +495,26 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
     (``roundtrip_tolerance`` on the latent norm; a numerical failure of the
     inverse, whose density is then wrong) is discarded.
 
+    ``lost_mass`` (prior-relative only) sets the cap from the share of the
+    likelihood-restricted prior the pool loses instead of from ``quantile``:
+    the live points sample that distribution, and a point with weight ``w``
+    keeps ``min(1, c / w)`` of its mass under the clip (all or none under a
+    drop), so the threshold is the one at which the live points' mean lost
+    share ``E[1 - min(1, c / w)]`` (``drop``: the share above the cap, the
+    quantile itself) equals ``lost_mass``. It averages over the whole upper
+    tail of the weights rather than resting on the few live points beyond a
+    small quantile. In checkpoint replays (xg_pe ``scripts/weight_gate``) the
+    0.5% quantile in clip mode lost 2-4e-3 of the mass; the cost of an
+    iteration grows roughly as ``lost_mass^-0.6`` to ``^-3`` below that.
+    ``quantile`` still sets the latent distortion's target.
+
     ``prepare`` records the live points outside the cap:
     ``excluded_live_fraction`` and ``excluded_live_mean_rank`` (their mean
     likelihood rank in [0, 1]; 0.5 if spread evenly). A rank well below 0.5
     means the excluded region lies at the low-likelihood edge, which biases
-    the compression of a drop cut.
+    the compression of a drop cut. ``lost_live_mass`` is the estimated share
+    of the likelihood-restricted prior lost at the threshold (prior-relative
+    only), whichever rule set it.
     """
 
     name = "log_proposal_threshold"
@@ -512,6 +527,7 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
         prior_relative: bool = False,
         mode: str = "drop",
         roundtrip_tolerance: float | None = 2.0,
+        lost_mass: float | None = None,
     ) -> None:
         super().__init__()
         self.quantile = float(quantile)
@@ -520,12 +536,20 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
             raise ValueError(f"mode must be one of {self._modes}")
         if mode == "clip" and not self.prior_relative:
             raise ValueError("mode='clip' requires prior_relative=True")
+        if lost_mass is not None:
+            if not self.prior_relative:
+                raise ValueError("lost_mass requires prior_relative=True")
+            if not 0 < lost_mass < 1:
+                raise ValueError("lost_mass must be in (0, 1)")
+            lost_mass = float(lost_mass)
+        self.lost_mass = lost_mass
         self.mode = mode
         self.roundtrip_tolerance = (
             None if roundtrip_tolerance is None else float(roundtrip_tolerance)
         )
         self.excluded_live_fraction = np.nan
         self.excluded_live_mean_rank = np.nan
+        self.lost_live_mass = np.nan
         self.roundtrip_discarded = 0
 
     @property
@@ -569,8 +593,46 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
                 )
             live_points = np.tile(live_points, len(log_q) // n)
         level = self._levels(proposal, live_points, log_q)
-        self._threshold = float(np.quantile(level, self.quantile))
+        target = getattr(self, "lost_mass", None)
+        if target is not None and len(level):
+            self._threshold = self._threshold_for_lost_mass(level, target)
+        else:
+            self._threshold = float(np.quantile(level, self.quantile))
         self._record_excluded(live_points, level)
+        if getattr(self, "prior_relative", False) and len(level):
+            self.lost_live_mass = float(self._lost_mass(level, self._threshold))
+
+    def _lost_mass(self, level, threshold):
+        """Mean share of the live points' mass lost at ``threshold`` (levels
+        ``-ln w``, cap ``ln c = -threshold``): ``1 - min(1, c / w)`` each in
+        clip mode, all of it below the threshold in drop mode."""
+        level = np.asarray(level, dtype=float)
+        if not self.clip:
+            return float(np.mean(level < threshold))
+        return float(np.mean(-np.expm1(np.minimum(level - threshold, 0.0))))
+
+    def _threshold_for_lost_mass(self, level, target, tol=1e-6):
+        """The threshold at which :meth:`_lost_mass` equals ``target``: the
+        loss grows with the threshold, so bisect between the smallest and
+        the largest finite level (clamped there when out of reach)."""
+        level = np.asarray(level, dtype=float)
+        finite = level[np.isfinite(level)]
+        if not len(finite):
+            return float(np.quantile(level, self.quantile))
+        if not self.clip:
+            return float(np.quantile(level, target))
+        lo, hi = float(finite.min()), float(finite.max())
+        if self._lost_mass(level, lo) >= target:
+            return lo
+        if self._lost_mass(level, hi) <= target:
+            return hi
+        while hi - lo > tol:
+            mid = 0.5 * (lo + hi)
+            if self._lost_mass(level, mid) < target:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
 
     def _record_excluded(self, live_points, level):
         """Fraction and mean likelihood rank of the live points (and mirror
