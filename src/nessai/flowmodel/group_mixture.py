@@ -1203,14 +1203,47 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                     self._canon_mean[idx]
                     + _wrap_angle(mean[idx] - self._canon_mean[idx]),
                 )
-            self._canon_mean.mul_(1 - beta).add_(beta * mean)
-            self._canon_std.mul_(1 - beta).add_(beta * std)
+            # A coordinate whose frame moved since the last round (e.g. a
+            # phase or arrival time re-referenced to another frequency before
+            # this training) restarts from this round's values: averaged with
+            # the old frame's, its centre would lag by a fraction of the jump,
+            # which for a tightly measured angle can be many Möbius scales and
+            # sends the points to the far side of the circle.
+            jump = self._frame_jump(mean, std)
+            new_mean = self._canon_mean * (1 - beta) + beta * mean
+            new_std = self._canon_std * (1 - beta) + beta * std
+            self._canon_mean.copy_(torch.where(jump, mean, new_mean))
+            self._canon_std.copy_(torch.where(jump, std, new_std))
             if idx is not None:
                 self._canon_mean[idx] = _wrap_angle(self._canon_mean[idx])
+            if bool(jump.any()):
+                logger.info(
+                    "Group mixture: standardisation restarted for %s (frame "
+                    "moved since the last round)",
+                    [self.param_names[i] for i in jump.nonzero().flatten()],
+                )
         else:
             self._canon_mean.copy_(mean)
             self._canon_std.copy_(std)
             self._canon_seen.fill_(True)
+
+    #: A coordinate's standardisation restarts instead of being averaged
+    #: when its centre moved by more than this many of its new standard
+    #: deviations (Möbius scales for the circular angles) since the last
+    #: round, or its scale changed by more than this factor.
+    _frame_jump_shift = 1.0
+    _frame_jump_ratio = 2.0
+
+    def _frame_jump(self, mean, std):
+        """Per-coordinate: has the frame moved since the stored round?
+        (``mean`` is already unwrapped next to the stored circular means.)"""
+        shift = (mean - self._canon_mean).abs() / std
+        ratio = std / self._canon_std
+        return (
+            (shift > self._frame_jump_shift)
+            | (ratio > self._frame_jump_ratio)
+            | (ratio < 1 / self._frame_jump_ratio)
+        )
 
     def _update_shear(self, t, seen):
         """Refit the curvature shear to base-frame points ``t``, averaged

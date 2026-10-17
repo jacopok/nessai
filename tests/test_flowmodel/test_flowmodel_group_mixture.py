@@ -901,10 +901,8 @@ def test_update_base_standardisation_pools_all_branches(base_flow):
     assert float(w._canon_mean[1]) == pytest.approx(pooled_y.mean(), abs=1e-3)
 
 
-def test_update_base_standardisation_ema_across_rounds(base_flow):
-    """A second round exponentially averages into the first, rather than
-    overwriting it outright."""
-    w = DiscreteGroupMixtureFlowWrapper(
+def _ema_wrapper(base_flow):
+    return DiscreteGroupMixtureFlowWrapper(
         base_flow=base_flow,
         num_features=2,
         group_action_fn=shift_group_action,
@@ -912,26 +910,36 @@ def test_update_base_standardisation_ema_across_rounds(base_flow):
         param_names=["x", "y"],
         in_fundamental_domain=in_fundamental_domain,
     )
-    rng = np.random.default_rng(0)
-    branches1 = [
-        _branch_data_with_mean(rng, k, 400, 0.0, 0.1)
-        for k in range(GROUP_SIZE)
-    ]
-    w.update_base_standardisation(
-        torch.tensor(np.concatenate(branches1), dtype=torch.float32)
-    )
-    assert float(w._canon_mean[1]) == pytest.approx(0.0, abs=0.05)
 
-    branches2 = [
-        _branch_data_with_mean(rng, k, 400, 5.0, 0.1)
-        for k in range(GROUP_SIZE)
-    ]
-    w.update_base_standardisation(
-        torch.tensor(np.concatenate(branches2), dtype=torch.float32)
-    )
+
+def _two_rounds(w, mean2):
+    rng = np.random.default_rng(0)
+    for mean in (0.0, mean2):
+        branches = [
+            _branch_data_with_mean(rng, k, 400, mean, 0.1)
+            for k in range(GROUP_SIZE)
+        ]
+        w.update_base_standardisation(
+            torch.tensor(np.concatenate(branches), dtype=torch.float32)
+        )
+
+
+def test_update_base_standardisation_ema_across_rounds(base_flow):
+    """A second round that moved by less than its spread exponentially
+    averages into the first, rather than overwriting it outright."""
+    w = _ema_wrapper(base_flow)
+    _two_rounds(w, 0.05)
     beta = float(w._canon_ema)
-    # moved towards 5.0 by exactly one EMA step, not snapped to it.
-    assert float(w._canon_mean[1]) == pytest.approx(beta * 5.0, abs=0.1)
+    # moved towards 0.05 by one EMA step, not snapped to it.
+    assert float(w._canon_mean[1]) == pytest.approx(beta * 0.05, abs=0.01)
+
+
+def test_update_base_standardisation_restarts_on_frame_jump(base_flow):
+    """A second round many standard deviations away (the coordinate's frame
+    moved) restarts the standardisation instead of lagging behind it."""
+    w = _ema_wrapper(base_flow)
+    _two_rounds(w, 5.0)
+    assert float(w._canon_mean[1]) == pytest.approx(5.0, abs=0.05)
 
 
 def test_update_base_standardisation_skips_when_too_few_claimed(base_flow):
