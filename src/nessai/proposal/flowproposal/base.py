@@ -1423,19 +1423,36 @@ class BaseFlowProposal(RejectionProposal):
         self.initialise(resumed=True)
 
         if weights_file is None:
-            weights_file = self.weights_file
+            weights_file = self._own_weights_file(self.weights_file)
 
         # Flow might have exited before any weights were saved.
-        if weights_file is not None:
-            if os.path.exists(weights_file):
-                self.flow.reload_weights(weights_file)
+        if weights_file is not None and os.path.exists(weights_file):
+            self.flow.reload_weights(weights_file)
         else:
-            logger.warning("Could not reload weights for flow")
+            logger.warning(
+                f"Could not reload weights for flow (from {weights_file})"
+            )
         params = getattr(self, "latent_distortion_params", None)
         if params is not None:
             model = getattr(getattr(self, "flow", None), "model", None)
             if hasattr(model, "set_latent_distortion"):
                 model.set_latent_distortion(*params)
+
+    def _own_weights_file(self, weights_file):
+        """The weights file of this run: ``weights_file`` (an absolute path
+        saved by the checkpoint) moved into the current output directory
+        when the run was resumed elsewhere (a copied run directory). The
+        saved path would otherwise point to the original run, whose flow
+        may have been retrained since, or does not exist."""
+        if weights_file is None or not getattr(self, "output", None):
+            return weights_file
+        own = os.path.join(self.output, os.path.basename(weights_file))
+        if os.path.abspath(own) != os.path.abspath(weights_file) and (
+            os.path.exists(own)
+        ):
+            logger.info(f"Reloading the flow from {own}, not {weights_file}")
+            return own
+        return weights_file
 
     def reset(self):
         """Reset the proposal"""
