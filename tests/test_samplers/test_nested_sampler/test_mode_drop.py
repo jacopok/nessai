@@ -1,7 +1,9 @@
 """Tests for the drop of under-covered dying modes."""
 
+import os
 from unittest.mock import MagicMock, create_autospec
 
+import h5py
 import numpy as np
 import pytest
 
@@ -248,9 +250,12 @@ def test_sampling_with_mode_drop(integration_model, flow_config, tmp_path):
         ),
         max_iteration=1500,
     )
-    fs.run(plot=False, save=False)
+    fs.run(plot=False, save=True)
     drops = fs.ns.mode_drops
     assert drops
+    with h5py.File(os.path.join(fs.output, "result.hdf5"), "r") as f:
+        saved = f["mode_drops"][()]
+    np.testing.assert_array_equal(saved["share"], [d["share"] for d in drops])
     removed = fs.ns.state.removed_volumes
     assert [f for _, f in removed] == [d["share"] for d in drops]
     assert fs.ns._log_volume_dropped == pytest.approx(

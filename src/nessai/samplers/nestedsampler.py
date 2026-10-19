@@ -1838,7 +1838,21 @@ class NestedSampler(BaseNestedSampler):
         d["information"] = self.information
         d["training_time"] = self.training_time.total_seconds()
         d["population_time"] = self.proposal_population_time.total_seconds()
-        d["mode_drops"] = list(getattr(self, "mode_drops", []))
+        drops = getattr(self, "mode_drops", [])
+        fields = [
+            ("iteration", "i8"),
+            ("n", "i8"),
+            ("share", "f8"),
+            ("posterior_bound", "f8"),
+            ("level_median", "f8"),
+            ("mode_level_median", "f8"),
+            ("mode_logL_max", "f8"),
+            ("logL_max", "f8"),
+            ("mode_mean_rank", "f8"),
+        ]
+        d["mode_drops"] = np.array(
+            [tuple(r[k] for k, _ in fields) for r in drops], dtype=fields
+        )
         return d
 
     @classmethod
