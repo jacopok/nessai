@@ -137,6 +137,8 @@ class _NSIntegralState(_BaseNSIntegralState):
         self.log_vols = [0.0]  # Volumes enclosed by contours
         self.nlive = []
         self.gradients = [0]
+        # (index into logLs of the contour, fraction) of each remove_volume
+        self.removed_volumes = []
 
     @property
     def log_evidence(self):
@@ -189,6 +191,25 @@ class _NSIntegralState(_BaseNSIntegralState):
                 (self.logLs[-1] - self.logLs[-2])
                 / (self.log_vols[-1] - self.log_vols[-2])
             )
+
+    def remove_volume(self, fraction):
+        """Remove ``fraction`` of the volume enclosed by the current contour.
+
+        For live points taken out of the run (not replaced by a dead point):
+        their share of the live points estimates the share of the volume
+        they stood for. The running estimate (:meth:`increment`) leaves the
+        removed volume's evidence out; :meth:`finalise` and the posterior
+        weights attribute the volume to the interval between the last dead
+        point and the next one, at the contour's likelihood. Either way the
+        error is below the removed region's evidence, which the caller must
+        bound.
+        """
+        if not 0 <= fraction < 1:
+            raise ValueError(f"fraction must be in [0, 1), got {fraction}")
+        self.logw += np.log1p(-fraction)
+        if not hasattr(self, "removed_volumes"):
+            self.removed_volumes = []
+        self.removed_volumes.append((len(self.logLs) - 1, float(fraction)))
 
     def get_logx_live_points(self, nlive: int):
         """Get the log-prior volume of the current live points.

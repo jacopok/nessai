@@ -222,3 +222,28 @@ def test_log_posterior_weights(ns_state):
     # Output should one shorted than logL since the initial point is not a
     # nested sample.
     assert len(out) == (len(logL) - 1)
+
+
+def test_remove_volume():
+    """Removing a share of the volume shifts log X by log(1 - share), and
+    the trapezoid rule attributes it to the next interval at the contour."""
+    nlive = 10
+    state = _NSIntegralState(nlive)
+    for logl in (-3.0, -2.0):
+        state.increment(logl)
+    state.remove_volume(0.2)
+    assert state.logw == pytest.approx(-2 / nlive + np.log(0.8))
+    assert state.removed_volumes == [(2, 0.2)]
+    state.increment(-1.0)
+    assert state.log_vols[-1] == pytest.approx(-3 / nlive + np.log(0.8))
+    # the interval after the removal holds the removed volume
+    vols = np.exp(state.log_vols)
+    assert vols[2] - vols[3] == pytest.approx(
+        np.exp(-2 / nlive) * (1 - 0.8 * np.exp(-1 / nlive))
+    )
+
+
+@pytest.mark.parametrize("fraction", [-0.1, 1.0])
+def test_remove_volume_invalid(fraction):
+    with pytest.raises(ValueError, match="fraction"):
+        _NSIntegralState(10).remove_volume(fraction)

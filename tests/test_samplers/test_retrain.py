@@ -487,3 +487,21 @@ def test_fresh_predictor_missing_after_unpickling(rng):
     del d.__dict__["fresh_predictor"]
     d = pickle.loads(pickle.dumps(d))
     assert d.fresh_acceptance() is not None
+
+
+def test_restart_history(rng):
+    """After a restart the fresh-flow prediction and the slope ignore the
+    episodes before it."""
+    d = make_decision(nlive=500)
+    it = run_episodes(d, rng, [np.log(1e-4)] * 4, 400)
+    assert d._warm_level()[0] < np.log(1e-3)
+    d.restart_history()
+    assert d.history_start == 4
+    d.start_episode(it, False, 50, d.nlive)
+    for c in geometric_counts(rng, np.log(0.05), -1.0 / d.nlive, 400):
+        d.record_iteration(int(c))
+    assert d._warm_level()[0] == pytest.approx(np.log(0.05), abs=0.3)
+    assert d._lineage() == []
+    # a pickled decision from before the option predicts from all episodes
+    del d.history_start
+    assert d._warm_level()[0] < np.log(0.01)

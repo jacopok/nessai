@@ -158,6 +158,12 @@ class FlowSampler:
 
         if resume and self.check_resume(resume_file, resume_data):
             weights_path = weights_path or weights_file
+            # settings a resumed sampler takes from the call, not the pickle
+            resume_overrides = {
+                k: kwargs[k]
+                for k in ("mode_drop",)
+                if kwargs.get(k) is not None
+            }
             if resume_data is not None:
                 self.ns = self._resume_from_data(
                     SamplerClass,
@@ -167,6 +173,7 @@ class FlowSampler:
                     weights_path=weights_path,
                     flow_config=kwargs.get("flow_config"),
                     checkpoint_callback=kwargs.get("checkpoint_callback"),
+                    **resume_overrides,
                 )
             else:
                 self.ns = self._resume_from_file(
@@ -177,6 +184,7 @@ class FlowSampler:
                     weights_path=weights_path,
                     flow_config=kwargs.get("flow_config"),
                     checkpoint_callback=kwargs.get("checkpoint_callback"),
+                    **resume_overrides,
                 )
         else:
             logger.debug("Not resuming sampler")

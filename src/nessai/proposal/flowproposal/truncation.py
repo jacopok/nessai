@@ -457,7 +457,13 @@ def _live_log_q(proposal):
     the live points are rescored at the same temperature before a threshold
     is taken from them.
     """
-    live_points = _threshold_points(proposal).copy()
+    return _points_log_q(proposal, _threshold_points(proposal))
+
+
+def _points_log_q(proposal, points):
+    """``(points, log q)`` as :func:`_live_log_q` scores the live points,
+    for any ``points``."""
+    live_points = points.copy()
     if getattr(proposal, "sum_mirror_density", False) is True and len(
         live_points
     ):
@@ -601,6 +607,28 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
         self._record_excluded(live_points, level)
         if getattr(self, "prior_relative", False) and len(level):
             self.lost_live_mass = float(self._lost_mass(level, self._threshold))
+
+    def point_levels(self, proposal, points):
+        """Each point's level ``log q - log prior`` under the current flow,
+        as :meth:`prepare` scores the live points, taking the best of a
+        point's mirror copies: one value per point (``-inf`` where the
+        flow has no density). Prior-relative only."""
+        if not getattr(self, "prior_relative", False):
+            raise RuntimeError("point_levels requires prior_relative=True")
+        n = len(points)
+        if not n:
+            return np.zeros(0)
+        points, log_q = _points_log_q(proposal, points)
+        log_q = np.asarray(log_q, dtype=float)
+        if len(log_q) % n:
+            raise RuntimeError(
+                f"{len(log_q)} rows of log q for {n} points: not whole "
+                "blocks of mirror copies"
+            )
+        blocks = len(log_q) // n
+        level = self._levels(proposal, np.tile(points, blocks), log_q)
+        level = np.where(np.isnan(level), -np.inf, level)
+        return level.reshape(blocks, n).max(axis=0)
 
     def _lost_mass(self, level, threshold):
         """Mean share of the live points' mass lost at ``threshold`` (levels

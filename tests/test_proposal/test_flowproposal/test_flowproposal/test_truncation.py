@@ -632,6 +632,30 @@ def test_log_proposal_threshold_lost_mass_validation_and_old_pickles():
     assert rule.threshold == pytest.approx(np.quantile(-live_x**2, 0.1))
 
 
+def test_log_proposal_threshold_point_levels():
+    """One level per point, the best of its mirror copies."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    live_x = np.random.default_rng(7).normal(size=50)
+    proposal = _prior_relative_proposal(live_x)
+    rule = LogProposalThresholdTruncation(prior_relative=True, mode="clip")
+    points = proposal.training_data
+    np.testing.assert_allclose(
+        rule.point_levels(proposal, points), -live_x**2)
+    # mirror copies: a second block of rows scored -(x + 1)**2
+    proposal.forward_pass = MagicMock(side_effect=lambda x: (
+        np.zeros((2 * len(x), 1)),
+        np.concatenate([-x["x"] ** 2, -(x["x"] + 1) ** 2])))
+    np.testing.assert_allclose(
+        rule.point_levels(proposal, points),
+        np.maximum(-live_x**2, -(live_x + 1) ** 2))
+    assert len(rule.point_levels(proposal, points[:0])) == 0
+    with pytest.raises(RuntimeError, match="prior_relative"):
+        LogProposalThresholdTruncation().point_levels(proposal, points)
+
+
 # -- log_level_threshold ------------------------------------------------------
 def _level_proposal(live_x, weights, with_pieces=True):
     """Mock two-piece proposal on a line: piece 1 is x < 0, the flow level is

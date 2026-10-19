@@ -14,6 +14,7 @@ from typing import Union
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
+from scipy.special import logsumexp
 
 from .. import config
 from ..evidence import _NSIntegralState
@@ -170,6 +171,21 @@ class NestedSampler(BaseNestedSampler):
         nessai.samplers.retrain_benchmark`), :code:`'benchmark'` to measure
         the costs on this hardware before the run, or None to measure them
         during the run. The last two make the schedule hardware-dependent.
+    mode_drop : bool or dict, optional
+        If true (or a dictionary of options, see
+        :py:meth:`configure_mode_drop`), drop a dying mode of live points
+        that the flow under-covers: when the pool is empty, the live points
+        whose prior-relative level (``log q - log prior``, as the
+        ``log_proposal_threshold`` truncation scores them) is more than
+        ``delta`` below the median level are taken out of the run, if they
+        are more than ``min_share`` and at most ``max_share`` of the live
+        points and a bound on the share of the posterior they can hold is
+        below the budget ``max_posterior``. Their share of the live points
+        is removed from the prior volume, the flow is retrained on the
+        remaining live points (``retrain``) and the live set is refilled.
+        Requires a flow proposal with the prior-relative
+        ``log_proposal_threshold`` truncation and
+        ``threshold_from_live_points``.
     kwargs :
         Keyword arguments passed to the flow proposal class
     """
@@ -218,6 +234,7 @@ class NestedSampler(BaseNestedSampler):
         trace_parameters=None,
         retrain_decision=True,
         retrain_costs="gw",
+        mode_drop=None,
         **kwargs,
     ):
         super().__init__(
@@ -297,6 +314,7 @@ class NestedSampler(BaseNestedSampler):
         )
         self.configure_training_frequency(training_frequency)
         self.configure_retrain_decision(retrain_decision, retrain_costs)
+        self.configure_mode_drop(mode_drop)
 
         if uninformed_proposal_kwargs is None:
             uninformed_proposal_kwargs = {}
@@ -799,7 +817,9 @@ class NestedSampler(BaseNestedSampler):
         self.condition = (
             np.logaddexp(
                 self.state.logZ,
-                self.logLmax - self.iteration / float(self.nlive),
+                self.logLmax
+                - self.iteration / float(self.nlive)
+                + getattr(self, "_log_volume_dropped", 0.0),
             )
             - self.state.logZ
         )
@@ -975,6 +995,209 @@ class NestedSampler(BaseNestedSampler):
         else:
             return False
 
+    def configure_mode_drop(self, mode_drop):
+        """Configure the drop of under-covered dying modes.
+
+        Parameters
+        ----------
+        mode_drop : bool, dict or None
+            False or None disables it; True uses the defaults; a dictionary
+            overrides them:
+
+            * ``delta`` (6.0): a live point is in the mode if its level is
+              more than ``delta`` (natural log) below the median level of
+              the live points;
+            * ``min_share`` (None): the mode must hold more than this share
+              of the live points (default: the truncation quantile, below
+              which the cap already ignores them);
+            * ``max_share`` (0.1): and at most this share;
+            * ``max_posterior`` (1e-3): budget, over the whole run, for the
+              bound on the posterior share of the dropped modes;
+            * ``retrain`` (True): retrain the flow on the remaining live
+              points after a drop, restarting the retrain decision's
+              history;
+            * ``check_every`` (None): minimum number of iterations between
+              two checks (default ``nlive // 20``).
+        """
+        defaults = dict(
+            delta=6.0,
+            min_share=None,
+            max_share=0.1,
+            max_posterior=1e-3,
+            retrain=True,
+            check_every=None,
+        )
+        if not mode_drop:
+            self.mode_drop = None
+            return
+        config = dict(defaults)
+        if isinstance(mode_drop, dict):
+            unknown = set(mode_drop) - set(defaults)
+            if unknown:
+                raise ValueError(f"Unknown mode_drop options: {unknown}")
+            config.update(mode_drop)
+        if config["check_every"] is None:
+            config["check_every"] = max(1, self.nlive // 20)
+        if config["delta"] <= 0:
+            raise ValueError("mode_drop delta must be positive")
+        if not 0 < config["max_share"] < 1:
+            raise ValueError("mode_drop max_share must be in (0, 1)")
+        self.mode_drop = config
+        if not hasattr(self, "mode_drops"):
+            self.mode_drops = []
+            self._mode_drop_posterior = 0.0
+            self._log_volume_dropped = 0.0
+            self._mode_drop_checked = -np.inf
+        logger.info(f"Mode drop: {config}")
+
+    def _mode_drop_rule(self):
+        """The flow proposal's prior-relative log-proposal threshold rule,
+        or None."""
+        get_rule = getattr(self._flow_proposal, "get_truncation_rule", None)
+        if get_rule is None:
+            return None
+        rule = get_rule("log_proposal_threshold")
+        if rule is None or not getattr(rule, "prior_relative", False):
+            return None
+        return rule
+
+    def _check_mode_drop(self):
+        """Drop an under-covered dying mode if the criterion holds (see
+        :py:meth:`configure_mode_drop`). Only with an empty pool of the
+        trained flow proposal. Returns True if a mode was dropped."""
+        config = getattr(self, "mode_drop", None)
+        if (
+            config is None
+            or getattr(self, "_refilling", False)
+            or self.proposal is not self._flow_proposal
+            or not self.completed_training
+            or not getattr(self.proposal, "training_count", 0)
+            or self.proposal.populated
+            or getattr(self.proposal, "populating", False)
+            or self.live_points is None
+            or self.iteration - self._mode_drop_checked < config["check_every"]
+        ):
+            return False
+        self._mode_drop_checked = self.iteration
+        rule = self._mode_drop_rule()
+        if rule is None:
+            if not getattr(self, "_mode_drop_warned", False):
+                logger.warning(
+                    "Mode drop needs the prior-relative log_proposal_threshold "
+                    "truncation: disabled"
+                )
+                self._mode_drop_warned = True
+            return False
+        n = len(self.live_points)
+        level = rule.point_levels(self.proposal, self.live_points)
+        finite = np.isfinite(level)
+        if not finite.any():
+            return False
+        median = float(np.median(level[finite]))
+        in_mode = ~(level >= median - config["delta"])
+        k = int(in_mode.sum())
+        logger.debug(
+            f"Mode drop check at iteration {self.iteration}: {k} live points "
+            f"more than {config['delta']} below the median level {median:.2f}"
+        )
+        min_share = config["min_share"]
+        if min_share is None:
+            min_share = rule.quantile
+        if k <= min_share * n or k > config["max_share"] * n:
+            return False
+        logl = np.asarray(self.live_points["logL"], dtype=float)
+        log_x = self.state.logw
+        # evidence so far plus the live points' estimate of the rest
+        log_z = np.logaddexp(
+            self.state.logZ, log_x + logsumexp(logl) - np.log(n)
+        )
+        # the mode's evidence is at most its volume times its highest
+        # likelihood
+        log_bound = np.log(k / n) + log_x + logl[in_mode].max() - log_z
+        bound = float(np.exp(log_bound))
+        if self._mode_drop_posterior + bound > config["max_posterior"]:
+            logger.debug(
+                f"Mode drop: {k} live points more than {config['delta']} "
+                f"below the median level, posterior bound {bound:.2e} over "
+                "the budget"
+            )
+            return False
+        self._drop_mode(in_mode, level, median, bound)
+        return True
+
+    def _drop_mode(self, in_mode, level, median, bound):
+        """Take the live points ``in_mode`` out of the run, remove their
+        share of the prior volume, retrain and refill the live points."""
+        config = self.mode_drop
+        n = len(self.live_points)
+        k = int(in_mode.sum())
+        dropped = self.live_points[in_mode]
+        rank = np.flatnonzero(in_mode) / max(n - 1, 1)
+        record = dict(
+            iteration=self.iteration,
+            n=k,
+            share=k / n,
+            posterior_bound=bound,
+            level_median=median,
+            mode_level_median=float(np.median(level[in_mode])),
+            mode_logL_max=float(dropped["logL"].max()),
+            logL_max=float(self.live_points["logL"].max()),
+            mode_mean_rank=float(rank.mean()),
+        )
+        logger.info(
+            f"Mode drop at iteration {self.iteration}: {k} live points "
+            f"({k / n:.2%}) more than {config['delta']} below the median "
+            f"level {median:.2f} (theirs {record['mode_level_median']:.2f}), "
+            f"max logL {record['mode_logL_max']:.2f} vs "
+            f"{record['logL_max']:.2f}, mean likelihood rank "
+            f"{record['mode_mean_rank']:.2f}, posterior bound {bound:.2e}"
+        )
+        self.state.remove_volume(k / n)
+        self._log_volume_dropped += float(np.log1p(-k / n))
+        self._mode_drop_posterior += bound
+        self.mode_drops.append(record)
+        self.dropped_live_points = np.concatenate(
+            [getattr(self, "dropped_live_points", dropped[:0]), dropped]
+        )
+        self.live_points = self.live_points[~in_mode]
+        if config["retrain"]:
+            if self.retrain_decision is not None:
+                self.retrain_decision.restart_history()
+            logger.info("Mode drop: retraining on the remaining live points")
+            self.train_proposal(force=True)
+        self._refill_live_points()
+
+    def _refill_live_points(self):
+        """Draw live points above the current contour until there are
+        ``nlive``; no dead points, so the prior volume does not shrink."""
+        missing = self.nlive - len(self.live_points)
+        logger.info(f"Refilling {missing} live points")
+        self._refilling = True
+        try:
+            template = self.live_points[0].copy()
+            template["logL"] = self.logLmin
+            while len(self.live_points) < self.nlive:
+                count, proposed = next(self.yield_sample(template.copy()))
+                if proposed["logL"] > self.logLmin:
+                    proposed["it"] = self.iteration
+                    index = np.searchsorted(
+                        self.live_points["logL"], proposed["logL"]
+                    )
+                    self.live_points = np.insert(
+                        self.live_points, index, proposed
+                    )
+                    if (
+                        self.retrain_decision is not None
+                        and self.proposal is self._flow_proposal
+                    ):
+                        self.retrain_decision.record_iteration(count)
+                else:
+                    # the pool ran out
+                    self.check_state()
+        finally:
+            self._refilling = False
+        logger.info("Live points refilled")
+
     def check_training(self):
         """
         Check if the normalising flow should be trained
@@ -1146,6 +1369,10 @@ class NestedSampler(BaseNestedSampler):
                 force = True
             else:
                 return
+        if getattr(self, "mode_drop", None) is not None and (
+            self._check_mode_drop()
+        ):
+            return
         # General override
         train = False
         if force:
@@ -1538,6 +1765,12 @@ class NestedSampler(BaseNestedSampler):
         if self.iteration:
             self.update_state()
 
+        if getattr(self, "mode_drops", None) and (
+            len(self.live_points) < self.nlive
+        ):
+            # resumed from a checkpoint written while refilling after a drop
+            self._refill_live_points()
+
         logger.info("Starting nested sampling loop")
 
         while not self.stopping_criterion.is_met(self.condition):
@@ -1605,11 +1838,18 @@ class NestedSampler(BaseNestedSampler):
         d["information"] = self.information
         d["training_time"] = self.training_time.total_seconds()
         d["population_time"] = self.proposal_population_time.total_seconds()
+        d["mode_drops"] = list(getattr(self, "mode_drops", []))
         return d
 
     @classmethod
     def resume_from_pickled_sampler(
-        cls, sampler, model, flow_config=None, weights_path=None, **kwargs
+        cls,
+        sampler,
+        model,
+        flow_config=None,
+        weights_path=None,
+        mode_drop=None,
+        **kwargs,
     ):
         """Resume from a pickled sampler.
 
@@ -1624,6 +1864,10 @@ class NestedSampler(BaseNestedSampler):
         weights_path : Optional[str]
             Weights file to use in place of the weights file stored in the
             pickle file.
+        mode_drop : Optional[bool or dict]
+            If given, replaces the pickled sampler's mode-drop configuration
+            (see :py:meth:`configure_mode_drop`), e.g. to enable it on a run
+            started without it.
         kwargs :
             Keyword arguments passed to the parent class's method.
 
@@ -1635,6 +1879,8 @@ class NestedSampler(BaseNestedSampler):
             sampler, model, **kwargs
         )
         obj._uninformed_proposal.resume(model)
+        if mode_drop is not None:
+            obj.configure_mode_drop(mode_drop)
         if flow_config is None:
             flow_config = {}
         obj._flow_proposal.resume(model, flow_config, weights_path)

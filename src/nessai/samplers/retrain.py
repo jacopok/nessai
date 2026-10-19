@@ -427,6 +427,7 @@ class RetrainDecision:
         self.log = []
         self.reset_next = False
         self._last = None
+        self.history_start = 0
 
     # ------------------------------------------------------------ recording
     @property
@@ -447,6 +448,19 @@ class RetrainDecision:
                 predicted=warm[0] if (warm and not reset) else np.nan,
             )
         )
+
+    def restart_history(self):
+        """Predict from the episodes starting with the next training only.
+
+        For a change of the live set that makes the past episodes a poor
+        guide to a fresh flow (e.g. a mode dropped by the sampler): the
+        acceptance levels, slopes and lineage then ignore what came before.
+        """
+        self.history_start = len(self.episodes)
+
+    def _since_restart(self, episodes):
+        """``episodes`` (a prefix of :attr:`episodes`) after the restart."""
+        return episodes[getattr(self, "history_start", 0):]
 
     def record_training_time(self, seconds, epochs, n_train):
         if epochs is not None:
@@ -490,11 +504,12 @@ class RetrainDecision:
         return [e for e in episodes if np.isfinite(e.log_a0)]
 
     def _lineage(self):
-        """Finished episodes since the last reset (or the first training)."""
-        start = 0
+        """Finished episodes since the last reset (or the first training,
+        or the last restart of the history)."""
+        start = getattr(self, "history_start", 0)
         for i, e in enumerate(self.episodes):
             if e.reset:
-                start = i
+                start = max(start, i)
         return self._finished(self.episodes[start:-1])
 
     def _level_history(self, include_current=True):
@@ -504,13 +519,13 @@ class RetrainDecision:
         The running episode is included by default: the decision to retrain
         is taken when it ends, so the next flow follows it.
         """
-        start = 0
+        start = getattr(self, "history_start", 0)
         for i, e in enumerate(self.episodes):
             if e.reset:
-                start = i
+                start = max(start, i)
         eps = self.episodes if include_current else self.episodes[:-1]
         rows = []
-        for lineage in (eps[start:], eps):
+        for lineage in (eps[start:], self._since_restart(eps)):
             rows = [
                 (e.start, *initial_level(e.counts, self.bin_size))
                 for e in lineage
@@ -615,7 +630,7 @@ class RetrainDecision:
         # ones return its prior
         eps = [
             e
-            for e in self._finished(self.episodes[:-1])
+            for e in self._finished(self._since_restart(self.episodes[:-1]))
             if len(e.counts) >= self.bin_size
         ][-self.history_length :]
         prior_mean = -1.0 / self.nlive
