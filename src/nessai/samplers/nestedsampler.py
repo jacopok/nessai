@@ -7,15 +7,18 @@ import datetime
 import logging
 import math
 import os
+import pickle
 from collections import deque
-from copy import copy
+from copy import copy, deepcopy
 from typing import Union
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
+from scipy.special import logsumexp
 
 from .. import config
+from .. import partition as partition_module
 from ..evidence import _NSIntegralState
 from ..livepoint import empty_structured_array
 from ..plot import nessai_style, plot_indices, plot_trace, sanitise_array
@@ -170,6 +173,12 @@ class NestedSampler(BaseNestedSampler):
         nessai.samplers.retrain_benchmark`), :code:`'benchmark'` to measure
         the costs on this hardware before the run, or None to measure them
         during the run. The last two make the schedule hardware-dependent.
+    partition : dict, optional
+        Partitioned nested sampling (see :py:meth:`configure_partition`):
+        once the live points separate along the given coordinates, the prior
+        is split into frozen regions, each continued as an independent run
+        with its own live points, proposal and stopping, in lockstep with
+        the others.
     kwargs :
         Keyword arguments passed to the flow proposal class
     """
@@ -218,6 +227,7 @@ class NestedSampler(BaseNestedSampler):
         trace_parameters=None,
         retrain_decision=True,
         retrain_costs="gw",
+        partition=None,
         **kwargs,
     ):
         super().__init__(
@@ -297,6 +307,7 @@ class NestedSampler(BaseNestedSampler):
         )
         self.configure_training_frequency(training_frequency)
         self.configure_retrain_decision(retrain_decision, retrain_costs)
+        self.configure_partition(partition)
 
         if uninformed_proposal_kwargs is None:
             uninformed_proposal_kwargs = {}
@@ -332,6 +343,11 @@ class NestedSampler(BaseNestedSampler):
     def proposal_population_time(self):
         t = self._uninformed_proposal.population_time
         t += self._flow_proposal.population_time
+        for region in getattr(self, "regions", None) or []:
+            if region.proposal is not None:
+                t += region.proposal.population_time
+            else:
+                t += getattr(region, "population_time", datetime.timedelta())
         return t
 
     @property
@@ -364,7 +380,12 @@ class NestedSampler(BaseNestedSampler):
     @property
     def birth_log_likelihoods(self):
         """Return the birth log-likelihoods for the nested samples"""
-        logLs = np.array(self.state.logLs)
+        # the thresholds in the order of the iterations (a partitioned run's
+        # ``logLs`` are sorted at the end)
+        threshold = getattr(self.state, "threshold_logLs", None)
+        logLs = np.array(
+            threshold if isinstance(threshold, list) else self.state.logLs
+        )
         its = np.array(self.nested_samples)["it"]
         return logLs[its].flatten()
 
@@ -408,6 +429,7 @@ class NestedSampler(BaseNestedSampler):
             retrain_decision if isinstance(retrain_decision, dict) else {}
         )
         self._retrain_benchmark = retrain_costs == "benchmark"
+        self._retrain_decision_kwargs = dict(kwargs)
         self.retrain_decision = RetrainDecision(
             self.nlive,
             costs=None if self._retrain_benchmark else retrain_costs,
@@ -626,6 +648,13 @@ class NestedSampler(BaseNestedSampler):
                 os.path.normpath(self._flow_proposal.output)
             )
             self._flow_proposal.update_output(os.path.join(output, subdir, ""))
+        for region in getattr(self, "regions", None) or []:
+            if region.proposal is not None:
+                region.proposal.update_output(
+                    os.path.join(
+                        output, "proposal", f"region_{region.label}", ""
+                    )
+                )
 
     def configure_flow_reset(
         self, reset_weights, reset_permutations, reset_flow
@@ -701,6 +730,15 @@ class NestedSampler(BaseNestedSampler):
             f"+/- {self.state.log_evidence_error:.3f} "
             f"logLmax: {self.logLmax:.2f}"
         )
+        for r in self.active_regions:
+            logger.info(
+                f"  region {r.label}: nlive {r.nlive}, ln X "
+                f"{self.state.region_logw[r.label]:.3f}, logL "
+                f"{r.live_points['logL'][0]:.2f} - "
+                f"{r.live_points['logL'][-1]:.2f}, iterations "
+                f"{r.iterations}, acceptance {r.mean_acceptance:.3g}, "
+                f"trainings {len(r.training_iterations)}"
+            )
 
     def check_insertion_indices(self, rolling=True, filename=None):
         """
@@ -708,6 +746,8 @@ class NestedSampler(BaseNestedSampler):
         the nested sampling run (rolling=True) or for the whole run
         (rolling=False).
         """
+        if getattr(self, "regions", None) is not None:
+            return self._check_region_insertion_indices(rolling, filename)
         if rolling:
             indices = self.insertion_indices[-self.nlive :]
         else:
@@ -742,6 +782,45 @@ class NestedSampler(BaseNestedSampler):
                 newline="\n",
                 delimiter=" ",
             )
+
+    def _check_region_insertion_indices(self, rolling=True, filename=None):
+        """The insertion-index KS test of each region (its own indices and
+        number of live points); the run's p-value is the smallest."""
+        regions = self.active_regions if rolling else self.regions
+        results = []
+        for r in regions:
+            indices = r.insertion_indices
+            if rolling:
+                indices = indices[-r.nlive :]
+            D, p = compute_indices_ks_test(indices, r.nlive)
+            if p is None:
+                continue
+            if not rolling:
+                r.final_p_value = p
+            results.append((p, D, r.label))
+            logger.info(
+                f"it: {self.iteration:5d}: region {r.label} "
+                f"{'rolling' if rolling else 'final'} KS test: "
+                f"D={D:.4}, p-value={p:.4}"
+            )
+        if results:
+            p, D, _ = min(results)
+            if rolling:
+                self.history["rolling_p"].append(p)
+            else:
+                self.final_p_value = p
+                self.final_ks_statistic = D
+        if filename is not None:
+            for r in self.regions:
+                np.savetxt(
+                    os.path.join(
+                        self.output,
+                        filename.replace(".", f"_region_{r.label}.", 1),
+                    ),
+                    r.insertion_indices,
+                    newline="\n",
+                    delimiter=" ",
+                )
 
     def yield_sample(self, oldparam):
         """
@@ -974,6 +1053,841 @@ class NestedSampler(BaseNestedSampler):
         # If using uninformed sampling, don't check training
         else:
             return False
+
+    # ------------------------------------------------------------------
+    # Partitioned nested sampling
+    # ------------------------------------------------------------------
+    _partition_defaults = dict(
+        coordinates=None,
+        splitter=None,
+        n_min=None,
+        max_regions=4,
+        check_every=None,
+        plot_every=None,
+        plot=True,
+    )
+
+    def configure_partition(self, partition):
+        """Configure partitioned nested sampling.
+
+        Every ``check_every`` iterations (in each region, counted in its own
+        iterations) once its flow is trained, the splitter looks at the live points
+        with hold-out bit 0 (:func:`nessai.partition.hold_out_bit`) along the
+        split coordinates. When it proposes a cut, the region (at first the
+        whole prior) is split into frozen parts: each part gets the share of
+        its volume that the live points with bit 1 estimate, keeps its live
+        points (topped up with independent draws to ``n_min``) and its own
+        copy of the proposal, restricted to the part
+        (:class:`nessai.partition.RegionTruncation`) and trained on its
+        points. The regions then run in lockstep: the lowest live point of
+        all is killed, only its region's volume shrinks (by one over that
+        region's number of live points) and it is replaced from its region's
+        proposal. A region stops (its live points are added as for the end
+        of a run) once it could add less than the stopping tolerance to the
+        evidence; the run ends when every region has stopped. The dead points
+        are merged in likelihood order.
+
+        Parameters
+        ----------
+        partition : dict or None
+            None or False disables it. Keys:
+
+            * ``coordinates`` (required): a list of parameter names, or a
+              :class:`nessai.partition.SplitCoordinates` (an instance, a
+              ``"module:Class"`` string, or a dictionary with ``"class"``
+              and its keyword arguments);
+            * ``splitter``: the splitter, as for ``coordinates`` (default
+              :class:`nessai.partition.GapSplitter`, which takes one
+              coordinate);
+            * ``n_min`` (``nlive // 5``): minimum number of live points of a
+              region;
+            * ``max_regions`` (4): maximum number of active regions;
+            * ``check_every`` (``nlive // 20`` of the region): iterations
+              between checks;
+            * ``plot_every`` (``nlive``): iterations between the diagnostic
+              plots (``diagnostics/partition.png``), also made at every
+              split;
+            * ``plot`` (True): make them.
+        """
+        if not hasattr(self, "regions"):
+            self.regions = None
+            self.partitions = []
+            self.retired_samples = []
+            self.retired_regions = []
+            self.nested_regions = []
+            self._partition_start = None
+            # the first check at the first chance (e.g. a run resumed with
+            # the partition switched on)
+            self._partition_last_check = -np.inf
+            self._next_region_label = 1
+            self._partition_last_cut = None
+            self._checkpoint_pending = False
+            self._splitting = False
+        if not partition:
+            self.partition = None
+            return
+        if not isinstance(partition, dict):
+            raise TypeError(
+                "partition must be a dictionary with at least 'coordinates'"
+            )
+        unknown = set(partition) - set(self._partition_defaults)
+        if unknown:
+            raise ValueError(f"Unknown partition options: {unknown}")
+        config = dict(self._partition_defaults)
+        config.update(partition)
+        coordinates = config["coordinates"]
+        if coordinates is None:
+            raise ValueError("partition needs the split 'coordinates'")
+        if isinstance(coordinates, (list, tuple)) and all(
+            isinstance(c, str) for c in coordinates
+        ):
+            coordinates = partition_module.ParameterCoordinates(coordinates)
+        else:
+            coordinates = partition_module.build(
+                coordinates,
+                partition_module.ParameterCoordinates,
+                partition_module,
+            )
+        coordinates.configure(self.model)
+        splitter = partition_module.build(
+            config["splitter"], partition_module.GapSplitter, partition_module
+        )
+        if config["n_min"] is None:
+            config["n_min"] = max(1, self.nlive // 5)
+        if config["plot_every"] is None:
+            config["plot_every"] = self.nlive
+        if config["max_regions"] < 2:
+            raise ValueError("partition max_regions must be at least 2")
+        self.partition = config
+        self._partition_coordinates = coordinates
+        self._partition_splitter = splitter
+        logger.info(
+            f"Partition: coordinates {list(coordinates.names)}, splitter "
+            f"{type(splitter).__name__}, n_min {config['n_min']}, max "
+            f"regions {config['max_regions']}"
+        )
+
+    @property
+    def active_regions(self):
+        """The regions still running (empty before the first split)."""
+        if getattr(self, "regions", None) is None:
+            return []
+        return [r for r in self.regions if r.active]
+
+    def _root_region(self):
+        """The unsplit run as the region every first split starts from."""
+        root = partition_module.Region(
+            0,
+            None,
+            partition_module.RegionMembership(),
+            self.nlive,
+            self.live_points,
+            proposal=self._flow_proposal,
+            retrain_decision=self.retrain_decision,
+        )
+        root.iterations = self.iteration
+        return root
+
+    def _region_ready(self, proposal, completed_training):
+        """A trained flow, not in the middle of a population. The checks
+        are made between iterations, at most every ``check_every``; a split
+        discards the region's pool (once)."""
+        return bool(
+            proposal is not None
+            and completed_training
+            and getattr(proposal, "training_count", 0)
+            and not getattr(proposal, "populating", False)
+        )
+
+    def _maybe_partition(self):
+        """Check the unsplit run, or each active region, for a split (see
+        :meth:`configure_partition`). Returns True if a split was made."""
+        config = self.partition
+        if self.regions is None:
+            if (
+                self.uninformed_sampling
+                or self.proposal is not self._flow_proposal
+                or not self._region_ready(
+                    self._flow_proposal, self.completed_training
+                )
+            ):
+                return False
+            every = config["check_every"] or max(1, self.nlive // 20)
+            if self.iteration - self._partition_last_check < every:
+                return False
+            self._partition_last_check = self.iteration
+            return self._try_split(self._root_region())
+        for region in self.active_regions:
+            if not self._region_ready(
+                region.proposal, region.completed_training
+            ):
+                continue
+            every = config["check_every"] or max(1, region.nlive // 20)
+            if region.iterations - region.last_check < every:
+                continue
+            region.last_check = region.iterations
+            if self._try_split(region):
+                return True
+        return False
+
+    def _try_split(self, parent):
+        n_active = len(self.active_regions) if self.regions else 1
+        max_labels = self.partition["max_regions"] - n_active + 1
+        if max_labels < 2:
+            return False
+        live = parent.live_points
+        coordinates = self._partition_coordinates.freeze(parent.proposal)
+        coords = coordinates(live)
+        bit = partition_module.hold_out_bit(live)
+        sel = bit == 0
+        cut = self._partition_splitter.propose(
+            coords[sel],
+            coordinates.period_list(),
+            points=live[sel],
+            proposal=parent.proposal,
+            max_labels=max_labels,
+        )
+        logger.debug(
+            f"Partition check at iteration {self.iteration} (region "
+            f"{parent.label}): "
+            + ("no cut" if cut is None else f"{cut.describe()} {cut.info}")
+        )
+        if cut is None:
+            return False
+        return self._split(parent, coordinates, cut, coords, bit)
+
+    def _split(self, parent, coordinates, cut, coords, bit):
+        """Split ``parent`` by ``cut`` (see :meth:`configure_partition`)."""
+        labels = cut.classify(coords)
+        n_labels = cut.n_labels
+        held = labels[bit == 1]
+        counts = np.bincount(labels, minlength=n_labels)
+        if not len(held):
+            return False
+        shares = np.bincount(held, minlength=n_labels) / len(held)
+        if np.any(shares == 0) or np.any(counts == 0):
+            logger.warning(
+                f"Partition: cut {cut.describe()} leaves a part without "
+                f"held-out live points (counts {counts.tolist()}, shares "
+                f"{shares.tolist()}): not splitting"
+            )
+            return False
+        first = self.regions is None
+        if first:
+            self.regions = []
+            self._partition_start = len(self.nested_samples)
+            self.nested_regions = []
+        log_x = (
+            float(self.state.logw)
+            if first
+            else float(self.state.region_logw[parent.label])
+        )
+        child_labels = list(
+            range(self._next_region_label, self._next_region_label + n_labels)
+        )
+        self._next_region_label += n_labels
+        self.state.split(parent.label, child_labels, np.log(shares))
+        n_min = self.partition["n_min"]
+        children = []
+        for k, label in enumerate(child_labels):
+            child = partition_module.Region(
+                label,
+                parent.label,
+                parent.membership.child(coordinates, cut, k),
+                max(int(counts[k]), n_min),
+                parent.live_points[labels == k].copy(),
+                acceptance_length=max(1, self.nlive // 10),
+            )
+            children.append(child)
+            self.partitions.append(
+                dict(
+                    iteration=self.iteration,
+                    logL=float(self.logLmin),
+                    parent=parent.label,
+                    region=label,
+                    share=float(shares[k]),
+                    n_points=int(counts[k]),
+                    n_held_out=int((held == k).sum()),
+                    nlive=child.nlive,
+                    log_x=log_x + float(np.log(shares[k])),
+                    cut=cut.describe(),
+                )
+            )
+        logger.info(
+            f"Partition at iteration {self.iteration} (logL > "
+            f"{self.logLmin:.3f}): region {parent.label} (ln X {log_x:.3f}) "
+            f"split by {list(coordinates.names)} {cut.describe()} into "
+            + ", ".join(
+                f"region {c.label} ({counts[k]} live points, share "
+                f"{shares[k]:.4f} from {(held == k).sum()} held out, nlive "
+                f"{c.nlive})"
+                for k, c in enumerate(children)
+            )
+        )
+        if self.memory:
+            logger.warning("Partition: the regions train without memory")
+        if not first:
+            self.regions.remove(parent)
+        parent.active = False
+        self.regions.extend(children)
+        self._partition_last_cut = (coordinates, cut)
+        # a region that cannot hold enough evidence stops at once
+        self._retire_regions()
+        self._splitting = True
+        try:
+            for child in children:
+                if not child.active:
+                    continue
+                child.proposal = self._clone_proposal(parent.proposal, child)
+                child.retrain_decision = self._child_retrain_decision(
+                    parent.retrain_decision, child.nlive
+                )
+                if len(child.live_points) < child.nlive:
+                    # train on the points it has, so the top-up is drawn
+                    # from a flow that covers the region
+                    self._train_region(child, force=True)
+                    self._fill_region(child)
+                self._train_region(child, force=True)
+        finally:
+            self._splitting = False
+        if not first:
+            parent.proposal = None
+        self._update_partition_condition()
+        self._merge_live_points()
+        self._plot_partition_diagnostic(split=True)
+        if self.checkpointing:
+            self.checkpoint(periodic=True, force=True)
+        return True
+
+    def _clone_proposal(self, source, region):
+        """A copy of ``source`` for ``region``: the pickled state (as for a
+        checkpoint) resumed with the source's current flow weights, in its
+        own output directory, with its own random generators and restricted
+        to the region."""
+        import torch
+
+        output = os.path.join(
+            self.output, "proposal", f"region_{region.label}", ""
+        )
+        os.makedirs(output, exist_ok=True)
+        weights = os.path.join(output, "model.pt")
+        torch.save(source.flow.model.state_dict(), weights)
+        clone = pickle.loads(pickle.dumps(source))
+        clone.output = output
+        clone.indices = []
+        clone.populated = False
+        clone.resume_populated = False
+        clone.samples = None
+        clone.x = None
+        partition_module.respawn_generators(clone, self.rng)
+        flow_config = getattr(self, "_resume_flow_config", None)
+        if flow_config is None:
+            flow_config = self._flow_proposal_config[1]
+        clone.resume(self.model, deepcopy(flow_config or {}), weights)
+        scheme = clone.truncation
+        # a copy of a region's proposal: its region becomes the child's
+        scheme.rules = [r for r in scheme.rules if r.name != "region"]
+        scheme.add_rule(
+            partition_module.RegionTruncation(region.membership, region.label),
+            index=0,
+        )
+        if hasattr(clone, "_sync_truncation_state"):
+            clone._sync_truncation_state()
+        clone.current_live_points = region.live_points
+        partition_module.check_clone(source, clone, region.live_points)
+        return clone
+
+    def _child_retrain_decision(self, parent, nlive):
+        """A new retrain decision with the parent's unit costs."""
+        if parent is None:
+            return None
+        decision = RetrainDecision(
+            nlive, **getattr(self, "_retrain_decision_kwargs", {})
+        )
+        decision.cost = deepcopy(parent.cost)
+        return decision
+
+    def _region_clock(self):
+        return self._retrain_time_snapshot()
+
+    def _charge_region(self, region, before):
+        """Add the time and likelihood calls since ``before`` to
+        ``region``."""
+        dt, dl, dn = (a - b for a, b in zip(self._region_clock(), before))
+        region.time += dt
+        region.likelihood_time += dl
+        region.likelihood_evaluations += dn
+
+    def _region_yield(self, region, oldparam):
+        """:meth:`yield_sample` for a region."""
+        proposal = region.proposal
+        while True:
+            counter = 0
+            while True:
+                counter += 1
+                proposal.current_live_points = region.live_points
+                try:
+                    newparam = proposal.draw(copy(oldparam))
+                except IndexError:
+                    # a pool with no draw inside the region
+                    proposal.indices = []
+                    proposal.populated = False
+                    proposal.populating = False
+                    region.empty_pools = getattr(region, "empty_pools", 0) + 1
+                    if region.empty_pools >= 50:
+                        raise RuntimeError(
+                            f"Partition: 50 pools without a draw inside "
+                            f"region {region.label}"
+                        )
+                    break
+                if newparam["logP"] != -np.inf:
+                    if not newparam["logL"]:
+                        newparam["logL"] = self.model.evaluate_log_likelihood(
+                            newparam
+                        )
+                    if newparam["logL"] > self.logLmin:
+                        self.logLmax = max(self.logLmax, newparam["logL"])
+                        region.empty_pools = 0
+                        oldparam = newparam.copy()
+                        break
+                if not proposal.populated:
+                    break
+            yield counter, oldparam
+
+    def _replace_in_region(self, region, worst):
+        """Draw the replacement of ``worst`` in ``region``, training when
+        the pool runs out (as :meth:`consume_sample`)."""
+        count = 0
+        while True:
+            c, proposed = next(self._region_yield(region, worst))
+            count += c
+            if proposed["logL"] > self.logLmin:
+                return count, proposed
+            self.rejected += 1
+            self._region_check_state(region)
+            if not region.block_iteration:
+                region.block_iteration += 1
+
+    def _fill_region(self, region):
+        """Top ``region`` up to its number of live points with independent
+        draws above the current contour (no dead points)."""
+        missing = region.nlive - len(region.live_points)
+        logger.info(f"Partition: drawing {missing} live points in region "
+                    f"{region.label}")
+        template = region.live_points[0].copy()
+        template["logL"] = self.logLmin
+        before = self._region_clock()
+        drawn, added = 0, 0
+        report = max(1, missing // 5)
+        while len(region.live_points) < region.nlive:
+            count, proposed = next(self._region_yield(region, template.copy()))
+            drawn += count
+            if proposed["logL"] > self.logLmin:
+                proposed["it"] = self.iteration
+                index = np.searchsorted(
+                    region.live_points["logL"], proposed["logL"]
+                )
+                region.live_points = np.insert(
+                    region.live_points, index, proposed
+                )
+                added += 1
+                if not added % report:
+                    logger.info(
+                        f"Partition: region {region.label}: {added} / "
+                        f"{missing} drawn (acceptance {added / drawn:.3g})"
+                    )
+        self._charge_region(region, before)
+        region.proposal.current_live_points = region.live_points
+
+    def _partitioned_iteration(self):
+        """One iteration of a partitioned run (see
+        :meth:`configure_partition`)."""
+        region = min(
+            self.active_regions, key=lambda r: r.live_points["logL"][0]
+        )
+        self.proposal = region.proposal
+        worst = region.live_points[0].copy()
+        self.logLmin = float(worst["logL"])
+        self.state.increment(
+            self.logLmin, nlive=region.nlive, region=region.label
+        )
+        self.nested_samples.append(worst)
+        self.nested_regions.append(region.label)
+        self.iteration += 1
+        self.block_iteration += 1
+        region.iterations += 1
+        region.block_iteration += 1
+
+        before = self._region_clock()
+        count, proposed = self._replace_in_region(region, worst)
+        self._charge_region(region, before)
+
+        proposed["it"] = self.iteration
+        live = region.live_points
+        index = np.searchsorted(live["logL"], proposed["logL"])
+        live[: index - 1] = live[1:index]
+        live[index - 1] = proposed
+        region.insertion_indices.append(index - 1)
+        self.accepted += 1
+        region.block_acceptance += 1 / count
+        region.acceptance_history.append(1 / count)
+        self.acceptance_history.append(1 / count)
+        if region.retrain_decision is not None:
+            region.retrain_decision.record_iteration(count)
+        region.mean_block_acceptance = (
+            region.block_acceptance / region.block_iteration
+        )
+        self.mean_block_acceptance = region.mean_block_acceptance
+        region.proposal.ns_acceptance = region.mean_block_acceptance
+
+        self._retire_regions()
+        self._update_partition_condition()
+        self._merge_live_points()
+        if self._checkpoint_pending:
+            self._checkpoint_pending = False
+            self.checkpoint(periodic=True, force=True)
+
+    def _region_condition(self, region):
+        """``ln(1 + X_r Lmax_r / Z)``: the most the region can still add."""
+        log_x = self.state.region_logw[region.label]
+        return float(
+            np.logaddexp(
+                0.0, log_x + region.live_points["logL"][-1] - self.state.logZ
+            )
+        )
+
+    def _retire_regions(self):
+        for region in self.active_regions:
+            condition = self._region_condition(region)
+            if condition < self.tolerance:
+                self._retire_region(region, condition)
+
+    def _retire_region(self, region, condition=None):
+        """Stop ``region``: its live points become dead points."""
+        live = region.live_points
+        log_x = self.state.region_logw[region.label]
+        self.state.retire(region.label, live["logL"])
+        self.retired_samples.extend(list(live))
+        self.retired_regions.extend([region.label] * len(live))
+        region.active = False
+        if len(region.insertion_indices) >= region.nlive:
+            _, region.final_p_value = compute_indices_ks_test(
+                region.insertion_indices, region.nlive
+            )
+        logger.info(
+            f"Partition: region {region.label} stops at iteration "
+            f"{self.iteration} after {region.iterations} of its own "
+            f"(ln X {log_x:.3f}, max logL {live['logL'][-1]:.3f}"
+            + (f", dlogZ {condition:.3g}" if condition is not None else "")
+            + f"); {len(self.active_regions)} region(s) left"
+        )
+        region.live_points = live[:0]
+        if region.proposal is not None:
+            region.population_time = region.proposal.population_time
+        region.proposal = None
+
+    def _update_partition_condition(self):
+        terms = [
+            self.state.region_logw[r.label] + r.live_points["logL"][-1]
+            for r in self.active_regions
+        ]
+        if terms:
+            self.condition = float(
+                np.logaddexp(self.state.logZ, logsumexp(terms))
+                - self.state.logZ
+            )
+        else:
+            self.condition = 0.0
+
+    def _merge_live_points(self):
+        """The active regions' live points as one array sorted by logL, for
+        plots and anything that reads ``live_points``."""
+        active = self.active_regions
+        if not active:
+            self.live_points = self.live_points[:0]
+            return
+        live = np.concatenate([r.live_points for r in active])
+        self.live_points = live[np.argsort(live["logL"], kind="stable")]
+
+    def _region_next_poolsize(self, region):
+        proposal = region.proposal
+        if not getattr(proposal, "update_poolsize", False):
+            return proposal.poolsize
+        acc = region.mean_block_acceptance
+        scale = 1.0 / acc if acc > 0 else proposal.max_poolsize_scale
+        scale = min(max(scale, 1.0), proposal.max_poolsize_scale)
+        return int(scale * proposal._poolsize)
+
+    def _region_remaining(self, region):
+        """Rough number of the region's own iterations left."""
+        tol = self.tolerance
+        c = self._region_condition(region)
+        if not np.isfinite(c) or tol <= 0:
+            return np.inf
+        if c <= tol:
+            return 0.0
+        return region.nlive * (
+            c + np.log(-np.expm1(-c)) - np.log(np.expm1(tol))
+        )
+
+    def _record_region_populations(self, region):
+        snap = (
+            region.time,
+            region.likelihood_time,
+            region.likelihood_evaluations,
+        )
+        samples = getattr(region.proposal, "samples", None)
+        if region._retrain_snapshot is not None and samples is not None:
+            dt, dl, dn = (a - b for a, b in zip(snap, region._retrain_snapshot))
+            region.retrain_decision.record_populations(
+                dt, samples.size, dl, dn
+            )
+        region._retrain_snapshot = snap
+
+    def _region_check_state(self, region):
+        """:meth:`check_training` and :meth:`train_proposal` for a
+        region."""
+        proposal = region.proposal
+        decision = region.retrain_decision
+        if not region.completed_training:
+            self._train_region(region, force=True)
+        elif decision is not None:
+            if not proposal.populated and not proposal.populating:
+                self._record_region_populations(region)
+                retrain = decision.decide(
+                    region.iterations,
+                    self._region_next_poolsize(region),
+                    remaining=self._region_remaining(region),
+                )
+                proposal.max_next_poolsize = decision.next_poolsize
+                if retrain:
+                    self._train_region(region, force=True)
+        elif (
+            not proposal.populated
+            and self.train_on_empty
+            and not proposal.populating
+        ):
+            self._train_region(region, force=True)
+        elif (
+            region.mean_block_acceptance < self.acceptance_threshold
+            and self.retrain_acceptance
+        ):
+            self._train_region(region)
+        elif (
+            region.iterations - region.last_trained
+        ) == self.training_frequency:
+            self._train_region(region)
+
+    def _region_flow_reset(self, region):
+        """:meth:`check_flow_model_reset` for a region."""
+        proposal = region.proposal
+        decision = region.retrain_decision
+        if not proposal.training_count:
+            return
+        if decision is not None and decision.allow_reset:
+            if decision.reset_next:
+                proposal.reset_model_weights(weights=True, permutations=True)
+            return
+        if (
+            self.reset_acceptance
+            and region.mean_block_acceptance < self.acceptance_threshold
+        ):
+            proposal.reset_model_weights(weights=True, permutations=True)
+            return
+        proposal.reset_model_weights(
+            weights=(
+                self.reset_weights
+                and not (proposal.training_count % self.reset_weights)
+            ),
+            permutations=(
+                self.reset_permutations
+                and not (proposal.training_count % self.reset_permutations)
+            ),
+        )
+
+    def _train_region(self, region, force=False):
+        """:meth:`train_proposal` for a region, on its own live points."""
+        if (
+            region.iterations - region.last_trained < self.cooldown
+            and region.training_iterations
+            and not force
+        ):
+            return
+        proposal = region.proposal
+        decision = region.retrain_decision
+        region.completed_training = False
+        self._region_flow_reset(region)
+        training_data = region.live_points.copy()
+        proposal.current_live_points = region.live_points
+        reset = proposal.training_count == 0 or (
+            decision is not None and decision.reset_next
+        )
+        st = datetime.datetime.now()
+        proposal.train(training_data)
+        dt = datetime.datetime.now() - st
+        self.training_time += dt
+        self.history["training_iterations"].append(self.iteration)
+        region.training_iterations.append(region.iterations)
+        if decision is not None:
+            epochs = getattr(proposal, "last_training_epochs", None)
+            n_train = len(training_data)
+            decision.record_training_time(dt.total_seconds(), epochs, n_train)
+            decision.start_episode(region.iterations, reset, epochs, n_train)
+            region._retrain_snapshot = (
+                region.time,
+                region.likelihood_time,
+                region.likelihood_evaluations,
+            )
+        region.block_iteration = 0
+        region.block_acceptance = 0.0
+        region.completed_training = True
+        if self.checkpoint_on_training and not self._splitting:
+            # after the iteration: a checkpoint between the kill and its
+            # replacement would count the dead point twice on resume
+            self._checkpoint_pending = True
+
+    def _finalise_partitioned(self):
+        """Stop the regions still running and merge the dead points in
+        likelihood order."""
+        for region in self.active_regions:
+            self._retire_region(region)
+        order = self.state.finalise_partitioned()
+        samples = list(self.nested_samples) + list(self.retired_samples)
+        regions = (
+            [-1] * self._partition_start
+            + list(self.nested_regions)
+            + list(self.retired_regions)
+        )
+        self.nested_samples = [samples[i] for i in order]
+        self.nested_samples_region = np.asarray(regions, dtype=int)[order]
+        self.retired_samples = []
+        self.retired_regions = []
+        self.nested_regions = []
+        self.live_points = None
+
+    def plot_partition(self, filename=None):
+        """Histograms of the split coordinates of the live points, coloured
+        by region, or, before the first split, by the parts of the cut the
+        splitter would make (see :func:`nessai.partition.plot_partition`)."""
+        if self.live_points is None or not len(self.live_points):
+            return None
+        if self.regions is None:
+            proposal = self._flow_proposal
+            coordinates = self._partition_coordinates.freeze(proposal)
+            live = self.live_points
+            coords = coordinates(live)
+            sel = partition_module.hold_out_bit(live) == 0
+            cut = None
+            try:
+                cut = self._partition_splitter.propose(
+                    coords[sel],
+                    coordinates.period_list(),
+                    points=live[sel],
+                    proposal=proposal,
+                    max_labels=self.partition["max_regions"],
+                    force=True,
+                )
+            except Exception as e:  # a diagnostic must not stop the run
+                logger.debug(f"Partition plot: no candidate cut ({e})")
+            labels = cut.classify(coords) if cut is not None else None
+            if cut is not None:
+                shares = np.bincount(labels, minlength=cut.n_labels) / len(
+                    labels
+                )
+                title = (
+                    f"iteration {self.iteration}, not split: candidate "
+                    f"{cut.describe()}, shares "
+                    + ", ".join(f"{s:.3f}" for s in shares)
+                )
+                legend = {k: f"part {k} ({s:.3f})" for k, s in enumerate(shares)}
+            else:
+                title = f"iteration {self.iteration}, not split: no candidate cut"
+                legend = {0: "live points"}
+        else:
+            coordinates, cut = self._partition_last_cut
+            active = self.active_regions
+            live = np.concatenate([r.live_points for r in active])
+            labels = np.concatenate(
+                [np.full(len(r.live_points), r.label) for r in active]
+            )
+            coords = coordinates(live)
+            legend = {
+                r.label: (
+                    f"region {r.label}: n {r.nlive}, ln X "
+                    f"{self.state.region_logw[r.label]:.2f}, max logL "
+                    f"{r.live_points['logL'][-1]:.1f}"
+                )
+                for r in active
+            }
+            stopped = [r.label for r in self.regions if not r.active]
+            title = (
+                f"iteration {self.iteration}: {len(active)} active region(s)"
+                + (f", stopped {stopped}" if stopped else "")
+            )
+        return partition_module.plot_partition(
+            coords,
+            labels,
+            list(coordinates.names),
+            coordinates.period_list(),
+            cut=cut,
+            legend=legend,
+            title=title,
+            filename=filename,
+        )
+
+    def _plot_partition_diagnostic(self, split=False):
+        if (
+            getattr(self, "partition", None) is None
+            or not self.plot
+            or not self.partition["plot"]
+            or not self.output
+        ):
+            return
+        directory = os.path.join(self.output, "diagnostics")
+        os.makedirs(directory, exist_ok=True)
+        names = ["partition.png"]
+        if split:
+            names.append(f"partition_split_{self.iteration}.png")
+        try:
+            for name in names:
+                self.plot_partition(filename=os.path.join(directory, name))
+        except Exception as e:  # a diagnostic must not stop the run
+            logger.warning(f"Partition plot failed: {type(e).__name__}: {e}")
+
+    def partition_summary(self):
+        """The regions as a structured array (one row each)."""
+        fields = [
+            ("region", "i8"),
+            ("parent", "i8"),
+            ("active", "?"),
+            ("nlive", "i8"),
+            ("iterations", "i8"),
+            ("trainings", "i8"),
+            ("log_x", "f8"),
+            ("mean_acceptance", "f8"),
+            ("final_p_value", "f8"),
+        ]
+        rows = []
+        for r in self.regions or []:
+            log_x = (
+                self.state.region_logw.get(r.label, -np.inf)
+                if self.state.region_logw is not None
+                else -np.inf
+            )
+            rows.append(
+                (
+                    r.label,
+                    -1 if r.parent is None else r.parent,
+                    r.active,
+                    r.nlive,
+                    r.iterations,
+                    len(r.training_iterations),
+                    log_x,
+                    r.mean_acceptance,
+                    np.nan if r.final_p_value is None else r.final_p_value,
+                )
+            )
+        return np.array(rows, dtype=fields)
 
     def check_training(self):
         """
@@ -1360,7 +2274,9 @@ class NestedSampler(BaseNestedSampler):
         """
         if self.nested_samples:
             if self.live_points is not None:
-                log_x_live_points = self.state.get_logx_live_points(self.nlive)
+                log_x_live_points = self.state.get_logx_live_points(
+                    len(self.live_points)
+                )
             else:
                 log_x_live_points = None
             fig = plot_trace(
@@ -1412,7 +2328,7 @@ class NestedSampler(BaseNestedSampler):
         if not (self.iteration % self.nlive) or force:
             if not force:
                 self.check_insertion_indices()
-                if self.plot:
+                if self.plot and getattr(self, "regions", None) is None:
                     plot_indices(
                         self.insertion_indices[-self.nlive :],
                         self.nlive,
@@ -1435,6 +2351,11 @@ class NestedSampler(BaseNestedSampler):
             if self.uninformed_sampling:
                 self.block_acceptance = 0.0
                 self.block_iteration = 0
+
+        if getattr(self, "partition", None) is not None and (
+            force or not (self.iteration % self.partition["plot_every"])
+        ):
+            self._plot_partition_diagnostic()
 
         if self.checkpointing:
             self.checkpoint(periodic=True)
@@ -1466,10 +2387,13 @@ class NestedSampler(BaseNestedSampler):
         Finalise things after sampling
         """
         logger.info("Finalising")
-        for i, p in enumerate(self.live_points):
-            self.state.increment(p["logL"], nlive=self.nlive - i)
-            self.nested_samples.append(p)
-        self.live_points = None
+        if getattr(self, "regions", None) is not None:
+            self._finalise_partitioned()
+        else:
+            for i, p in enumerate(self.live_points):
+                self.state.increment(p["logL"], nlive=self.nlive - i)
+                self.nested_samples.append(p)
+            self.live_points = None
 
         # Refine evidence estimate
         self.update_state(force=True)
@@ -1541,9 +2465,16 @@ class NestedSampler(BaseNestedSampler):
         logger.info("Starting nested sampling loop")
 
         while not self.stopping_criterion.is_met(self.condition):
-            self.check_state()
-
-            self.consume_sample()
+            if getattr(self, "partition", None) is not None:
+                self._maybe_partition()
+            if getattr(self, "regions", None) is not None:
+                if not self.active_regions:
+                    self.condition = 0.0
+                    continue
+                self._partitioned_iteration()
+            else:
+                self.check_state()
+                self.consume_sample()
 
             self.update_state()
 
@@ -1605,11 +2536,49 @@ class NestedSampler(BaseNestedSampler):
         d["information"] = self.information
         d["training_time"] = self.training_time.total_seconds()
         d["population_time"] = self.proposal_population_time.total_seconds()
+        if getattr(self, "regions", None) is not None:
+            fields = [
+                ("iteration", "i8"),
+                ("logL", "f8"),
+                ("parent", "i8"),
+                ("region", "i8"),
+                ("share", "f8"),
+                ("n_points", "i8"),
+                ("n_held_out", "i8"),
+                ("nlive", "i8"),
+                ("log_x", "f8"),
+                ("cut", "S256"),
+            ]
+            d["partitions"] = np.array(
+                [
+                    tuple(
+                        r[k].encode()[:256] if k == "cut" else r[k]
+                        for k, _ in fields
+                    )
+                    for r in self.partitions
+                ],
+                dtype=fields,
+            )
+            d["regions"] = self.partition_summary()
+            region = getattr(self, "nested_samples_region", None)
+            if region is not None:
+                d["nested_samples_region"] = region
+            log_z = self.state.region_log_evidence()
+            d["region_log_evidence"] = np.array(
+                [(-1 if k is None else k, v) for k, v in log_z.items()],
+                dtype=[("region", "i8"), ("log_evidence", "f8")],
+            )
         return d
 
     @classmethod
     def resume_from_pickled_sampler(
-        cls, sampler, model, flow_config=None, weights_path=None, **kwargs
+        cls,
+        sampler,
+        model,
+        flow_config=None,
+        weights_path=None,
+        partition=None,
+        **kwargs,
     ):
         """Resume from a pickled sampler.
 
@@ -1624,6 +2593,11 @@ class NestedSampler(BaseNestedSampler):
         weights_path : Optional[str]
             Weights file to use in place of the weights file stored in the
             pickle file.
+        partition : Optional[dict]
+            If given, replaces the partition configuration (see
+            :py:meth:`configure_partition`), e.g. to enable it on a run
+            started without it. The regions of a run already split are
+            kept.
         kwargs :
             Keyword arguments passed to the parent class's method.
 
@@ -1638,4 +2612,15 @@ class NestedSampler(BaseNestedSampler):
         if flow_config is None:
             flow_config = {}
         obj._flow_proposal.resume(model, flow_config, weights_path)
+        obj._resume_flow_config = deepcopy(flow_config)
+        if partition is not None or not hasattr(obj, "partition"):
+            obj.configure_partition(partition)
+        for region in obj.active_regions:
+            proposal = region.proposal
+            proposal.resume(model, deepcopy(flow_config), None)
+            if getattr(proposal, "resume_populated", False) and (
+                proposal.indices
+            ):
+                proposal.populated = True
+            proposal.current_live_points = region.live_points
         return obj

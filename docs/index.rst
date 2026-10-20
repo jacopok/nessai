@@ -24,6 +24,7 @@ For questions or other support, please either use our `gitter room <https://app.
    gravitational-wave-inference
    discrete-parameters
    group-mixture-proposal
+   partitioned-nested-sampling
    plugins
    further-details
    faqs

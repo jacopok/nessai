@@ -137,6 +137,18 @@ class _NSIntegralState(_BaseNSIntegralState):
         self.log_vols = [0.0]  # Volumes enclosed by contours
         self.nlive = []
         self.gradients = [0]
+        # prior volume of each dead point (log), in the order of ``logLs``
+        self.log_dx = []
+        # partitioned run (:meth:`split`): log-volume of each active region,
+        # and the retired regions' live points, added as dead points
+        self.region_logw = None
+        self.retired = dict(logL=[], log_dx=[], region=[])
+        self.threshold_logLs = None
+
+    @property
+    def partitioned(self):
+        """True once the prior has been split into regions."""
+        return getattr(self, "region_logw", None) is not None
 
     @property
     def log_evidence(self):
@@ -148,10 +160,38 @@ class _NSIntegralState(_BaseNSIntegralState):
         """The current error on the log-evidence."""
         return np.sqrt(self.info[-1] / self.base_nlive)
 
-    def increment(self, logL, nlive=None):
+    def _logt(self, nlive):
+        if self.expectation == "logt":
+            # <logt> approx -1 / N
+            return -1.0 / nlive
+        # <t> = N / (N + 1)
+        return -np.log1p(1 / nlive)
+
+    def _add_weight(self, Wt, logL):
+        """Add a dead point of log-weight ``Wt`` to the evidence and the
+        information."""
+        oldZ = self.logZ
+        self.logZ = np.logaddexp(self.logZ, Wt)
+        if np.isfinite(oldZ) and np.isfinite(self.logZ) and np.isfinite(logL):
+            info = (
+                np.exp(Wt - self.logZ) * logL
+                + np.exp(oldZ - self.logZ) * (self.info[-1] + oldZ)
+                - self.logZ
+            )
+            self.info.append(info)
+
+    def _active_logw(self):
+        values = list(self.region_logw.values())
+        return float(logsumexp(values)) if values else -np.inf
+
+    def increment(self, logL, nlive=None, region=None):
         """
         Increment the state of the evidence integrator
         Simply uses rectangle rule for initial estimate
+
+        In a partitioned run (:meth:`split`) ``region`` is the region the
+        dead point belongs to: only its volume shrinks, by ``1 / nlive``
+        with ``nlive`` that region's number of live points.
         """
         if logL <= self.logLs[-1]:
             logger.warning(
@@ -160,16 +200,21 @@ class _NSIntegralState(_BaseNSIntegralState):
             )
         if nlive is None:
             nlive = self.base_nlive
+        partitioned = getattr(self, "region_logw", None) is not None
+        if partitioned and region is None:
+            raise RuntimeError("A partitioned run needs the region")
 
         self.nlive.append(nlive)
-        oldZ = self.logZ
         if self.expectation == "logt":
             # <logt> approx -1 / N
             logt = -1.0 / nlive
         else:
             # <t> = N / (N + 1)
             logt = -np.log1p(1 / nlive)
-        Wt = self.logw + logL + np.log1p(-np.exp(logt))
+        logw = self.region_logw[region] if partitioned else self.logw
+        log_dx = logw + np.log1p(-np.exp(logt))
+        Wt = log_dx + logL
+        oldZ = self.logZ
         self.logZ = np.logaddexp(self.logZ, Wt)
         # Update information estimate
         if np.isfinite(oldZ) and np.isfinite(self.logZ) and np.isfinite(logL):
@@ -179,9 +224,18 @@ class _NSIntegralState(_BaseNSIntegralState):
                 - self.logZ
             )
             self.info.append(info)
+        if not hasattr(self, "log_dx"):
+            self.log_dx = []
+        self.log_dx.append(log_dx)
+        if partitioned:
+            self.log_dx_region.append(region)
 
         # Update history
-        self.logw += logt
+        if partitioned:
+            self.region_logw[region] += logt
+            self.logw = self._active_logw()
+        else:
+            self.logw += logt
         self.logLs.append(logL)
         self.log_vols.append(self.logw)
         if self.track_gradients:
@@ -214,11 +268,133 @@ class _NSIntegralState(_BaseNSIntegralState):
         log_x = self.logw + np.cumsum(logt)
         return log_x
 
+    # -- partitioned runs ---------------------------------------------------
+    def split(self, parent, children, log_shares):
+        """Split the volume of region ``parent`` into ``children``.
+
+        Each child gets ``log_shares[i]`` of the parent's current volume
+        (natural log, the shares summing to one). Before the first split the
+        whole run is the region ``parent``.
+        """
+        if not self.partitioned:
+            self.region_logw = {parent: float(self.logw)}
+            self.retired = dict(logL=[], log_dx=[], region=[])
+            self.log_dx_region = [None] * len(getattr(self, "log_dx", []))
+        if parent not in self.region_logw:
+            raise ValueError(f"Region {parent} is not active")
+        log_shares = np.asarray(log_shares, dtype=float)
+        if len(children) != len(log_shares):
+            raise ValueError("One share per child")
+        if not np.isclose(logsumexp(log_shares), 0.0, atol=1e-9):
+            raise ValueError("The shares must sum to one")
+        logw = self.region_logw.pop(parent)
+        for child, log_share in zip(children, log_shares):
+            if child in self.region_logw:
+                raise ValueError(f"Region {child} already exists")
+            self.region_logw[child] = logw + float(log_share)
+        self.logw = self._active_logw()
+
+    def retire(self, region, logLs):
+        """Close ``region``: its live points ``logLs`` become dead points
+        with the volumes of the final live points of a run (``nlive`` from
+        ``len(logLs)`` down to 1), and the rest of its volume, below the last
+        of them, is given to that last point.
+
+        The entries are kept apart from :attr:`logLs`, which stays in the
+        order of the iterations; :meth:`finalise` merges them.
+        """
+        logLs = np.sort(np.asarray(logLs, dtype=float))
+        logw = self.region_logw.pop(region)
+        n = len(logLs)
+        for i, logL in enumerate(logLs):
+            logt = self._logt(n - i)
+            log_dx = logw + np.log1p(-np.exp(logt))
+            logw += logt
+            if i == n - 1:
+                # the volume left inside the last contour
+                log_dx = np.logaddexp(log_dx, logw)
+            self._add_weight(log_dx + logL, logL)
+            self.retired["logL"].append(float(logL))
+            self.retired["log_dx"].append(float(log_dx))
+            self.retired["region"].append(region)
+        self.logw = self._active_logw()
+
+    def region_log_evidence(self):
+        """Evidence of each region's dead points (log), keyed by region;
+        ``None`` holds the points from before the first split."""
+        regions = list(self.log_dx_region) + list(self.retired["region"])
+        log_w = np.concatenate(
+            [
+                np.asarray(self.log_dx, dtype=float)
+                + np.asarray(self._kill_logLs()[1:], dtype=float),
+                np.asarray(self.retired["log_dx"], dtype=float)
+                + np.asarray(self.retired["logL"], dtype=float),
+            ]
+        )
+        out = {}
+        for r in dict.fromkeys(regions):
+            mask = np.array([q == r for q in regions], dtype=bool)
+            out[r] = float(logsumexp(log_w[mask]))
+        return out
+
+    def _kill_logLs(self):
+        return (
+            self.threshold_logLs
+            if getattr(self, "threshold_logLs", None) is not None
+            else self.logLs
+        )
+
+    def finalise_partitioned(self, live_logLs=None):
+        """Merge the dead points of a partitioned run in likelihood order.
+
+        ``live_logLs`` maps each still-active region to its live points'
+        log-likelihoods, which are retired first. Rebuilds :attr:`logLs` and
+        :attr:`log_vols` (the volume above each point, the sum over the
+        regions) and the evidence by the rectangle rule (each point's own
+        volume times its likelihood), and returns the permutation that sorts
+        the dead points, in the order of the iterations followed by the
+        retired points.
+        """
+        for region, logLs in (live_logLs or {}).items():
+            self.retire(region, logLs)
+        if self.region_logw:
+            raise RuntimeError(
+                f"Regions {list(self.region_logw)} are still active"
+            )
+        self.threshold_logLs = list(self.logLs)
+        logL = np.concatenate(
+            [np.asarray(self.logLs[1:], dtype=float), self.retired["logL"]]
+        )
+        log_dx = np.concatenate(
+            [np.asarray(self.log_dx, dtype=float), self.retired["log_dx"]]
+        )
+        order = np.argsort(logL, kind="stable")
+        logL, log_dx = logL[order], log_dx[order]
+        # volume above point k: the sum of the volumes of the points after it
+        above = np.logaddexp.accumulate(log_dx[::-1])[::-1]
+        log_vols = np.concatenate([above[1:], [-np.inf]])
+        self.logLs = [-np.inf] + logL.tolist()
+        self.log_vols = [float(above[0])] + log_vols.tolist()
+        self._sorted_log_dx = log_dx
+        if self.track_gradients:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                grad = np.diff(self.logLs) / np.diff(self.log_vols)
+            grad = np.where(np.isfinite(grad), grad, 0.0)
+            self.gradients = [0] + grad.tolist()
+        log_w = logL + log_dx
+        self.logZ = float(logsumexp(log_w))
+        p = np.exp(log_w - self.logZ)
+        self.info.append(float(np.sum(p * logL) - self.logZ))
+        self._finalised_partitioned = True
+        return order
+
     def finalise(self):
         """
         Compute the final evidence with more accurate integrator
         Call at end of sampling run to refine estimate
         """
+        if getattr(self, "_finalised_partitioned", False):
+            return self.logZ
         # Trapezoidal rule
         # Extra point represents X=0 and assume max(L) = L[-1]
         self.logZ = log_integrate_log_trap(
@@ -258,6 +434,8 @@ class _NSIntegralState(_BaseNSIntegralState):
     @property
     def log_posterior_weights(self):
         """Compute the log-posterior weights."""
+        if getattr(self, "_finalised_partitioned", False):
+            return np.asarray(self.logLs[1:]) + self._sorted_log_dx - self.logZ
         log_L = np.array(self.logLs + [self.logLs[-1]])
         log_vols = np.array(self.log_vols + [-np.inf])
         log_Z = log_integrate_log_trap(log_L, log_vols)

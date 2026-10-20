@@ -158,6 +158,12 @@ class FlowSampler:
 
         if resume and self.check_resume(resume_file, resume_data):
             weights_path = weights_path or weights_file
+            # options a resumed sampler takes from this call
+            resume_options = {
+                key: kwargs[key]
+                for key in ("partition",)
+                if kwargs.get(key) is not None
+            }
             if resume_data is not None:
                 self.ns = self._resume_from_data(
                     SamplerClass,
@@ -167,6 +173,7 @@ class FlowSampler:
                     weights_path=weights_path,
                     flow_config=kwargs.get("flow_config"),
                     checkpoint_callback=kwargs.get("checkpoint_callback"),
+                    **resume_options,
                 )
             else:
                 self.ns = self._resume_from_file(
@@ -177,6 +184,7 @@ class FlowSampler:
                     weights_path=weights_path,
                     flow_config=kwargs.get("flow_config"),
                     checkpoint_callback=kwargs.get("checkpoint_callback"),
+                    **resume_options,
                 )
         else:
             logger.debug("Not resuming sampler")
