@@ -1236,17 +1236,26 @@ class NestedSampler(BaseNestedSampler):
         if max_labels < 2:
             return False
         live = parent.live_points
-        coordinates = self._partition_coordinates.freeze(parent.proposal)
-        coords = coordinates(live)
-        bit = partition_module.hold_out_bit(live)
-        sel = bit == 0
-        cut = self._partition_splitter.propose(
-            coords[sel],
-            coordinates.period_list(),
-            points=live[sel],
-            proposal=parent.proposal,
-            max_labels=max_labels,
-        )
+        # the check changes nothing, so a failure in it (e.g. in a
+        # splitter's frame) leaves the run unsplit rather than stopping it
+        try:
+            coordinates = self._partition_coordinates.freeze(parent.proposal)
+            coords = coordinates(live)
+            bit = partition_module.hold_out_bit(live)
+            sel = bit == 0
+            cut = self._partition_splitter.propose(
+                coords[sel],
+                coordinates.period_list(),
+                points=live[sel],
+                proposal=parent.proposal,
+                max_labels=max_labels,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Partition check at iteration {self.iteration} (region "
+                f"{parent.label}) failed, no split: {e!r}"
+            )
+            return False
         logger.debug(
             f"Partition check at iteration {self.iteration} (region "
             f"{parent.label}): "
