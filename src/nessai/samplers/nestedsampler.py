@@ -1242,6 +1242,11 @@ class NestedSampler(BaseNestedSampler):
                 region.proposal, region.completed_training
             ):
                 continue
+            # a region proposal can declare its region final (e.g. one in
+            # coordinates of a single mode, which the split coordinates
+            # need not even be defined for)
+            if getattr(region.proposal, "splittable", True) is False:
+                continue
             every = config["check_every"] or max(1, region.nlive // 20)
             if region.iterations - region.last_check < every:
                 continue
