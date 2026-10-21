@@ -2569,6 +2569,7 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         with torch.no_grad():
             self.cluster_weights.copy_(old.cluster_weights)
             self._n_active.copy_(old._n_active)
+            self._k_pinned = getattr(old, "_k_pinned", False)
             self._centroids.copy_(old._centroids)
             self._base_mu.copy_(old._base_mu)
             self._base_sd.copy_(old._base_sd)
@@ -2652,6 +2653,8 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         self._proposal_weights.copy_(w)
         self._proposal_weights_seen.fill_(False)
         self._n_active.fill_(1)
+        # the region's cut already separates the experts: never re-split
+        self._k_pinned = True
         self._frozen.zero_()
         self._pending_split_train.fill_(False)
         self._k_shrink_streak.zero_()
@@ -2682,7 +2685,11 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     def keeps_warm(self, j):
         """Whether expert ``j`` keeps its flow through a reset: it is
         frozen, or (``k >= 2``) it holds at most :attr:`warm_max_share` of the
-        live points."""
+        live points.  A partition region's single expert (pinned by
+        :meth:`keep_expert_of`) always keeps its flow: the region only
+        shrinks, and a rebuilt flow would be starved of training points."""
+        if getattr(self, "_k_pinned", False) and j == 0:
+            return True
         if self._n_active_experts() < 2 or j >= self._n_active_experts():
             return False
         if bool(self._frozen[j]):
@@ -3198,6 +3205,8 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         k_cur = int(self._n_active.item())
         self._k_now = False
         k_want = self._k_want(t, ts, mu, sd)
+        if getattr(self, "_k_pinned", False):
+            k_want = 1
 
         if not bool(self._clustering_seen) or self._k_now:
             k = k_want
