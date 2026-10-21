@@ -11,6 +11,7 @@ from scipy.special import logsumexp
 from nessai.flowsampler import FlowSampler
 from nessai.model import Model
 from nessai.posterior import compute_weights
+from nessai.proposal import FlowProposal
 from nessai.samplers.nestedsampler import NestedSampler
 
 torch.set_num_threads(1)
@@ -208,3 +209,49 @@ def test_partition_n_min_refuses_small_parts(tmp_path):
     assert not fs.ns.partitions
     err = max(fs.ns.state.log_evidence_error, 0.05)
     assert abs(fs.ns.log_evidence - model.logZ) < 4 * err
+
+
+class FreshProposalForPositiveX:
+    """``region_proposal`` factory: the region at ``x > 0`` gets a new
+    flow proposal with its own flow, the other keeps its copy."""
+
+    def __init__(self):
+        self.calls = []
+        self.made = []
+
+    def __call__(self, clone, region, sampler):
+        self.calls.append(region.label)
+        if np.median(region.live_points["x"]) < 0:
+            return None
+        proposal = FlowProposal(
+            sampler.model,
+            flow_config=dict(n_blocks=3, n_neurons=8),
+            poolsize=clone._poolsize,
+            plot=False,
+        )
+        self.made.append(proposal)
+        return proposal
+
+
+@pytest.mark.slow_integration_test
+def test_partition_region_proposal(tmp_path):
+    """A region can sample with a proposal of its own (``region_proposal``),
+    restricted to the region like the copies."""
+    model = TwoModes()
+    factory = FreshProposalForPositiveX()
+    fs = FlowSampler(
+        model,
+        output=str(tmp_path / "partition_region_proposal"),
+        nlive=500,
+        seed=1234,
+        plot=False,
+        checkpointing=False,
+        flow_config=FLOW,
+        partition={"coordinates": ["x"], "region_proposal": factory},
+    )
+    fs.run(plot=False, save=False)
+    _check_result(fs.ns, model)
+    assert sorted(factory.calls) == [1, 2]
+    (proposal,) = factory.made
+    assert proposal.training_count > 0
+    assert proposal.truncation.get_rule("region") is not None

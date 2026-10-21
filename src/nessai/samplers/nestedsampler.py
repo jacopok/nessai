@@ -1069,6 +1069,7 @@ class NestedSampler(BaseNestedSampler):
         check_every=None,
         plot_every=None,
         plot=True,
+        region_proposal=None,
     )
 
     def configure_partition(self, partition):
@@ -1112,7 +1113,14 @@ class NestedSampler(BaseNestedSampler):
             * ``plot_every`` (``nlive``): iterations between the diagnostic
               plots (``diagnostics/partition.png``), also made at every
               split;
-            * ``plot`` (True): make them.
+            * ``plot`` (True): make them;
+            * ``region_proposal``: a factory (as for ``coordinates``) called
+              as ``factory(copy, region, sampler)`` with the copy of the
+              parent's proposal made for each new region; it returns
+              ``None`` (the region keeps the copy) or a new, uninitialised
+              proposal for the region, e.g. one in coordinates suited to
+              the region alone. It gets the copy's truncation rules
+              (including the region's).
         """
         if not hasattr(self, "regions"):
             self.regions = None
@@ -1166,6 +1174,13 @@ class NestedSampler(BaseNestedSampler):
         self.partition = config
         self._partition_coordinates = coordinates
         self._partition_splitter = splitter
+        self._partition_region_proposal = (
+            None
+            if config["region_proposal"] is None
+            else partition_module.build(
+                config["region_proposal"], None, partition_module
+            )
+        )
         logger.info(
             f"Partition: coordinates {list(coordinates.names)}, splitter "
             f"{type(splitter).__name__}, n_min {config['n_min']}, max "
@@ -1428,7 +1443,32 @@ class NestedSampler(BaseNestedSampler):
         restrict = getattr(clone, "restrict_to_region", None)
         if restrict is not None:
             restrict(region.live_points)
+        factory = getattr(self, "_partition_region_proposal", None)
+        if factory is not None:
+            replacement = factory(clone, region, self)
+            if replacement is not None:
+                return self._install_region_proposal(replacement, clone, region)
         return clone
+
+    def _install_region_proposal(self, proposal, clone, region):
+        """Set up ``proposal`` (from the ``region_proposal`` factory) in
+        place of ``clone`` for ``region``: the clone's output directory and
+        truncation rules (the region's among them), its own random
+        generator, initialised."""
+        proposal.output = clone.output
+        proposal.rng = np.random.default_rng(int(self.rng.integers(2**63)))
+        proposal.initialise()
+        proposal._truncation_scheme = deepcopy(clone._truncation_scheme)
+        proposal._truncation_scheme.configure(proposal)
+        if hasattr(proposal, "_sync_truncation_state"):
+            proposal._sync_truncation_state()
+        proposal.current_live_points = region.live_points
+        logger.info(
+            f"Partition: region {region.label} samples with "
+            f"{type(proposal).__name__} instead of a copy of "
+            f"{type(clone).__name__}"
+        )
+        return proposal
 
     def _child_retrain_decision(self, parent, nlive):
         """A new retrain decision with the parent's unit costs."""
