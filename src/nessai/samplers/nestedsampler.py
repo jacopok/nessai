@@ -1424,6 +1424,10 @@ class NestedSampler(BaseNestedSampler):
             clone._sync_truncation_state()
         clone.current_live_points = region.live_points
         partition_module.check_clone(source, clone, region.live_points)
+        # e.g. a mixture keeps the expert of the region's side of the cut
+        restrict = getattr(clone, "restrict_to_region", None)
+        if restrict is not None:
+            restrict(region.live_points)
         return clone
 
     def _child_retrain_decision(self, parent, nlive):

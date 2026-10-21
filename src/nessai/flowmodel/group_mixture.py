@@ -2620,6 +2620,46 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         ts = (self._fold_to_base(x) - self._base_mu) / self._base_sd
         return torch.cdist(ts, self._centroids[:act]).argmin(dim=1)
 
+    @torch.no_grad()
+    def keep_expert_of(self, x, min_share=0.99):
+        """Collapse to the one expert that owns the points ``x`` (a region
+        of a partitioned run cut along this mixture's own routing): its flow
+        and canonical standardisation move to slot 0 and ``k`` drops to 1
+        at once, without the shrink hysteresis. Nothing changes unless
+        ``k >= 2`` and one expert owns at least ``min_share`` of ``x``.
+
+        Returns ``(expert, share)`` of the kept expert, else None.
+        """
+        act = int(self._n_active.item())
+        if act < 2 or not bool(self._clustering_seen) or not len(x):
+            return None
+        labels = self._route(x).cpu().numpy()
+        counts = np.bincount(labels, minlength=act)
+        j = int(np.argmax(counts))
+        share = float(counts[j] / len(labels))
+        if share < min_share:
+            return None
+        if j != 0:
+            src = self.experts[j]
+            self.experts[0].load_state_dict(src.state_dict())
+            self.experts[0]._domain_mass_seen = getattr(
+                src, "_domain_mass_seen", False
+            )
+            self._trained[0] = self._trained[j]
+        w = torch.zeros_like(self.cluster_weights)
+        w[0] = 1.0
+        self.cluster_weights.copy_(w)
+        self._proposal_weights.copy_(w)
+        self._proposal_weights_seen.fill_(False)
+        self._n_active.fill_(1)
+        self._frozen.zero_()
+        self._pending_split_train.fill_(False)
+        self._k_shrink_streak.zero_()
+        self._k_grow_streak.zero_()
+        self._centroids[1:].zero_()
+        self._cluster_cache = None
+        return j, share
+
     # -- densities -----------------------------------------------------
     def _active(self):
         """Experts contributing to the *generative / density* path.
@@ -3872,6 +3912,25 @@ class GroupFlowProposalMixin:
         for i, name in enumerate(names):
             out[name] = array[:, i]
         return out
+
+    def restrict_to_region(self, live_points):
+        """A copy of this proposal starting a region of a partitioned run
+        (:meth:`nessai.samplers.nestedsampler.NestedSampler._clone_proposal`):
+        a clustered mixture whose experts the cut separated keeps only the
+        expert of the region's live points
+        (:meth:`ClusteredGroupMixtureFlowWrapper.keep_expert_of`)."""
+        model = getattr(self.flow, "model", None)
+        if model is None or not hasattr(model, "keep_expert_of"):
+            return None
+        # the leading rows are the live points (augmented copies follow)
+        x = self._training_data_as_prime_tensor(live_points)[: len(live_points)]
+        kept = model.keep_expert_of(x)
+        if kept is not None:
+            logger.info(
+                "Region proposal: keeps expert %d (%.3f of its live points)",
+                *kept,
+            )
+        return kept
 
     def _refresh_group_affine_map(self):
         """Backwards-compatible alias for :meth:`_refresh_group_coordinate_bridge`."""

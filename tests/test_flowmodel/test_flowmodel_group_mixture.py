@@ -2902,3 +2902,33 @@ def test_log_prob_at_element_falls_back_off_domain():
         assert torch.allclose(
             w.log_prob_at_element(x, wrong), w.log_prob(x), atol=1e-6
         )
+
+
+def test_clustered_keep_expert_of_moves_the_region_expert_to_slot_zero():
+    """A region of a partitioned run cut along the routing keeps its own
+    expert at once (no shrink hysteresis), in slot 0."""
+    w = ClusteredGroupMixtureFlowWrapper(
+        [_expert() for _ in range(2)], num_features=2, min_cluster_size=10,
+        max_cluster_overlap=0.1,
+    )
+    rng = np.random.default_rng(1)
+    x = _bimodal(800, rng)
+    w._cluster(x)
+    w.finalise()
+    assert int(w._n_active.item()) == 2
+    labels = w._route(x)
+    j = int(labels[0].item())
+    side = x[labels == j]
+    other = 1 - j
+    # the experts differ, so the copy is visible
+    with torch.no_grad():
+        for p in w.experts[other].parameters():
+            p.add_(1.0)
+    expected = {k: v.clone() for k, v in w.experts[j].state_dict().items()}
+    assert w.keep_expert_of(x) is None  # both sides: nothing to collapse
+    assert w.keep_expert_of(side) == (j, 1.0)
+    assert int(w._n_active.item()) == 1
+    assert w.cluster_weights.tolist() == [1.0, 0.0]
+    for k, v in w.experts[0].state_dict().items():
+        assert torch.equal(v, expected[k])
+    assert w.keep_expert_of(side) is None  # k = 1 already
