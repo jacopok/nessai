@@ -376,6 +376,7 @@ class _NSIntegralState(_BaseNSIntegralState):
         self.logLs = [-np.inf] + logL.tolist()
         self.log_vols = [float(above[0])] + log_vols.tolist()
         self._sorted_log_dx = log_dx
+        self.set_partitioned_nlive()
         if self.track_gradients:
             with np.errstate(divide="ignore", invalid="ignore"):
                 grad = np.diff(self.logLs) / np.diff(self.log_vols)
@@ -387,6 +388,18 @@ class _NSIntegralState(_BaseNSIntegralState):
         self.info.append(float(np.sum(p * logL) - self.logZ))
         self._finalised_partitioned = True
         return order
+
+    def set_partitioned_nlive(self):
+        """Set :attr:`nlive` of a finalised partitioned run to the number
+        of live points that gives each merged point its volume, for code
+        that rebuilds the weights from it (:func:`nessai.posterior.
+        compute_weights`, as nessai-bilby does): the renormalised weights
+        are then those of the rectangle rule. The last point has 1, as at
+        the end of an unsplit run."""
+        log_vols = np.asarray(self.log_vols, dtype=float)
+        with np.errstate(divide="ignore"):
+            logt = log_vols[1:-1] - log_vols[:-2]
+        self.nlive = (-1.0 / logt).tolist() + [1.0]
 
     def finalise(self):
         """

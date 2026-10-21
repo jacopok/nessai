@@ -9,6 +9,7 @@ from scipy.special import logsumexp
 
 from nessai.evidence import _NSIntegralState
 from nessai.livepoint import empty_structured_array
+from nessai.posterior import compute_weights
 from nessai.partition import (
     CoreSplitter,
     FirstOf,
@@ -207,6 +208,12 @@ def test_split_state_total_volume_and_evidence(rng):
     assert np.isclose(state.log_vols[0], 0.0)
     assert np.all(np.diff(state.log_vols) <= 0)
     assert set(state.region_log_evidence()) == {None, 1, 2}
+    # the weights rebuilt from the effective nlive (as nessai-bilby does)
+    _, log_w = compute_weights(logL[order], np.array(state.nlive))
+    w = np.exp(log_w - logsumexp(log_w))
+    expected = np.exp(state.log_posterior_weights)
+    # equal up to the last point (whose volume nlive 1 cuts to 1 - 1/e)
+    np.testing.assert_allclose(w[:-1] / w[0], expected[:-1] / expected[0])
 
 
 def test_split_shares_must_sum_to_one():

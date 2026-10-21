@@ -10,6 +10,7 @@ from scipy.special import logsumexp
 
 from nessai.flowsampler import FlowSampler
 from nessai.model import Model
+from nessai.posterior import compute_weights
 from nessai.samplers.nestedsampler import NestedSampler
 
 torch.set_num_threads(1)
@@ -56,6 +57,10 @@ def _check_result(ns, model, n_sigma=4):
     share = w[samples["x"] > 0].sum()
     # the scatter of the share at nlive 500 is ~0.035 (40 seeds)
     assert abs(share - model.share) < 0.12
+    # the weights rebuilt from the effective nlive, as nessai-bilby does
+    _, log_w = compute_weights(samples["logL"], np.array(ns.state.nlive))
+    rebuilt = np.exp(log_w - logsumexp(log_w))
+    np.testing.assert_allclose(rebuilt[:-1] / rebuilt[0], w[:-1] / w[0])
     regions = ns.nested_samples_region
     assert len(regions) == len(samples)
     assert set(np.unique(regions)) == {-1, 1, 2}

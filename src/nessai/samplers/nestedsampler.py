@@ -2652,4 +2652,7 @@ class NestedSampler(BaseNestedSampler):
             ):
                 proposal.populated = True
             proposal.current_live_points = region.live_points
+        if getattr(obj.state, "_finalised_partitioned", False):
+            # a run finished before nessai set the effective nlive
+            obj.state.set_partitioned_nlive()
         return obj
