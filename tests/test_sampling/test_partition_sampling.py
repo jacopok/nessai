@@ -78,8 +78,10 @@ def test_partition_sampling(tmp_path):
         flow_config=FLOW,
         partition={"coordinates": ["x"]},
     )
-    fs.run(plot=False, save=True)
+    # the logX-logL plot: a partitioned run's last volume is zero
+    fs.run(plot=True, plot_posterior=False, plot_indices=False, save=True)
     _check_result(fs.ns, model)
+    assert os.path.exists(os.path.join(output, "logXlogL.png"))
     assert os.path.exists(os.path.join(output, "diagnostics", "partition.png"))
     result = fs.ns.get_result_dictionary()
     assert len(result["partitions"]) == 2
@@ -178,3 +180,26 @@ def test_partition_nested_split(tmp_path):
     for m, share in zip(model.mu, model.w / model.w.sum()):
         near = np.abs(samples["x"] - m) < 1.5
         assert abs(w[near].sum() - share) < 0.1
+
+
+@pytest.mark.slow_integration_test
+def test_partition_n_min_refuses_small_parts(tmp_path):
+    """A cut that would leave a part with fewer than ``n_min`` live points
+    is not used: the run goes on unsplit."""
+    model = TwoModes()
+    fs = FlowSampler(
+        model,
+        output=str(tmp_path / "partition_n_min"),
+        nlive=500,
+        seed=1234,
+        plot=False,
+        checkpointing=False,
+        flow_config=FLOW,
+        # the smaller mode holds 30% of the 500 live points
+        partition={"coordinates": ["x"], "n_min": 200},
+    )
+    fs.run(plot=False, save=False)
+    assert fs.ns.regions is None
+    assert not fs.ns.partitions
+    err = max(fs.ns.state.log_evidence_error, 0.05)
+    assert abs(fs.ns.log_evidence - model.logZ) < 4 * err

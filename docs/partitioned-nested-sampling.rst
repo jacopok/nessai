@@ -26,8 +26,7 @@ How it works
   the points with bit 0. The share of the prior volume of each part is the
   fraction of the points with bit 1 that fall in it, so it is not biased by
   the choice of the moment of the split.
-- **The regions.** Each part keeps its live points, topped up with
-  independent draws to ``n_min`` if it has fewer, and gets its own copy of
+- **The regions.** Each part keeps its live points and gets its own copy of
   the flow proposal. The copy is restricted to the region (draws outside it
   are discarded before the likelihood is evaluated), trained on the region's
   live points and retrained by its own retrain decision. Its weight cap
@@ -85,7 +84,12 @@ The options (:py:meth:`nessai.samplers.nestedsampler.NestedSampler.configure_par
   spacings), :py:class:`nessai.partition.CoreSplitter` (a concentrated core
   cut from a diffuse rest), :py:class:`nessai.partition.FirstOf` (the first
   of several), or any object with the same ``propose`` method.
-- ``n_min`` (``nlive // 5``), ``max_regions`` (4), ``check_every``
+- ``n_min`` (``nlive // 5``): a cut is used only if every part holds at
+  least this many live points. A region with a few hundred points or fewer
+  trains a poor flow, and drawing from it can cost far more than the
+  likelihood (in GW runs, 15% slivers of 200 points drew ~50000 times per
+  accepted point).
+- ``max_regions`` (4), ``check_every``
   (``nlive // 20`` of each region), ``plot_every`` (``nlive``), ``plot``
   (True).
 

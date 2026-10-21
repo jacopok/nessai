@@ -422,7 +422,10 @@ class _NSIntegralState(_BaseNSIntegralState):
         plt.grid(which="both")
         plt.xlabel("log prior-volume")
         plt.ylabel("log-likelihood")
-        plt.xlim([self.log_vols[-1], self.log_vols[0]])
+        # a partitioned run's last volume is exactly zero (log -inf)
+        log_vols = np.asarray(self.log_vols, dtype=float)
+        log_vols = log_vols[np.isfinite(log_vols)]
+        plt.xlim([log_vols.min(), log_vols.max()])
 
         if filename is not None:
             fig.savefig(filename, bbox_inches="tight")

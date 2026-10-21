@@ -343,6 +343,10 @@ class NestedSampler(BaseNestedSampler):
     def proposal_population_time(self):
         t = self._uninformed_proposal.population_time
         t += self._flow_proposal.population_time
+        # the proposals of regions that were split again
+        split = vars(self).get("_split_population_time")
+        if split is not None:
+            t += split
         for region in getattr(self, "regions", None) or []:
             if region.proposal is not None:
                 t += region.proposal.population_time
@@ -1076,8 +1080,8 @@ class NestedSampler(BaseNestedSampler):
         split coordinates. When it proposes a cut, the region (at first the
         whole prior) is split into frozen parts: each part gets the share of
         its volume that the live points with bit 1 estimate, keeps its live
-        points (topped up with independent draws to ``n_min``) and its own
-        copy of the proposal, restricted to the part
+        points (a cut is used only if every part has at least ``n_min``) and
+        its own copy of the proposal, restricted to the part
         (:class:`nessai.partition.RegionTruncation`) and trained on its
         points. The regions then run in lockstep: the lowest live point of
         all is killed, only its region's volume shrinks (by one over that
@@ -1100,7 +1104,8 @@ class NestedSampler(BaseNestedSampler):
               :class:`nessai.partition.GapSplitter`, which takes one
               coordinate);
             * ``n_min`` (``nlive // 5``): minimum number of live points of a
-              region;
+              region; a cut that leaves fewer in a part is not used (a
+              region with few points trains a poor flow and draws slowly);
             * ``max_regions`` (4): maximum number of active regions;
             * ``check_every`` (``nlive // 20`` of the region): iterations
               between checks;
@@ -1281,6 +1286,16 @@ class NestedSampler(BaseNestedSampler):
                 f"{shares.tolist()}): not splitting"
             )
             return False
+        n_min = self.partition["n_min"]
+        if counts.min() < n_min:
+            # a region with few live points trains a poor flow and draws
+            # slowly: keep them with the rest
+            logger.debug(
+                f"Partition: cut {cut.describe()} leaves a part with fewer "
+                f"than {n_min} live points (counts {counts.tolist()}): not "
+                "splitting"
+            )
+            return False
         first = self.regions is None
         if first:
             self.regions = []
@@ -1296,7 +1311,6 @@ class NestedSampler(BaseNestedSampler):
         )
         self._next_region_label += n_labels
         self.state.split(parent.label, child_labels, np.log(shares))
-        n_min = self.partition["n_min"]
         children = []
         for k, label in enumerate(child_labels):
             child = partition_module.Region(
@@ -1337,6 +1351,11 @@ class NestedSampler(BaseNestedSampler):
             logger.warning("Partition: the regions train without memory")
         if not first:
             self.regions.remove(parent)
+            if parent.proposal is not None:
+                self._split_population_time = (
+                    getattr(self, "_split_population_time", datetime.timedelta())
+                    + parent.proposal.population_time
+                )
         parent.active = False
         self.regions.extend(children)
         self._partition_last_cut = (coordinates, cut)
@@ -1388,6 +1407,7 @@ class NestedSampler(BaseNestedSampler):
         clone.resume_populated = False
         clone.samples = None
         clone.x = None
+        clone.population_time = datetime.timedelta()
         partition_module.respawn_generators(clone, self.rng)
         flow_config = getattr(self, "_resume_flow_config", None)
         if flow_config is None:
