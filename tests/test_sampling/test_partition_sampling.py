@@ -255,3 +255,91 @@ def test_partition_region_proposal(tmp_path):
     (proposal,) = factory.made
     assert proposal.training_count > 0
     assert proposal.truncation.get_rule("region") is not None
+
+
+class FinalFlowProposal(FlowProposal):
+    """A region proposal that declares its region final."""
+
+    splittable = False
+
+
+class FinalProposalForNegativeX:
+    """``region_proposal`` factory: the region at ``x < 0`` gets a new flow
+    proposal that is not split again."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, clone, region, sampler):
+        self.calls.append(region.label)
+        if np.median(region.live_points["x"]) > 0:
+            return None
+        return FinalFlowProposal(
+            sampler.model,
+            flow_config=FLOW,
+            poolsize=clone._poolsize,
+            plot=False,
+        )
+
+
+@pytest.mark.slow_integration_test
+def test_partition_region_proposal_final_and_resumed(tmp_path):
+    """A region proposal with ``splittable = False`` keeps its region whole
+    (two modes, which the copies split: see test_partition_nested_split),
+    and the run resumes from a checkpoint taken after it was installed,
+    with the partition passed again (as xg_pe does)."""
+    model = TwoModes(
+        w=(0.4, 0.3, 0.3), mu=(-6.0, -3.0, 6.0), sd=(0.4, 0.4, 0.4)
+    )
+    model.share = 0.3
+    output = str(tmp_path / "partition_final")
+
+    def partition():
+        return {
+            "coordinates": ["x"],
+            "splitter": {"max_share": 0.5},
+            "region_proposal": FinalProposalForNegativeX(),
+        }
+
+    ns = NestedSampler(
+        model,
+        output=output,
+        nlive=400,
+        seed=7,
+        plot=False,
+        checkpointing=True,
+        flow_config=FLOW,
+        max_iteration=2500,
+        partition=partition(),
+    )
+    ns.nested_sampling_loop()
+    assert ns.regions is not None, "no split before the checkpoint"
+    assert not ns.finalised
+    (final,) = [
+        r for r in ns.active_regions if isinstance(r.proposal, FinalFlowProposal)
+    ]
+    assert np.all(final.live_points["x"] < 0)
+    ns = NestedSampler.resume(
+        os.path.join(output, "nested_sampler_resume.pkl"),
+        model,
+        flow_config=FLOW,
+        partition=partition(),
+    )
+    ns.initialise()
+    (final,) = [
+        r for r in ns.active_regions if isinstance(r.proposal, FinalFlowProposal)
+    ]
+    assert final.proposal.training_count > 0
+    assert final.proposal.truncation.get_rule("region") is not None
+    ns.max_iteration = np.inf
+    ns.nested_sampling_loop()
+    assert ns.finalised
+    # one split, of the whole prior
+    assert {p["parent"] for p in ns.partitions} == {0}
+    err = max(ns.state.log_evidence_error, 0.05)
+    assert abs(ns.log_evidence - model.logZ) < 4 * err
+    samples = np.array(ns.nested_samples)
+    w = np.exp(ns.state.log_posterior_weights)
+    for m, share in zip(model.mu, model.w / model.w.sum()):
+        near = np.abs(samples["x"] - m) < 1.5
+        assert abs(w[near].sum() - share) < 0.1
