@@ -206,19 +206,84 @@ class NFlow(BaseFlow):
         self._transform = transform
         self._distribution = distribution
 
+    # Latent distortion (``set_latent_distortion``): the flow draws its
+    # latent as ``z' = mu + sigma * z`` with ``z`` standard, and scores with
+    # ``N(z'; mu, sigma^2)``: an elementwise affine layer at the latent end of
+    # the transform, so the density stays exact on every path. ``forward``
+    # returns the standard ``z`` and ``inverse`` takes it, as the latent
+    # truncation and radius expect. Plain attributes, not buffers: the
+    # weights files keep their keys, and the proposal re-applies its stored
+    # distortion after a reload. As the experts of
+    # :class:`~nessai.flowmodel.group_mixture.DiscreteGroupMixtureFlowWrapper`.
+    _latent_mu = None
+    _latent_log_sigma = None
+    #: :meth:`latent_components` decomposes :meth:`log_prob` exactly
+    supports_latent_components = True
+
+    def set_latent_distortion(self, mu=None, log_sigma=None):
+        """Set (``mu``, ``log_sigma``: ``[dims]`` or ``[1, dims]`` arrays)
+        or clear (``None``) the latent distortion."""
+        if mu is None:
+            self._latent_mu = self._latent_log_sigma = None
+            return
+        import torch
+
+        p = next(self.parameters())
+        self._latent_mu = torch.as_tensor(
+            mu, dtype=p.dtype, device=p.device
+        ).reshape(-1)
+        self._latent_log_sigma = torch.as_tensor(
+            log_sigma, dtype=p.dtype, device=p.device
+        ).reshape(-1)
+
+    @property
+    def latent_distortion(self):
+        """``(mu, log_sigma)`` as ``[dims]`` numpy arrays, or ``None``."""
+        if self._latent_mu is None:
+            return None
+        return (
+            self._latent_mu.detach().cpu().numpy(),
+            self._latent_log_sigma.detach().cpu().numpy(),
+        )
+
+    def latent_components(self, x):
+        """``(log q(x), z(x))``: the undistorted density of ``x`` and its
+        latent, for fitting a distortion: under ``(mu, sigma)`` the density
+        is ``log q(x) + Delta(z(x))``, ``Delta(z) = sum_i log N(z_i; mu_i,
+        sigma_i^2) - log N(z_i; 0, 1)``."""
+        import torch
+
+        with torch.no_grad():
+            z, log_j = self._transform.forward(x)
+            return self._distribution.log_prob(z) + log_j, z
+
+    def _standardise(self, noise, logabsdet):
+        if self._latent_mu is None:
+            return noise, logabsdet
+        z = (noise - self._latent_mu) / self._latent_log_sigma.exp()
+        return z, logabsdet - self._latent_log_sigma.sum()
+
+    def _destandardise(self, z):
+        if self._latent_mu is None:
+            return z, 0.0
+        noise = self._latent_mu + self._latent_log_sigma.exp() * z
+        return noise, self._latent_log_sigma.sum()
+
     def forward(self, x, context=None):
         """
         Apply the forward transformation and return samples in the latent
         space and log-Jacobian determinant.
         """
-        return self._transform.forward(x, context=context)
+        return self._standardise(*self._transform.forward(x, context=context))
 
     def inverse(self, z, context=None):
         """
         Apply the inverse transformation and return samples in the
         data space and log-Jacobian determinant (not log probability).
         """
-        return self._transform.inverse(z, context=context)
+        noise, log_s = self._destandardise(z)
+        x, log_j = self._transform.inverse(noise, context=context)
+        return x, log_j + log_s
 
     def sample(self, num_samples, context=None):
         """
@@ -229,7 +294,7 @@ class NFlow(BaseFlow):
         """
         noise = self._distribution.sample(num_samples)
 
-        samples, _ = self._transform.inverse(noise, context=context)
+        samples, _ = self.inverse(noise, context=context)
 
         return samples
 
@@ -240,7 +305,7 @@ class NFlow(BaseFlow):
 
         Does NOT need to specified by the user
         """
-        noise, logabsdet = self._transform(inputs, context=context)
+        noise, logabsdet = self.forward(inputs, context=context)
         log_prob = self._distribution.log_prob(noise)
         return log_prob + logabsdet
 
@@ -282,7 +347,7 @@ class NFlow(BaseFlow):
         """
         z, log_prob = self._distribution.sample_and_log_prob(N)
 
-        samples, logabsdet = self._transform.inverse(z, context=context)
+        samples, logabsdet = self.inverse(z, context=context)
 
         return samples, log_prob - logabsdet
 
