@@ -168,6 +168,7 @@ def get_n_neurons(
 def get_native_flow_class(name):
     """Get a natively implemented flow class."""
     name = name.lower()
+    from .circular import CircularNeuralSplineFlow
     from .maf import MaskedAutoregressiveFlow
     from .nsf import NeuralSplineFlow
     from .realnvp import RealNVP
@@ -178,6 +179,8 @@ def get_native_flow_class(name):
         "frealnvp": RealNVP,
         "spline": NeuralSplineFlow,
         "nsf": NeuralSplineFlow,
+        "circular": CircularNeuralSplineFlow,
+        "circular-nsf": CircularNeuralSplineFlow,
     }
     if name not in flows:
         raise ValueError(f"Unknown flow: {name}")
