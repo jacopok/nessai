@@ -70,3 +70,52 @@ def test_state_dict_keys_unchanged(flow, distortion):
     keys = set(flow.state_dict())
     flow.set_latent_distortion(*distortion)
     assert set(flow.state_dict()) == keys
+
+
+@pytest.mark.integration_test
+def test_fit_with_auxiliary_radius(tmp_path, rng):
+    """The fit evaluates the prior of the live points, which do not carry
+    the auxiliary radius of an angle (e.g. bilby's ``time_jitter`` under
+    time marginalisation, sampled with GWFlowProposal's periodic angle):
+    it is drawn once for them."""
+    from scipy.stats import norm
+
+    from nessai.model import Model
+    from nessai.proposal import FlowProposal
+
+    class AngleModel(Model):
+        def __init__(self):
+            self.names = ["x", "phi"]
+            self.bounds = {"x": [-5, 5], "phi": [0, 2 * np.pi]}
+
+        def log_prior(self, x):
+            log_p = np.log(self.in_bounds(x), dtype="float")
+            return log_p - np.log(10 * 2 * np.pi)
+
+        def log_likelihood(self, x):
+            return norm.logpdf(x["x"]) + 2 * np.cos(x["phi"])
+
+    model = AngleModel()
+    model.set_rng(rng)
+    output = tmp_path / "flowproposal"
+    output.mkdir()
+    fp = FlowProposal(
+        model,
+        output=output,
+        flow_config=dict(n_neurons=4, n_blocks=2, n_layers=1),
+        plot=False,
+        poolsize=100,
+        reparameterisations={"phi": "angle-2pi"},
+        truncation_methods=["log_proposal_threshold"],
+        truncation_kwargs={
+            "log_proposal_threshold": {"quantile": 0.1, "prior_relative": True}
+        },
+        latent_distortion="shared",
+    )
+    fp.initialise()
+    live = model.new_point(300)
+    live["logL"] = model.batch_evaluate_log_likelihood(live)
+    fp.train(live, plot=False)
+    info = fp.latent_distortion_history[-1]
+    assert info.get("reason") != "flow model not supported"
+    assert "heldout_gain" in info or "reason" in info

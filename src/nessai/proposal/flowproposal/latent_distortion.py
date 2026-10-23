@@ -231,6 +231,11 @@ def fit_and_check(proposal, x, quantile, **kwargs):
     real = np.asarray(proposal.latent_real_mask, dtype=bool)
     fit_kw = {k: opts[k] for k in ("mode", "tail", "reg", "steps", "lr")}
 
+    from .truncation import _with_auxiliary_parameters
+
+    # the live points' auxiliary parameters (an angle's radius) drawn once,
+    # for their prior and their flow density alike
+    x = _with_auxiliary_parameters(proposal, x)
     lp, z = components(proposal, x)
     if lp.shape[0] > 1 and not getattr(proposal, "sum_mirror_density", False):
         # each draw is then scored with its own side's density only, which
