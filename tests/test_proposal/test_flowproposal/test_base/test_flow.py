@@ -74,7 +74,9 @@ def test_train_groups_mirror_copies(
     proposal.training_count = 0
     proposal.flow = MagicMock()
     proposal.check_state = MagicMock()
-    proposal.rescale = MagicMock(return_value=(x_prime, np.zeros(len(x_prime))))
+    proposal.rescale = MagicMock(
+        return_value=(x_prime, np.zeros(len(x_prime)))
+    )
     BaseFlowProposal.train(proposal, x, plot=False)
     kwargs = proposal.flow.train.call_args[1]
     if n_copies == 1:

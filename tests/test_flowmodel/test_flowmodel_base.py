@@ -877,4 +877,3 @@ def test_prep_data_with_groups(data_dim):
     # each validation row's mirror copy is also in the validation data
     for row in val:
         assert np.isclose(val, -row, atol=1e-6).all(axis=1).any()
-
