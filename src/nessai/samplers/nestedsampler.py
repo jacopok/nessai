@@ -648,6 +648,13 @@ class NestedSampler(BaseNestedSampler):
             counter = 0
             while True:
                 counter += 1
+                if hasattr(self.proposal, "current_live_points"):
+                    # the flow proposal's truncation thresholds can be taken
+                    # from the current live points (a reference: the live
+                    # points are updated in place)
+                    self.proposal.current_live_points = getattr(
+                        self, "live_points", None
+                    )
                 newparam = self.proposal.draw(copy(oldparam))
 
                 # Prior is computed in the proposal
@@ -951,6 +958,9 @@ class NestedSampler(BaseNestedSampler):
             self.check_flow_model_reset()
 
             training_data = self.live_points.copy()
+            if hasattr(getattr(self, "_flow_proposal", None),
+                       "current_live_points"):
+                self._flow_proposal.current_live_points = self.live_points
             if self.memory and (len(self.nested_samples) >= self.memory):
                 training_data = np.concatenate(
                     [training_data, self.nested_samples[-self.memory :].copy()]

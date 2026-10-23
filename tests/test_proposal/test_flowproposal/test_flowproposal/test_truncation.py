@@ -2,7 +2,7 @@
 """Standalone tests for truncation rules and helpers."""
 
 import logging
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -459,3 +459,425 @@ def test_truncation_scheme_prepare_and_reset(proposal):
     assert np.isnan(radius_rule.radius)
     assert np.isnan(radius_rule.threshold)
     assert np.isnan(likelihood_rule.threshold)
+
+
+@pytest.mark.parametrize("temperature", [None, 1.0, 2.0])
+def test_log_proposal_threshold_uses_tempered_live_log_q(temperature):
+    """The live points are scored at the pool's latent temperature, so the
+    threshold is comparable with the tempered ``log_q`` of the draws."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    z = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]])
+    log_q = np.array([-1.0, -2.0, -3.0, -4.0])
+    proposal = MagicMock()
+    proposal.training_data = np.zeros(4)
+    proposal.forward_pass = MagicMock(return_value=(z, log_q))
+    proposal.latent_temperature = temperature
+
+    def latent_log_prob(z, temperature=None):
+        t = 1.0 if temperature is None else temperature
+        return -0.5 * np.sum(z**2, axis=-1) / t - 0.5 * z.shape[-1] * np.log(t)
+
+    proposal.latent_log_prob = latent_log_prob
+
+    rule = LogProposalThresholdTruncation(quantile=0.5)
+    rule.prepare(proposal, worst_point=None)
+
+    expected = log_q
+    if temperature not in (None, 1.0):
+        expected = (
+            log_q + latent_log_prob(z, temperature) - latent_log_prob(z)
+        )
+    assert rule.threshold == pytest.approx(np.quantile(expected, 0.5))
+
+
+def test_log_proposal_threshold_prior_relative():
+    """With ``prior_relative`` the threshold is on ``log q - log prior``,
+    over the live points and their boundary-inversion mirror copies: the kept
+    draws have log-weights below ``-threshold``, whatever their ``log q``."""
+    from nessai.livepoint import empty_structured_array
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    def arr(v):
+        a = empty_structured_array(len(v), names=["x"])
+        a["x"] = v
+        return a
+
+    def log_q_of(x):
+        return -x["x"] ** 2
+
+    def log_prior(x):
+        return 2.0 * x["x"]
+
+    rng = np.random.default_rng(3)
+    live = arr(rng.uniform(-1, 1, 1000))
+    proposal = MagicMock()
+    proposal.training_data = live
+    proposal.latent_temperature = None
+    # the flow's rescale appends a boundary-inversion mirror copy of every
+    # point (x -> -x - 4, far below the live points' log q): forward_pass
+    # returns twice as many rows as the live points
+    proposal.forward_pass = MagicMock(
+        side_effect=lambda x: (
+            np.zeros((2 * len(x), 1)),
+            np.concatenate([log_q_of(x), -(x["x"] + 4) ** 2]),
+        ))
+
+    def compute_weights(x, log_q):
+        assert len(x) == len(log_q)
+        return log_prior(x) - log_q
+
+    proposal.compute_weights = MagicMock(side_effect=compute_weights)
+
+    rule = LogProposalThresholdTruncation(quantile=0.1, prior_relative=True)
+    rule.prepare(proposal, worst_point=None)
+    # each mirror row is paired with its live point's prior
+    live_level = np.concatenate([
+        log_q_of(live), -(live["x"] + 4) ** 2]) - np.tile(log_prior(live), 2)
+    assert rule.threshold == pytest.approx(np.quantile(live_level, 0.1))
+
+    x = arr(np.linspace(-1, 1, 2001))
+    out, _, _ = rule.apply_after_backward(
+        proposal, x, log_q_of(x), np.zeros((len(x), 1)))
+    assert len(out) == np.sum(log_q_of(x) - log_prior(x) > rule.threshold)
+    assert np.all(log_prior(out) - log_q_of(out) < -rule.threshold)
+
+    # a rule pickled before the option existed thresholds log q, over the
+    # mirror copies too
+    del rule.prior_relative
+    rule.prepare(proposal, worst_point=None)
+    assert rule.threshold == pytest.approx(np.quantile(
+        np.concatenate([log_q_of(live), -(live["x"] + 4) ** 2]), 0.1))
+
+
+def _prior_relative_proposal(live_x):
+    """Mock proposal on a line with log q = -x**2 and a flat prior, so the
+    level (log q - log prior) of a point is -x**2."""
+    from nessai.livepoint import empty_structured_array
+
+    live = empty_structured_array(len(live_x), names=["x"])
+    live["x"] = live_x
+    proposal = MagicMock()
+    proposal.training_data = live
+    proposal.latent_temperature = None
+    proposal.forward_pass = MagicMock(
+        side_effect=lambda x: (np.zeros((len(x), 1)), -x["x"] ** 2))
+    proposal.compute_weights = MagicMock(side_effect=lambda x, log_q: -log_q)
+    return proposal
+
+
+@pytest.mark.parametrize("mode", ["clip", "drop"])
+def test_log_proposal_threshold_lost_mass(mode):
+    """``lost_mass`` sets the threshold at which the live points' mean lost
+    share is the target: ``1 - min(1, c / w)`` in clip mode, the share below
+    the threshold (a quantile) in drop mode."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    live_x = np.random.default_rng(4).normal(size=2000)
+    proposal = _prior_relative_proposal(live_x)
+    level = -live_x**2
+    rule = LogProposalThresholdTruncation(
+        quantile=0.5, prior_relative=True, mode=mode, lost_mass=0.01)
+    rule.prepare(proposal, worst_point=None)
+    t = rule.threshold
+    if mode == "clip":
+        lost = np.mean(1 - np.minimum(1, np.exp(level - t)))
+        assert lost == pytest.approx(0.01, rel=1e-4)
+        # the clip only underweights the points beyond its cap, so losing as
+        # much needs a lower cap (higher threshold) than the drop's quantile
+        assert t > np.quantile(level, 0.01)
+        assert rule.log_weight_cap == -t
+    else:
+        assert t == pytest.approx(np.quantile(level, 0.01))
+    assert rule.lost_live_mass == pytest.approx(0.01, rel=1e-3)
+
+
+def test_log_proposal_threshold_lost_mass_recorded_with_quantile():
+    """Set by ``quantile``, the rule still records the mass it loses."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    live_x = np.random.default_rng(5).normal(size=2000)
+    rule = LogProposalThresholdTruncation(
+        quantile=0.005, prior_relative=True, mode="clip")
+    rule.prepare(_prior_relative_proposal(live_x), worst_point=None)
+    level = -live_x**2
+    expected = np.mean(1 - np.minimum(1, np.exp(level - rule.threshold)))
+    assert rule.lost_live_mass == pytest.approx(expected)
+    assert 0 < rule.lost_live_mass < 0.005
+
+
+def test_log_proposal_threshold_lost_mass_validation_and_old_pickles():
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    with pytest.raises(ValueError, match="prior_relative"):
+        LogProposalThresholdTruncation(lost_mass=0.01)
+    with pytest.raises(ValueError, match=r"\(0, 1\)"):
+        LogProposalThresholdTruncation(prior_relative=True, lost_mass=1.5)
+    # a rule pickled before the option existed uses its quantile
+    live_x = np.random.default_rng(6).normal(size=500)
+    rule = LogProposalThresholdTruncation(
+        quantile=0.1, prior_relative=True, mode="clip")
+    del rule.lost_mass
+    rule.prepare(_prior_relative_proposal(live_x), worst_point=None)
+    assert rule.threshold == pytest.approx(np.quantile(-live_x**2, 0.1))
+
+
+# -- log_level_threshold ------------------------------------------------------
+def _level_proposal(live_x, weights, with_pieces=True):
+    """Mock two-piece proposal on a line: piece 1 is x < 0, the flow level is
+    -x**2 and q = w_piece * exp(level)."""
+    from nessai.livepoint import empty_structured_array
+
+    def arr(xs):
+        a = empty_structured_array(len(xs), names=["x"])
+        a["x"] = xs
+        return a
+
+    def pieces(x):
+        p = (x["x"] < 0).astype(int)
+        return p, np.log(np.asarray(weights, float))[p]
+
+    proposal = MagicMock(spec=["training_data", "forward_pass",
+                               "latent_temperature", "compute_weights",
+                               "training_count", "mixture_levels"])
+    proposal.training_data = arr(live_x)
+    proposal.latent_temperature = None
+    proposal.training_count = 0
+
+    def log_q_of(x):
+        p, log_pi = pieces(x)
+        return -x["x"] ** 2 + (log_pi if with_pieces else 0.0)
+
+    proposal.forward_pass = MagicMock(
+        side_effect=lambda x: (np.zeros((len(x), 1)), log_q_of(x)))
+    proposal.compute_weights = MagicMock(side_effect=lambda x, log_q: -log_q)
+    def levels(x, log_q, z=None):
+        p, log_pi = pieces(x)
+        return p[:, None], (np.asarray(log_q) - log_pi)[:, None]
+
+    if with_pieces:
+        proposal.mixture_levels = MagicMock(side_effect=levels)
+    else:
+        del proposal.mixture_levels
+    return proposal, arr, log_q_of
+
+
+def test_log_level_threshold_ignores_piece_weights():
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    rng = np.random.default_rng(0)
+    live_x = np.r_[rng.uniform(0, 1, 990), rng.uniform(-0.2, -0.1, 10)]
+    draws = rng.uniform(-1, 1, 5000)
+    kept = []
+    for weights in ([0.5, 0.5], [0.99, 0.01]):
+        proposal, arr, log_q_of = _level_proposal(live_x, weights)
+        rule = LogLevelThresholdTruncation(quantile=0.1)
+        rule.prepare(proposal, worst_point=None)
+        assert rule.threshold == pytest.approx(np.quantile(-live_x**2, 0.1))
+        x = arr(draws)
+        out, _, _ = rule.apply_after_backward(
+            proposal, x, log_q_of(x), np.zeros((len(x), 1)))
+        kept.append(np.sort(out["x"]))
+    np.testing.assert_array_equal(kept[0], kept[1])
+
+
+def test_log_level_threshold_without_pieces_is_log_q_threshold():
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    live_x = np.linspace(-1, 1, 101)
+    proposal, _, log_q_of = _level_proposal(live_x, [0.3, 0.7],
+                                            with_pieces=False)
+    rule = LogLevelThresholdTruncation(quantile=0.2)
+    rule.prepare(proposal, worst_point=None)
+    assert rule.threshold == pytest.approx(
+        np.quantile(log_q_of(proposal.training_data), 0.2))
+
+
+def test_log_level_threshold_tightens_an_overrepresented_piece():
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    rng = np.random.default_rng(1)
+    # piece 1 holds 1 % of the live points, all near the flow's core, but a
+    # full-size copy of the support (half of the prior mass)
+    live_x = np.r_[rng.uniform(0, 1, 990), -np.linspace(0.1, 0.2, 10)]
+    proposal, arr, log_q_of = _level_proposal(live_x, [0.5, 0.5])
+    rule = LogLevelThresholdTruncation(quantile=0.005, share_cap=4.0)
+    # through the scheme, as populate() does: its reset must keep the draws
+    scheme = TruncationScheme([rule])
+    scheme.prepare(proposal, worst_point=None)    # new flow: no floors yet
+    assert rule.floors == {}
+    x = arr(rng.uniform(-1, 1, 20000))
+    scheme.apply_after_backward(proposal, x, log_q_of(x), np.zeros((len(x), 1)))
+    scheme.prepare(proposal, worst_point=None)
+    # the share target (4 x ~1 % of the pool) sits above piece 1's lowest
+    # live point, so the floor stops there: no live point is cut out
+    assert list(rule.floors) == [1]
+    assert rule.floors[1] == pytest.approx(-(0.2**2))
+    x = arr(rng.uniform(-1, 1, 20000))
+    out, _, _ = rule.apply_after_backward(
+        proposal, x, log_q_of(x), np.zeros((len(x), 1)))
+    neg = out["x"][out["x"] < 0]
+    assert neg.min() > -0.2
+    assert np.all(out["x"][out["x"] >= 0] ** 2 < -rule.threshold)
+    # a retrained flow starts again from the global threshold
+    proposal.training_count = 1
+    rule.prepare(proposal, worst_point=None)
+    assert rule.floors == {}
+
+
+def test_log_level_threshold_pilot_sets_floors_before_first_pool():
+    """With ``pilot_size`` a new flow's floors come from pilot draws in
+    ``prepare``, so its first pool is already tightened."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    rng = np.random.default_rng(1)
+    live_x = np.r_[rng.uniform(0, 1, 990), -np.linspace(0.1, 0.2, 10)]
+    proposal, arr, log_q_of = _level_proposal(live_x, [0.5, 0.5])
+    proposal.drawsize = 5000
+
+    def backward_pass(z, rescale=True, return_z=False,
+                      return_unit_hypercube=False):
+        x = arr(z[:, 0])
+        return x, log_q_of(x), z
+
+    proposal.sample_latent_distribution = MagicMock(
+        side_effect=lambda n: rng.uniform(-1, 1, (n, 1)))
+    proposal.backward_pass = MagicMock(side_effect=backward_pass)
+
+    rule = LogLevelThresholdTruncation(
+        quantile=0.005, share_cap=4.0, pilot_size=20000)
+    rule.prepare(proposal, worst_point=None)
+    assert proposal.sample_latent_distribution.call_count == 4
+    assert list(rule.floors) == [1]
+    assert rule.floors[1] == pytest.approx(-(0.2**2))
+    # the pilot draws are not reused by the next prepare of the same flow
+    assert rule._draws == []
+    # a retrained flow gets a fresh pilot
+    proposal.training_count = 1
+    rule.prepare(proposal, worst_point=None)
+    assert proposal.sample_latent_distribution.call_count == 8
+    assert list(rule.floors) == [1]
+
+
+def test_log_level_threshold_rejects_cap_below_one():
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    with pytest.raises(ValueError, match="share_cap"):
+        LogLevelThresholdTruncation(share_cap=0.5)
+
+
+def test_log_level_threshold_keeps_a_point_any_candidate_clears():
+    """Overlapping components: a point is in the support if any candidate
+    clears its piece's threshold; a zero-weight piece (-inf) never does."""
+    from nessai.livepoint import empty_structured_array
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    live = empty_structured_array(100, names=["x"])
+    live["x"] = np.linspace(0, 1, 100)
+    proposal = MagicMock(spec=["training_data", "forward_pass",
+                               "latent_temperature", "mixture_levels"])
+    proposal.training_data = live
+    proposal.latent_temperature = None
+    proposal.forward_pass = MagicMock(
+        side_effect=lambda x: (np.zeros((len(x), 1)), -x["x"]))
+    # candidate 0: level -x (piece 0); candidate 1: level -x - 5 (piece 1),
+    # except points with x > 2, where piece 0 has zero weight and piece 1
+    # has level 0
+    def levels(x, log_q, z=None):
+        a = -x["x"].astype(float)
+        b = a - 5.0
+        far = x["x"] > 2
+        a = np.where(far, -np.inf, a)
+        b = np.where(far, 0.0, b)
+        return np.tile([0, 1], (len(x), 1)), np.stack([a, b], axis=1)
+
+    proposal.mixture_levels = MagicMock(side_effect=levels)
+    rule = LogLevelThresholdTruncation(quantile=0.5)
+    rule.prepare(proposal, worst_point=None)
+    assert rule.threshold == pytest.approx(-0.5, abs=0.01)
+    x = empty_structured_array(4, names=["x"])
+    x["x"] = [0.2, 0.9, 3.0, 1.5]
+    out, _, _ = rule.apply_after_backward(
+        proposal, x, -x["x"], np.zeros((4, 1)))
+    np.testing.assert_array_equal(out["x"], [0.2, 3.0])
+
+
+def test_log_level_threshold_keeps_nothing_from_an_empty_batch():
+    """A failed backward pass returns plain empty arrays; the rule must pass
+    them through rather than fail to reshape the empty levels."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    live_x = np.linspace(-1, 1, 101)
+    proposal, _, _ = _level_proposal(live_x, [0.3, 0.7])
+    proposal.mixture_levels = MagicMock(
+        side_effect=lambda x, log_q, z=None: (
+            np.zeros((len(x), 1), dtype=int),
+            np.asarray(log_q).reshape(len(x), 1),
+        )
+    )
+    rule = LogLevelThresholdTruncation(quantile=0.2, share_cap=4.0)
+    rule.prepare(proposal, worst_point=None)
+    out, log_q, z = rule.apply_after_backward(
+        proposal, np.array([]), np.array([]), np.array([]))
+    assert len(out) == len(log_q) == len(z) == 0
+
+
+def test_log_level_threshold_prior_relative():
+    """With ``prior_relative`` the level is taken relative to the prior: a
+    draw where the prior is large and the flow broad is cut first."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogLevelThresholdTruncation,
+    )
+
+    rng = np.random.default_rng(2)
+    live_x = rng.uniform(-1, 1, 1000)
+    proposal, arr, log_q_of = _level_proposal(live_x, [0.5, 0.5])
+
+    def log_prior(x):
+        return 2.0 * x["x"]
+
+    proposal.compute_weights = MagicMock(
+        side_effect=lambda x, log_q: log_prior(x) - log_q)
+    rule = LogLevelThresholdTruncation(quantile=0.1, prior_relative=True)
+    rule.prepare(proposal, worst_point=None)
+    assert rule.threshold == pytest.approx(
+        np.quantile(-live_x**2 - 2.0 * live_x, 0.1))
+    x = arr(np.linspace(-1, 1, 2001))
+    out, _, _ = rule.apply_after_backward(
+        proposal, x, log_q_of(x), np.zeros((len(x), 1)))
+    level = -out["x"] ** 2 - 2.0 * out["x"]
+    assert np.all(level > rule.threshold)
+    assert len(out) == np.sum(-x["x"] ** 2 - 2.0 * x["x"] > rule.threshold)
+    # weights in the support are bounded by exp(-threshold) (here w_piece
+    # = 1/2 for both pieces)
+    log_w = log_prior(out) - log_q_of(out)
+    assert np.all(log_w < -rule.threshold - np.log(0.5))
+
+    # a rule pickled before the option existed thresholds log q - log w_p
+    del rule.prior_relative
+    rule.prepare(proposal, worst_point=None)
+    assert rule.threshold == pytest.approx(np.quantile(-live_x**2, 0.1))

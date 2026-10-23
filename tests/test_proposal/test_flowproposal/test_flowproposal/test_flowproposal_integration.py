@@ -298,3 +298,122 @@ def test_rescaling_integration_no_rescaling(tmp_path, model):
 
     assert_structured_arrays_equal(x_prime, x)
     assert_structured_arrays_equal(x_recon, x_prime)
+
+
+@pytest.mark.parametrize("sum_mirror_density", [False, True])
+@pytest.mark.integration_test
+@pytest.mark.timeout(60)
+def test_sum_mirror_density(tmp_path, model, flow_config, sum_mirror_density):
+    """With boundary inversion by duplication a draw is folded back from any
+    side: with ``sum_mirror_density`` it is scored with the flow's density
+    summed over the sides (as are the live points the truncation rules use),
+    otherwise with the side it was drawn on."""
+    from scipy.special import logsumexp
+
+    from nessai.proposal.flowproposal.truncation import _live_log_q
+
+    output = tmp_path / "flowproposal"
+    output.mkdir()
+    fp = FlowProposal(
+        model,
+        output=output,
+        flow_config=flow_config,
+        plot=False,
+        poolsize=100,
+        reparameterisations="inversion-duplicate",
+        sum_mirror_density=sum_mirror_density,
+    )
+    fp.initialise()
+    live = model.new_point(100)
+    fp.train(live, plot=False)
+
+    z = fp.sample_latent_distribution(200)
+    x, log_q = fp.backward_pass(z)
+    sides = fp.mirror_log_q(x)
+    assert sides.shape[0] > 1
+    if sum_mirror_density:
+        np.testing.assert_allclose(log_q, logsumexp(sides, axis=0), atol=1e-5)
+    else:
+        # the density of the side the draw came from
+        assert np.all(np.min(np.abs(sides - log_q), axis=0) < 1e-3)
+        assert np.all(log_q < logsumexp(sides, axis=0))
+
+    live_points, live_log_q = _live_log_q(fp)
+    expected = (
+        logsumexp(fp.mirror_log_q(live_points), axis=0)
+        if sum_mirror_density
+        else fp.mirror_log_q(live_points).ravel()
+    )
+    np.testing.assert_allclose(live_log_q, expected)
+
+
+@pytest.mark.parametrize("sum_mirror_density", [False, True])
+@pytest.mark.integration_test
+def test_prior_relative_threshold_with_auxiliary_radius(
+    tmp_path, rng, sum_mirror_density
+):
+    """Live points do not carry the auxiliary radius of an angle (e.g.
+    GWFlowProposal's sky and phase): the prior-relative rules draw it once,
+    so that the prior of the live points can be evaluated, and the flow
+    density and the mirror copies of the boundary inversion see the same
+    radius."""
+    from scipy.special import logsumexp
+    from scipy.stats import norm
+
+    from nessai.model import Model
+    from nessai.proposal.flowproposal.truncation import _live_log_q
+
+    class AngleModel(Model):
+        def __init__(self):
+            self.names = ["x", "phi"]
+            self.bounds = {"x": [-5, 5], "phi": [0, 2 * np.pi]}
+
+        def log_prior(self, x):
+            log_p = np.log(self.in_bounds(x), dtype="float")
+            return log_p - np.log(10 * 2 * np.pi)
+
+        def log_likelihood(self, x):
+            return norm.logpdf(x["x"]) + 2 * np.cos(x["phi"])
+
+    model = AngleModel()
+    model.set_rng(rng)
+    reparameterisations = {"phi": "angle-2pi"}
+    if sum_mirror_density:
+        reparameterisations["x"] = "inversion-duplicate"
+    output = tmp_path / "flowproposal"
+    output.mkdir()
+    fp = FlowProposal(
+        model,
+        output=output,
+        flow_config=dict(n_neurons=2, n_blocks=1, n_layers=1),
+        plot=False,
+        poolsize=100,
+        reparameterisations=reparameterisations,
+        truncation_methods=["log_proposal_threshold"],
+        truncation_kwargs={
+            "log_proposal_threshold": {
+                "quantile": 0.1,
+                "prior_relative": True,
+                "mode": "clip",
+            }
+        },
+        sum_mirror_density=sum_mirror_density,
+    )
+    fp.initialise()
+    assert "phi_radial" in fp.x_dtype.names
+    live = model.new_point(200)
+    live["logL"] = model.batch_evaluate_log_likelihood(live)
+    fp.train(live, plot=False)
+
+    points, log_q = _live_log_q(fp)
+    assert np.all(points["phi_radial"] > 0)
+    # the radius is the point's own: scoring the points again reuses it
+    if sum_mirror_density:
+        again = logsumexp(fp.mirror_log_q(points), axis=0)
+    else:
+        again = fp.forward_pass(points)[1]
+    np.testing.assert_allclose(again, log_q, rtol=1e-6, atol=1e-6)
+
+    fp.populate(live[np.argmin(live["logL"])], n_samples=50, plot=False)
+    assert fp.populated
+    assert np.isfinite(fp.get_truncation_rule("log_proposal_threshold").threshold)

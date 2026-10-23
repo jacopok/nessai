@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from copy import deepcopy
 
 import numpy as np
+from scipy.special import logsumexp
 
+from ...livepoint import empty_structured_array
 from ...utils import compute_radius
 from ...utils.structures import get_subset_arrays
 
@@ -395,6 +398,605 @@ class MinLogQTruncation(BaseTruncationRule):
         return get_subset_arrays(keep, x, log_q, z)
 
 
+def _accepts_keyword(fn, name):
+    """Whether ``fn`` takes the keyword argument ``name``."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD
+        for p in params
+    )
+
+
+def _threshold_points(proposal):
+    """The live points the truncation thresholds are taken from: the
+    sampler's current live points with ``threshold_from_live_points``,
+    otherwise the flow's training data (the live points at the last
+    training, which lag the current ones by up to a training interval)."""
+    live = getattr(proposal, "current_live_points", None)
+    if getattr(proposal, "threshold_from_live_points", False) is True and (
+        live is not None and len(live)
+    ):
+        return live
+    return proposal.training_data
+
+
+def _with_auxiliary_parameters(proposal, points):
+    """``points`` with the auxiliary x-space parameters of the
+    reparameterisations (e.g. the radius of an
+    :class:`~nessai.reparameterisations.Angle`) drawn once.
+
+    Live points do not carry them, so without this their prior
+    (:meth:`compute_weights`) cannot be evaluated, and each pass through the
+    flow would draw new ones. With the values attached, the flow density,
+    the mirror copies and the prior of a live point all use the same.
+    """
+    names = getattr(getattr(proposal, "x_dtype", None), "names", None) or ()
+    present = points.dtype.names or ()
+    missing = [n for n in names if n not in present]
+    if not missing or not len(points):
+        return points
+    x_prime, _ = proposal.rescale(points.copy())
+    x, _ = proposal.inverse_rescale(x_prime)
+    out = empty_structured_array(len(points), dtype=proposal.x_dtype)
+    for name in present:
+        if name in names:
+            out[name] = points[name]
+    # rows past ``len(points)`` are boundary-inversion mirror copies
+    for name in missing:
+        out[name] = x[name][: len(points)]
+    return out
+
+
+def _live_log_q(proposal):
+    """``log q`` of the live points (:func:`_threshold_points`) under the
+    density the pool is drawn from, and the live points it was evaluated at
+    (with their auxiliary parameters, :func:`_with_auxiliary_parameters`).
+
+    ``backward_pass`` scores draws with the *tempered* latent density
+    (``latent_log_prob(z, latent_temperature)``) while ``forward_pass``
+    returns the untempered flow density, so with ``latent_temperature != 1``
+    the live points are rescored at the same temperature before a threshold
+    is taken from them.
+    """
+    live_points = _with_auxiliary_parameters(
+        proposal, _threshold_points(proposal).copy()
+    )
+    if getattr(proposal, "sum_mirror_density", False) is True and len(
+        live_points
+    ):
+        # the draws are scored with the density summed over the sides of the
+        # boundary inversion: so are the live points
+        sides = proposal.mirror_log_q(live_points)
+        return live_points, logsumexp(sides, axis=0)
+    z, log_q = proposal.forward_pass(live_points)
+    temperature = getattr(proposal, "latent_temperature", None)
+    if temperature not in (None, 1.0):
+        log_q = (
+            log_q
+            + proposal.latent_log_prob(z, temperature)
+            - proposal.latent_log_prob(z, None)
+        )
+    return live_points, log_q
+
+
+class LogProposalThresholdTruncation(BaseTruncationRule):
+    """Truncate samples using the current log-proposal threshold.
+
+    With ``prior_relative`` the thresholded quantity is ``log q - log prior``
+    (minus the rejection-sampling log-weight) instead of ``log q``: the
+    support then caps the weights at ``exp(-threshold)``, dropping first the
+    draws where the flow is broad but the prior large.
+
+    ``mode`` (prior-relative only) is what happens to the draws above the
+    cap: ``"drop"`` discards them, so the pool follows the prior on the
+    support only, and the region where the flow undercovers the live points
+    (``quantile`` of them) is never proposed; ``"clip"`` keeps them with
+    their weight clipped to the cap, so the pool follows ``min(p, c q)``
+    everywhere: no excluded region, at the cost of the likelihood calls
+    spent on the clipped part of the pool (``clipped_share``). In clip mode
+    a clipped draw whose latent the flow's forward map does not return to
+    (``roundtrip_tolerance`` on the latent norm; a numerical failure of the
+    inverse, whose density is then wrong) is discarded.
+
+    ``lost_mass`` (prior-relative only) sets the cap from the share of the
+    likelihood-restricted prior the pool loses instead of from ``quantile``:
+    the live points sample that distribution, and a point with weight ``w``
+    keeps ``min(1, c / w)`` of its mass under the clip (all or none under a
+    drop), so the threshold is the one at which the live points' mean lost
+    share ``E[1 - min(1, c / w)]`` (``drop``: the share above the cap, the
+    quantile itself) equals ``lost_mass``. It averages over the whole upper
+    tail of the weights rather than resting on the few live points beyond a
+    small quantile. In checkpoint replays (xg_pe ``scripts/weight_gate``) the
+    0.5% quantile in clip mode lost 2-4e-3 of the mass; the cost of an
+    iteration grows roughly as ``lost_mass^-0.6`` to ``^-3`` below that.
+    ``quantile`` still sets the latent distortion's target.
+
+    ``prepare`` records the live points outside the cap:
+    ``excluded_live_fraction`` and ``excluded_live_mean_rank`` (their mean
+    likelihood rank in [0, 1]; 0.5 if spread evenly). A rank well below 0.5
+    means the excluded region lies at the low-likelihood edge, which biases
+    the compression of a drop cut. ``lost_live_mass`` is the estimated share
+    of the likelihood-restricted prior lost at the threshold (prior-relative
+    only), whichever rule set it.
+    """
+
+    name = "log_proposal_threshold"
+    _transient_defaults = {"_threshold": np.nan}
+    _modes = ("drop", "clip")
+
+    def __init__(
+        self,
+        quantile: float = 0.05,
+        prior_relative: bool = False,
+        mode: str = "drop",
+        roundtrip_tolerance: float | None = 2.0,
+        lost_mass: float | None = None,
+    ) -> None:
+        super().__init__()
+        self.quantile = float(quantile)
+        self.prior_relative = bool(prior_relative)
+        if mode not in self._modes:
+            raise ValueError(f"mode must be one of {self._modes}")
+        if mode == "clip" and not self.prior_relative:
+            raise ValueError("mode='clip' requires prior_relative=True")
+        if lost_mass is not None:
+            if not self.prior_relative:
+                raise ValueError("lost_mass requires prior_relative=True")
+            if not 0 < lost_mass < 1:
+                raise ValueError("lost_mass must be in (0, 1)")
+            lost_mass = float(lost_mass)
+        self.lost_mass = lost_mass
+        self.mode = mode
+        self.roundtrip_tolerance = (
+            None if roundtrip_tolerance is None else float(roundtrip_tolerance)
+        )
+        self.excluded_live_fraction = np.nan
+        self.excluded_live_mean_rank = np.nan
+        self.lost_live_mass = np.nan
+        self.roundtrip_discarded = 0
+
+    @property
+    def threshold(self) -> float:
+        return self._threshold
+
+    @property
+    def clip(self) -> bool:
+        # rules pickled before the option existed have no attribute
+        return getattr(self, "mode", "drop") == "clip"
+
+    @property
+    def log_weight_cap(self) -> float:
+        """The cap on the rejection log-weights in clip mode, else ``inf``."""
+        if self.clip and np.isfinite(self._threshold):
+            return -self._threshold
+        return np.inf
+
+    def _levels(self, proposal, x, log_q):
+        log_q = np.asarray(log_q, dtype=float)
+        # rules pickled before the option existed have no attribute
+        if not getattr(self, "prior_relative", False) or not len(x):
+            return log_q
+        log_w = np.asarray(proposal.compute_weights(x, log_q), dtype=float)
+        return np.where(np.isfinite(log_w), -log_w, -np.inf)
+
+    def prepare(self, proposal, worst_point, radius=None):
+        live_points, log_q = _live_log_q(proposal)
+        log_q = np.asarray(log_q)
+        if getattr(self, "prior_relative", False) and len(live_points):
+            # Boundary inversion with duplication appends mirror copies of
+            # the live points in blocks of ``len(live_points)`` rows (row r
+            # is a copy of live point r mod n). A draw is weighted with the
+            # density of the side it was drawn on, so the quantile is over
+            # every side's density, each paired with its live point's prior.
+            n = len(live_points)
+            if len(log_q) % n:
+                raise RuntimeError(
+                    f"{len(log_q)} rows of log q for {n} live points: not "
+                    "whole blocks of mirror copies"
+                )
+            live_points = np.tile(live_points, len(log_q) // n)
+        level = self._levels(proposal, live_points, log_q)
+        target = getattr(self, "lost_mass", None)
+        if target is not None and len(level):
+            self._threshold = self._threshold_for_lost_mass(level, target)
+        else:
+            self._threshold = float(np.quantile(level, self.quantile))
+        self._record_excluded(live_points, level)
+        if getattr(self, "prior_relative", False) and len(level):
+            self.lost_live_mass = float(self._lost_mass(level, self._threshold))
+
+    def _lost_mass(self, level, threshold):
+        """Mean share of the live points' mass lost at ``threshold`` (levels
+        ``-ln w``, cap ``ln c = -threshold``): ``1 - min(1, c / w)`` each in
+        clip mode, all of it below the threshold in drop mode."""
+        level = np.asarray(level, dtype=float)
+        if not self.clip:
+            return float(np.mean(level < threshold))
+        return float(np.mean(-np.expm1(np.minimum(level - threshold, 0.0))))
+
+    def _threshold_for_lost_mass(self, level, target, tol=1e-6):
+        """The threshold at which :meth:`_lost_mass` equals ``target``: the
+        loss grows with the threshold, so bisect between the smallest and
+        the largest finite level (clamped there when out of reach)."""
+        level = np.asarray(level, dtype=float)
+        finite = level[np.isfinite(level)]
+        if not len(finite):
+            return float(np.quantile(level, self.quantile))
+        if not self.clip:
+            return float(np.quantile(level, target))
+        lo, hi = float(finite.min()), float(finite.max())
+        if self._lost_mass(level, lo) >= target:
+            return lo
+        if self._lost_mass(level, hi) <= target:
+            return hi
+        while hi - lo > tol:
+            mid = 0.5 * (lo + hi)
+            if self._lost_mass(level, mid) < target:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    def _record_excluded(self, live_points, level):
+        """Fraction and mean likelihood rank of the live points (and mirror
+        copies) below the threshold."""
+        self.excluded_live_fraction = np.nan
+        self.excluded_live_mean_rank = np.nan
+        if not len(level) or "logL" not in (live_points.dtype.names or ()):
+            return
+        logl = np.asarray(live_points["logL"], dtype=float)
+        rank = np.argsort(np.argsort(logl, kind="stable"), kind="stable")
+        rank = rank / max(len(rank) - 1, 1)
+        if len(level) != len(rank):
+            # mirror copies: blocks of ``len(live_points)`` rows
+            if len(level) % len(rank):
+                return
+            rank = np.tile(rank, len(level) // len(rank))
+        out = level < self._threshold
+        self.excluded_live_fraction = float(out.mean())
+        if out.any():
+            self.excluded_live_mean_rank = float(rank[out].mean())
+
+    def apply_after_backward(self, proposal, x, log_q, z):
+        levels = self._levels(proposal, x, log_q)
+        keep = levels > self.threshold
+        if self.clip:
+            # non-finite weights are dropped in either mode
+            keep = np.isfinite(levels) & self._roundtrip_keep(
+                proposal, x, z, ~keep
+            )
+        logger.debug(
+            "Accepting %s / %s samples (log-proposal threshold, %s)",
+            int(keep.sum()),
+            len(x),
+            getattr(self, "mode", "drop"),
+        )
+        return get_subset_arrays(keep, x, log_q, z)
+
+    def _roundtrip_keep(self, proposal, x, z, above):
+        """Keep every draw except the ones above the cap that fail the
+        round-trip check (only those: below the cap a wrong density costs
+        nothing, it is rejected or dropped like any other)."""
+        keep = np.ones(len(x), dtype=bool)
+        tol = getattr(self, "roundtrip_tolerance", None)
+        if tol is None or z is None or not above.any():
+            return keep
+        try:
+            # the latent decomposition of the flow, for the flow models that
+            # provide one (the latent-distortion hooks)
+            from .latent_distortion import roundtrip_gap
+        except ImportError:
+            return keep
+
+        idx = np.flatnonzero(above)
+        try:
+            gap = roundtrip_gap(proposal, x[idx], np.asarray(z)[idx])
+        except Exception as e:  # a diagnostic guard must not stop a run
+            if not getattr(self, "_roundtrip_warned", False):
+                logger.warning(
+                    "Round-trip check failed (%s: %s): clipped draws kept "
+                    "unchecked",
+                    type(e).__name__,
+                    e,
+                )
+                self._roundtrip_warned = True
+            return keep
+        if gap is None:
+            return keep
+        bad = idx[~(gap <= tol)]
+        keep[bad] = False
+        self.roundtrip_discarded = (
+            getattr(self, "roundtrip_discarded", 0) + len(bad)
+        )
+        return keep
+
+
+class LogLevelThresholdTruncation(BaseTruncationRule):
+    """Truncate on the proposal density with each mixture piece's weight
+    divided out, optionally tightening over-represented pieces.
+
+    For a mixture proposal ``q(x) = pi_p(x) f_p(x)`` whose pieces ``p`` tile
+    the space (the group elements of a group-mixture flow, times its experts),
+    the support is ``{log q(x) - log pi_p(x) > t}`` with ``t`` the
+    ``quantile`` of the same level over the live points.  Unlike
+    :class:`LogProposalThresholdTruncation` the support does not depend on the
+    piece weights, so re-weighting the pieces (e.g. importance weights) moves
+    draws between pieces without moving any piece's boundary -- and without
+    moving the threshold, which a piece with a small weight otherwise drags
+    down through its live points' low ``log q``.
+
+    With ``share_cap``, a piece whose share of the prior mass of the support
+    (estimated from the draws of the previous populate) exceeds ``share_cap``
+    times its share of the live points gets its own, higher level floor: the
+    level above which its prior mass is ``share_cap`` times its live share,
+    but never above its lowest live point.  A symmetry image the likelihood is
+    abandoning then stops holding a full-size copy of the support.  Floors are
+    relaxed by ``relax`` when a piece falls well inside the cap, and are
+    reset whenever the flow is retrained.  With ``pilot_size``, a retrained
+    flow's floors are set before its first pool from that many latent draws
+    (flow draws only, no likelihood evaluations); otherwise its first pool
+    is drawn without floors.
+
+    With ``prior_relative``, the level is ``log q(x) - log pi_p(x) -
+    log prior(x)``: the support is a threshold on the piece's density
+    relative to the prior, the region where ``f_p`` concentrates the most
+    mass per unit prior mass.  The pool is rejection-sampled to the prior on
+    the support, so on a plain ``log q`` threshold the draws from where the
+    flow is broad but the prior is large (e.g. the far distance tail) get
+    the largest weights and fill the pool; thresholding ``f_p / prior``
+    instead removes those first, and bounds the weights by ``exp(-t)``.
+
+    The proposal supplies ``mixture_levels(x, log_q) -> (pieces, levels)``,
+    both of shape ``(n, k)``: one candidate (piece, level) per mixture
+    component that can generate ``x`` (e.g. per overlapping expert), with
+    level ``-inf`` for a component whose piece has zero weight.  A point is
+    in the support if any candidate clears its piece's threshold, and is
+    counted towards its highest-level candidate.  Proposals without the
+    method are a single piece with level ``log q``: the rule is then
+    :class:`LogProposalThresholdTruncation`.
+    """
+
+    name = "log_level_threshold"
+    # ``_draws`` (the last pool's kept draws, for the share cap) must survive
+    # the scheme's reset at the start of the next ``prepare``, which uses them
+    _transient_defaults = {"_threshold": np.nan}
+
+    def __init__(
+        self,
+        quantile: float = 0.005,
+        share_cap: float | None = None,
+        relax: float = 0.5,
+        pilot_size: int | None = None,
+        prior_relative: bool = False,
+    ) -> None:
+        super().__init__()
+        self.quantile = float(quantile)
+        if share_cap is not None and share_cap < 1:
+            raise ValueError("share_cap must be >= 1")
+        self.share_cap = None if share_cap is None else float(share_cap)
+        self.relax = float(relax)
+        self.pilot_size = int(pilot_size) if pilot_size else 0
+        self.prior_relative = bool(prior_relative)
+        self._floors = {}
+        self._floors_training = None
+        self._tightened = {}
+        self._draws = []
+
+    @property
+    def threshold(self) -> float:
+        return self._threshold
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["_draws"] = []   # up to a pool's worth of draws: not checkpointed
+        return state
+
+    @property
+    def floors(self) -> dict:
+        """Per-piece level floors above the global threshold."""
+        return dict(self._floors)
+
+    def _levels(self, proposal, x, log_q, z=None, log_w=None):
+        """Candidate (piece, level) pairs of ``x``; ``log_w`` (the weights
+        ``compute_weights`` gives ``x``) saves recomputing the prior."""
+        log_q = np.asarray(log_q, dtype=float)
+        fn = getattr(proposal, "mixture_levels", None)
+        if not len(x):
+            # an empty batch (a failed backward pass) cannot be reshaped
+            # with -1 below: give it one (empty) candidate column
+            return np.zeros((0, 1), dtype=int), log_q.reshape(0, 1)
+        if fn is None:
+            pieces, levels = np.zeros(len(x), dtype=int), log_q
+        elif z is not None and _accepts_keyword(fn, "z"):
+            pieces, levels = fn(x, log_q, z=z)
+        else:
+            pieces, levels = fn(x, log_q)
+        pieces = np.asarray(pieces, dtype=int).reshape(len(x), -1)
+        levels = np.asarray(levels, dtype=float).reshape(len(x), -1)
+        # rules pickled before the option existed have no attribute
+        if getattr(self, "prior_relative", False):
+            if log_w is None:
+                log_w = proposal.compute_weights(x, log_q)
+            log_p = np.asarray(log_w, dtype=float) + log_q
+            levels = np.where(
+                np.isfinite(log_p)[:, None], levels - log_p[:, None], -np.inf
+            )
+        return pieces, levels
+
+    @staticmethod
+    def _best(pieces, levels):
+        """Each point's highest-level candidate."""
+        k = np.argmax(levels, axis=1)
+        rows = np.arange(len(k))
+        return pieces[rows, k], levels[rows, k]
+
+    def _point_thresholds(self, pieces):
+        thr = np.full(pieces.shape, self._threshold)
+        for piece, floor in self._floors.items():
+            thr[pieces == piece] = max(self._threshold, floor)
+        return thr
+
+    def prepare(self, proposal, worst_point, radius=None):
+        live_points, log_q = _live_log_q(proposal)
+        n = len(live_points)
+        # rows past ``n`` are boundary-inversion mirror copies
+        pieces, level = self._best(
+            *self._levels(proposal, live_points, log_q[:n])
+        )
+        self._threshold = float(np.quantile(level, self.quantile))
+        if self.share_cap is not None:
+            self._update_floors(proposal, pieces, level)
+        self._draws = []
+
+    def _update_floors(self, proposal, live_pieces, live_level):
+        training = getattr(proposal, "training_count", None)
+        if training != self._floors_training:
+            # a new flow: levels are not comparable with the old ones
+            self._log_floors()
+            self._floors = {}
+            self._tightened = {}
+            self._floors_training = training
+            if not getattr(self, "pilot_size", 0):
+                return
+            self._draws = self._pilot_draws(proposal)
+        if not self._draws:
+            return
+        d_piece = np.concatenate([d[0] for d in self._draws])
+        d_level = np.concatenate([d[1] for d in self._draws])
+        d_logw = np.concatenate([d[2] for d in self._draws])
+        ok = np.isfinite(d_logw) & (d_piece >= 0)
+        if not ok.any():
+            return
+        d_piece, d_level = d_piece[ok], d_level[ok]
+        w = np.exp(d_logw[ok] - d_logw[ok].max())
+        total = w.sum()
+        valid = live_pieces >= 0
+        all_pieces = np.union1d(np.unique(d_piece), live_pieces[valid])
+        n_live = int(valid.sum())
+        changed = []
+        for piece in all_pieces:
+            in_live = valid & (live_pieces == piece)
+            live_share = (in_live.sum() + 0.5) / (n_live + 0.5 * len(all_pieces))
+            sel = d_piece == piece
+            share = w[sel].sum() / total
+            floor = self._floors.get(piece, -np.inf)
+            if share > self.share_cap * live_share:
+                order = np.argsort(-d_level[sel])
+                cum = np.cumsum(w[sel][order])
+                idx = min(
+                    int(np.searchsorted(cum, self.share_cap * live_share * total)),
+                    len(order) - 1,
+                )
+                floor = max(floor, float(d_level[sel][order][idx]))
+            elif share < 0.5 * self.share_cap * live_share:
+                floor = floor - self.relax
+            if in_live.any():
+                floor = min(floor, float(live_level[in_live].min()))
+            if floor > self._threshold:
+                if self._floors.get(piece) != floor:
+                    changed.append((int(piece), share, live_share))
+                    self._tightened[int(piece)] = (share, live_share)
+                self._floors[piece] = floor
+            else:
+                self._floors.pop(piece, None)
+        if changed:
+            logger.debug(
+                "Level threshold %.3f: %d piece(s) tightened (pool/live share: "
+                "%s)",
+                self._threshold,
+                len(self._floors),
+                ", ".join(
+                    f"{p}: {s:.3g}/{l:.3g}" for p, s, l in changed[:8]
+                ),
+            )
+
+    def _pilot_draws(self, proposal):
+        """Draws from a newly trained flow, kept and recorded as
+        :meth:`apply_after_backward` does, to set its floors before its
+        first pool.  Only this rule's support applies (the threshold is set
+        and there are no floors yet)."""
+        draws = []
+        batch = int(getattr(proposal, "drawsize", None) or 10_000)
+        n_drawn = n_kept = 0
+        while n_drawn < self.pilot_size:
+            n = min(batch, self.pilot_size - n_drawn)
+            z = proposal.sample_latent_distribution(n)
+            n_drawn += n
+            x, log_q, z = proposal.backward_pass(
+                z,
+                rescale=True,
+                return_z=True,
+                return_unit_hypercube=getattr(
+                    proposal, "map_to_unit_hypercube", False
+                ),
+            )
+            if not len(x):
+                continue
+            log_w = np.asarray(proposal.compute_weights(x, log_q))
+            cand_pieces, cand_levels = self._levels(
+                proposal, x, log_q, z=z, log_w=log_w
+            )
+            keep = np.any(
+                cand_levels > self._point_thresholds(cand_pieces), axis=1
+            )
+            if not keep.any():
+                continue
+            pieces, level = self._best(cand_pieces[keep], cand_levels[keep])
+            draws.append((pieces, level, log_w[keep]))
+            n_kept += int(keep.sum())
+        logger.debug(
+            "Level threshold pilot: %d / %d draws in the support",
+            n_kept,
+            n_drawn,
+        )
+        return draws
+
+    def _log_floors(self):
+        """Summarise the ending flow's floors (logged once per retrain)."""
+        tightened = getattr(self, "_tightened", None)
+        if not tightened:
+            return
+        worst = sorted(tightened.items(), key=lambda kv: -kv[1][0] / kv[1][1])
+        logger.info(
+            "Level threshold %.3f: %d piece(s) tightened during the last flow, "
+            "%d floor(s) at retrain (pool/live share at the last tightening, "
+            "most over-covered first: %s)",
+            self._threshold,
+            len(tightened),
+            len(self._floors),
+            ", ".join(f"{p}: {s:.3g}/{l:.3g}" for p, (s, l) in worst[:8]),
+        )
+
+    def apply_after_backward(self, proposal, x, log_q, z):
+        log_w = None
+        if getattr(self, "prior_relative", False) and len(x):
+            log_w = np.asarray(proposal.compute_weights(x, log_q))
+        cand_pieces, cand_levels = self._levels(
+            proposal, x, log_q, z=z, log_w=log_w
+        )
+        keep = np.any(
+            cand_levels > self._point_thresholds(cand_pieces), axis=1
+        )
+        if self.share_cap is not None and keep.any():
+            pieces, level = self._best(cand_pieces[keep], cand_levels[keep])
+            if log_w is None:
+                log_w = proposal.compute_weights(x[keep], log_q[keep])
+            else:
+                log_w = log_w[keep]
+            if self._draws is None:
+                self._draws = []
+            self._draws.append((pieces, level, np.asarray(log_w)))
+        logger.debug(
+            "Accepting %s / %s samples above the level threshold",
+            int(keep.sum()),
+            len(x),
+        )
+        return get_subset_arrays(keep, x, log_q, z)
+
+
 class LikelihoodThresholdTruncation(BaseTruncationRule):
     """Truncate samples using the current likelihood threshold."""
 
@@ -429,10 +1031,58 @@ class LikelihoodThresholdTruncation(BaseTruncationRule):
         return get_subset_arrays(keep, x, log_q, z)
 
 
+class LogWeightThresholdTruncation(BaseTruncationRule):
+    """Truncate samples using the current log-weight threshold.
+
+    The threshold is set based on the current live points.
+    """
+
+    name = "log_weight_threshold"
+    _transient_defaults = {"_threshold": np.nan}
+
+    def __init__(
+        self, quantile: float = 0.05, enlargement: float = 0.0
+    ) -> None:
+        super().__init__()
+        self.quantile = quantile
+        self.enlargement = enlargement
+
+    @property
+    def threshold(self) -> float:
+        return self._threshold
+
+    def prepare(self, proposal, worst_point, radius=None):
+        live_points, log_q = _live_log_q(proposal)
+        # boundary inversion with duplication appends mirror copies of the
+        # live points in blocks of ``len(live_points)`` rows
+        log_w = proposal.compute_weights(
+            np.tile(live_points, len(log_q) // max(len(live_points), 1)),
+            log_q=log_q,
+        )
+
+        self._threshold = np.quantile(log_w, self.quantile) - self.enlargement
+
+    def apply_after_backward(self, proposal, x, log_q, z):
+        log_w = proposal.compute_weights(
+            x,
+            log_q=log_q,
+        )
+        keep = log_w > self.threshold
+        logger.debug(
+            "Accepting %s / %s samples above log-weight threshold",
+            int(keep.sum()),
+            len(x),
+        )
+        return get_subset_arrays(keep, x, log_q, z)
+
+
 TRUNCATION_REGISTRY = {
     "latent_radius": LatentRadiusTruncation,
     "min_log_q": MinLogQTruncation,
     "likelihood_threshold": LikelihoodThresholdTruncation,
+    "log_proposal_threshold": LogProposalThresholdTruncation,
+    "log_level_threshold": LogLevelThresholdTruncation,
+    "weights_threshold": LogWeightThresholdTruncation,
 }
 
 
@@ -502,6 +1152,13 @@ class TruncationScheme:
         for rule in self.rules:
             x, log_q, z = rule.apply_after_likelihood(proposal, x, log_q, z)
         return x, log_q, z
+
+    @property
+    def log_weight_cap(self) -> float:
+        """The tightest cap on the rejection log-weights set by a rule in
+        clip mode (``inf`` if none)."""
+        caps = [getattr(rule, "log_weight_cap", np.inf) for rule in self.rules]
+        return float(min(caps, default=np.inf))
 
     def reset(self) -> None:
         for rule in self.rules:
