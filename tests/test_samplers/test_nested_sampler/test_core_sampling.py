@@ -310,3 +310,29 @@ def test_nested_sampling_loop_already_finished(sampler, caplog):
     sampler.check_resume.assert_not_called()
     assert logz is sampler.log_evidence
     np.testing.assert_array_equal(ns, np.array(sampler.nested_samples))
+
+
+@pytest.mark.parametrize("condition", [0.5, 5.0, 800.0, 1e5])
+def test_remaining_iterations(sampler, condition):
+    """Assert the estimate matches the naive formula and does not overflow"""
+    sampler.tolerance = 0.1
+    sampler.condition = condition
+    with np.errstate(over="raise"):
+        out = NestedSampler._remaining_iterations(sampler)
+    assert np.isfinite(out)
+    if condition < 700:
+        expected = sampler.nlive * (
+            np.log(np.expm1(condition)) - np.log(np.expm1(0.1))
+        )
+        np.testing.assert_allclose(out, expected)
+    else:
+        assert out > sampler.nlive * (condition - 1)
+
+
+@pytest.mark.parametrize(
+    "condition, expected", [(0.05, 0.0), (np.inf, np.inf)]
+)
+def test_remaining_iterations_edge_cases(sampler, condition, expected):
+    sampler.tolerance = 0.1
+    sampler.condition = condition
+    assert NestedSampler._remaining_iterations(sampler) == expected

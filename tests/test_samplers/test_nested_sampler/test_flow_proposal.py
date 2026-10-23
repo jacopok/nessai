@@ -281,7 +281,7 @@ def test_train_proposal(sampler, wait):
 
     sampler.check_flow_model_reset.assert_called_once()
     sampler.proposal.train.assert_called_once()
-    sampler.checkpoint.assert_called_once_with(periodic=True)
+    sampler.checkpoint.assert_called_once_with(periodic=True, force=True)
 
     assert sampler.history["training_iterations"] == [100]
     assert sampler.training_time.total_seconds() > 0
@@ -311,7 +311,7 @@ def test_train_proposal_memory(sampler, wait):
     NestedSampler.train_proposal(sampler, force=True)
 
     sampler.check_flow_model_reset.assert_called_once()
-    sampler.checkpoint.assert_called_once_with(periodic=True)
+    sampler.checkpoint.assert_called_once_with(periodic=True, force=True)
     sampler.proposal.train.assert_called_once()
 
     np.testing.assert_array_equal(

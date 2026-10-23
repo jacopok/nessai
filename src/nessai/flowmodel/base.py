@@ -243,6 +243,7 @@ class FlowModel:
         weights=None,
         use_dataloader=False,
         conditional=None,
+        groups=None,
     ):
         """
         Prep data and return dataloaders for training
@@ -261,6 +262,12 @@ class FlowModel:
         weights : array_like, optional
             Array of weights for each sample, weights will used when computing
             the loss.
+        groups : array_like, optional
+            Group label of each sample. Samples sharing a label (e.g. the
+            mirror copies that boundary inversion with duplication appends)
+            are kept on the same side of the training/validation split, so
+            the validation loss is not measured on copies of training
+            samples. ``val_size`` is then the fraction of groups.
 
         Returns
         -------
@@ -276,7 +283,13 @@ class FlowModel:
         if weights is not None and conditional is not None:
             raise RuntimeError("weights and conditional inputs not supported")
 
-        idx = self.rng.permutation(samples.shape[0])
+        if val_size is None:
+            val_size = 0
+        if groups is None:
+            idx = self.rng.permutation(samples.shape[0])
+            n = int((1 - val_size) * samples.shape[0])
+        else:
+            idx, n = self._grouped_split(groups, val_size, samples.shape[0])
         samples = samples[idx]
         if weights is not None:
             if not np.isfinite(weights).all():
@@ -290,9 +303,6 @@ class FlowModel:
         logger.debug("N input samples: {}".format(len(samples)))
 
         # setup data loading
-        if val_size is None:
-            val_size = 0
-        n = int((1 - val_size) * samples.shape[0])
         x_train, x_val = samples[:n], samples[n:]
         if weights is not None:
             weights_train = weights[:n]
@@ -361,6 +371,26 @@ class FlowModel:
         Calls :py:meth:`nessai.flows.base.BaseFlow.end_iteration`
         """
         self.model.end_iteration()
+
+    def _grouped_split(self, groups, val_size, n_samples):
+        """Shuffled sample order with whole groups in the validation set.
+
+        Returns the order and the number of training samples (the first
+        ``n`` of the order).
+        """
+        groups = np.asarray(groups)
+        if groups.shape != (n_samples,):
+            raise ValueError(
+                f"groups must have shape ({n_samples},), got {groups.shape}"
+            )
+        labels = self.rng.permutation(np.unique(groups))
+        n_val_groups = int(round(val_size * len(labels)))
+        if val_size > 0 and len(labels) > 1:
+            n_val_groups = min(max(n_val_groups, 1), len(labels) - 1)
+        is_val = np.isin(groups, labels[:n_val_groups])
+        train_idx = self.rng.permutation(np.flatnonzero(~is_val))
+        val_idx = self.rng.permutation(np.flatnonzero(is_val))
+        return np.concatenate([train_idx, val_idx]), len(train_idx)
 
     def _train(
         self,
@@ -537,6 +567,7 @@ class FlowModel:
         output=None,
         val_size=None,
         plot=True,
+        groups=None,
     ):
         """
         Train the flow on a set of samples.
@@ -563,6 +594,10 @@ class FlowModel:
             specified when the object is initialised
         plot : bool, optional
             Boolean to enable or disable plotting the loss function
+        groups : array_like, optional
+            Group label of each sample: samples sharing a label are kept on
+            the same side of the training/validation split (see
+            :meth:`prep_data`).
 
         Returns
         -------
@@ -621,6 +656,7 @@ class FlowModel:
             weights=weights,
             conditional=conditional,
             use_dataloader=use_dataloader,
+            groups=groups,
         )
 
         if max_epochs is None:
@@ -693,6 +729,8 @@ class FlowModel:
             plot_loss(
                 epoch, history, filename=os.path.join(output, "loss.png")
             )
+        # the epochs of the last training (read by the retrain decision)
+        self.last_training_history = history
         return history
 
     def save_weights(self, weights_file):

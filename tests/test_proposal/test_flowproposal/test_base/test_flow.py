@@ -56,6 +56,37 @@ def test_train_plot_false(mock_os_makedirs, proposal, model):
     proposal.flow.train.assert_called_once()
 
 
+@pytest.mark.parametrize("n_copies", [1, 2, 4])
+@patch("os.path.exists", return_value=False)
+@patch("os.makedirs")
+def test_train_groups_mirror_copies(
+    mock_os_makedirs, mock_exists, proposal, model, n_copies
+):
+    """Rows that rescaling appends as mirror copies (boundary inversion with
+    duplication, in blocks of ``len(x)``) are passed to the flow as groups so
+    the validation split keeps each live point's copies together."""
+    x = model.new_point(3)
+    x_prime = model.new_point(3 * n_copies)
+    proposal.output = "out"
+    proposal._plot_training = False
+    proposal.prime_parameters = model.names
+    proposal.save_training_data = False
+    proposal.training_count = 0
+    proposal.flow = MagicMock()
+    proposal.check_state = MagicMock()
+    proposal.rescale = MagicMock(
+        return_value=(x_prime, np.zeros(len(x_prime)))
+    )
+    BaseFlowProposal.train(proposal, x, plot=False)
+    kwargs = proposal.flow.train.call_args[1]
+    if n_copies == 1:
+        assert "groups" not in kwargs
+    else:
+        np.testing.assert_array_equal(
+            kwargs["groups"], np.tile(np.arange(3), n_copies)
+        )
+
+
 @pytest.mark.parametrize("n", [1, 10])
 def test_forward_pass(proposal, model, n):
     """Test the forward pass method"""
@@ -116,9 +147,30 @@ def test_compute_latent_log_prob_with_temperature(proposal):
     proposal.flow.model.base_distribution_log_prob = MagicMock(
         return_value=torch.zeros(1, dtype=torch.get_default_dtype())
     )
+    proposal.latent_real_mask = np.array([True, True])
     out = BaseFlowProposal.latent_log_prob(proposal, z, temperature=4.0)
     proposal.flow.model.base_distribution_log_prob.assert_called_once()
     np.testing.assert_allclose(out, np.array([-np.log(2.0) * 2]))
+
+
+def test_compute_latent_log_prob_with_temperature_circular(proposal):
+    """The temperature does not rescale circular latent dimensions"""
+    z = np.array([[2.0, 3.0]])
+    proposal.flow = MagicMock()
+    proposal.flow.numpy_array_to_tensor = MagicMock(
+        side_effect=lambda x: torch.from_numpy(x).type(
+            torch.get_default_dtype()
+        )
+    )
+    proposal.flow.model = MagicMock()
+    proposal.flow.model.base_distribution_log_prob = MagicMock(
+        return_value=torch.zeros(1, dtype=torch.get_default_dtype())
+    )
+    proposal.latent_real_mask = np.array([True, False])
+    out = BaseFlowProposal.latent_log_prob(proposal, z, temperature=4.0)
+    z_in = proposal.flow.numpy_array_to_tensor.call_args[0][0]
+    np.testing.assert_allclose(z_in, np.array([[1.0, 3.0]]))
+    np.testing.assert_allclose(out, np.array([-np.log(2.0)]))
 
 
 @pytest.mark.parametrize("temperature", [None, 1.0])

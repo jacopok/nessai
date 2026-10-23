@@ -168,6 +168,7 @@ def get_n_neurons(
 def get_native_flow_class(name):
     """Get a natively implemented flow class."""
     name = name.lower()
+    from .circular import CircularNeuralSplineFlow
     from .maf import MaskedAutoregressiveFlow
     from .nsf import NeuralSplineFlow
     from .realnvp import RealNVP
@@ -178,6 +179,8 @@ def get_native_flow_class(name):
         "frealnvp": RealNVP,
         "spline": NeuralSplineFlow,
         "nsf": NeuralSplineFlow,
+        "circular": CircularNeuralSplineFlow,
+        "circular-nsf": CircularNeuralSplineFlow,
     }
     if name not in flows:
         raise ValueError(f"Unknown flow: {name}")
@@ -270,6 +273,14 @@ def reset_weights(module):
         module.bias.data.zero_()
         module.running_mean.zero_()
         module.running_var.fill_(1)
+    elif isinstance(module, torch.nn.Module) and (
+        isinstance(module, transforms.LULinear)
+        or not any(True for _ in module.parameters(recurse=False))
+    ):
+        # Nothing of its own to reset: containers (their parameters live in
+        # children, which ``Module.apply`` visits separately) and
+        # parameter-free modules; LULinear is reset by reset_permutations.
+        return
     else:
         logger.warning(f"Could not reset: {module}")
 

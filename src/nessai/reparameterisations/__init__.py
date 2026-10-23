@@ -11,6 +11,7 @@ import logging
 
 from .angle import Angle, AnglePair, ToCartesian
 from .base import Reparameterisation
+from .circular import Circular
 from .combined import CombinedReparameterisation
 from .discrete import Dequantise
 from .null import NullReparameterisation
@@ -177,6 +178,7 @@ default_reparameterisations.add_reparameterisation(
     "periodic", Angle, {"scale": None}
 )
 default_reparameterisations.add_reparameterisation("to-cartesian", ToCartesian)
+default_reparameterisations.add_reparameterisation("circular", Circular)
 default_reparameterisations.add_reparameterisation("dequantise", Dequantise)
 default_reparameterisations.add_reparameterisation(
     "dequantise-logit",
@@ -205,6 +207,7 @@ default_reparameterisations.add_external_reparameterisations(
 __all__ = [
     "Angle",
     "AnglePair",
+    "Circular",
     "CombinedReparameterisation",
     "Dequantise",
     "KnownReparameterisation",

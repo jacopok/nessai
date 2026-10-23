@@ -29,6 +29,7 @@ from ..utils import (
     rolling_mean,
 )
 from .base import BaseNestedSampler
+from .retrain import RetrainDecision
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,24 @@ class NestedSampler(BaseNestedSampler):
     trace_parameters : Optional[list[str]]
         List of parameters to include in the trace plot. If None, all model
         parameters are included.
+    retrain_decision : bool or dict, optional
+        If true (or a dictionary of keyword arguments for
+        :py:class:`nessai.samplers.retrain.RetrainDecision`), the flow is
+        only retrained when the pool is empty and the cost-based decision
+        model predicts that retraining reduces the run time. This replaces
+        :code:`training_frequency`, :code:`cooldown`,
+        :code:`retrain_acceptance` and :code:`reset_acceptance`. False (the
+        default) uses those criteria instead.
+    retrain_costs : dict or str, optional
+        Unit costs used by the retrain decision (see
+        :py:class:`nessai.samplers.retrain.RetrainCostModel`). Defaults to
+        the :code:`'gw'` preset, which makes the training schedule
+        deterministic. Can be a dictionary, the name of a preset, the path
+        to a JSON file (e.g. :code:`retrain_costs.json` written by a
+        previous run, or by :code:`python -m
+        nessai.samplers.retrain_benchmark`), :code:`'benchmark'` to measure
+        the costs on this hardware before the run, or None to measure them
+        during the run. The last two make the schedule hardware-dependent.
     kwargs :
         Keyword arguments passed to the flow proposal class
     """
@@ -197,6 +216,8 @@ class NestedSampler(BaseNestedSampler):
         acceptance_threshold=0.01,
         shrinkage_expectation="logt",
         trace_parameters=None,
+        retrain_decision=False,
+        retrain_costs="gw",
         **kwargs,
     ):
         super().__init__(
@@ -275,6 +296,7 @@ class NestedSampler(BaseNestedSampler):
             reset_weights, reset_permutations, reset_flow
         )
         self.configure_training_frequency(training_frequency)
+        self.configure_retrain_decision(retrain_decision, retrain_costs)
 
         if uninformed_proposal_kwargs is None:
             uninformed_proposal_kwargs = {}
@@ -377,6 +399,83 @@ class NestedSampler(BaseNestedSampler):
         else:
             self.training_frequency = training_frequency
 
+    def configure_retrain_decision(self, retrain_decision, retrain_costs):
+        """Configure the cost-based retrain decision."""
+        if not retrain_decision:
+            self.retrain_decision = None
+            return
+        kwargs = retrain_decision if isinstance(retrain_decision, dict) else {}
+        self._retrain_benchmark = retrain_costs == "benchmark"
+        self.retrain_decision = RetrainDecision(
+            self.nlive,
+            costs=None if self._retrain_benchmark else retrain_costs,
+            **kwargs,
+        )
+        self._retrain_snapshot = None
+
+    def benchmark_retrain_costs(self):
+        """Measure the retrain unit costs with the run's configuration."""
+        from .retrain_benchmark import measure_retrain_costs
+
+        ProposalClass, flow_config, kwargs = self._flow_proposal_config
+        filename = None
+        if self.output:
+            filename = os.path.join(
+                self.output, "retrain_costs_benchmark.json"
+            )
+        logger.info("Measuring the retrain unit costs on this hardware")
+        costs = measure_retrain_costs(
+            self.model,
+            nlive=self.nlive,
+            flow_config=flow_config,
+            flow_proposal_class=ProposalClass,
+            filename=filename,
+            **kwargs,
+        )
+        self.retrain_decision.cost.provided.update(costs)
+        self._retrain_benchmark = False
+
+    def _retrain_time_snapshot(self):
+        return (
+            (self.current_sampling_time - self.training_time).total_seconds(),
+            self.likelihood_evaluation_time.total_seconds(),
+            self.total_likelihood_evaluations,
+        )
+
+    def _record_retrain_populations(self):
+        """Record the cost of the pool that has just been used."""
+        snap = self._retrain_time_snapshot()
+        if (
+            self._retrain_snapshot is not None
+            and self.proposal.samples is not None
+        ):
+            dt, dl, dn = (a - b for a, b in zip(snap, self._retrain_snapshot))
+            self.retrain_decision.record_populations(
+                dt, self.proposal.samples.size, dl, dn
+            )
+        self._retrain_snapshot = snap
+
+    def _next_poolsize(self):
+        """Size of the next pool if drawn with the current flow."""
+        proposal = self.proposal
+        if not getattr(proposal, "update_poolsize", False):
+            return proposal.poolsize
+        acc = self.mean_block_acceptance
+        scale = 1.0 / acc if acc > 0 else proposal.max_poolsize_scale
+        scale = min(max(scale, 1.0), proposal.max_poolsize_scale)
+        return int(scale * proposal._poolsize)
+
+    def _remaining_iterations(self):
+        """Rough estimate of the number of iterations left."""
+        tol = self.tolerance
+        if not np.isfinite(self.condition) or tol <= 0:
+            return np.inf
+        if self.condition <= tol:
+            return 0.0
+        # log(expm1(c)) = c + log(-expm1(-c)), stable for large c
+        c = self.condition
+        return self.nlive * (c + np.log(-np.expm1(-c)) - np.log(np.expm1(tol)))
+
     def configure_uninformed_proposal(
         self,
         uninformed_proposal,
@@ -476,6 +575,11 @@ class NestedSampler(BaseNestedSampler):
         kwargs = check_proposal_kwargs(ProposalClass, kwargs)
 
         logger.info(f"Passing kwargs to {ProposalClass.__name__}: {kwargs}")
+        self._flow_proposal_config = (
+            ProposalClass,
+            flow_config,
+            dict(kwargs),
+        )
         self._flow_proposal = ProposalClass(
             self.model,
             rng=self.rng,
@@ -720,6 +824,11 @@ class NestedSampler(BaseNestedSampler):
                 self.accepted += 1
                 self.block_acceptance += 1 / count
                 self.acceptance_history.append(1 / count)
+                if (
+                    self.retrain_decision is not None
+                    and self.proposal is self._flow_proposal
+                ):
+                    self.retrain_decision.record_iteration(count)
                 break
             else:
                 # Only get here if the yield sample returns worse point
@@ -802,6 +911,8 @@ class NestedSampler(BaseNestedSampler):
             steps are complete but live points remain empty.
         """
         flags = [False] * 3
+        if getattr(self, "_retrain_benchmark", False):
+            self.benchmark_retrain_costs()
         if not self._flow_proposal.initialised:
             self._flow_proposal.initialise()
             flags[0] = True
@@ -890,6 +1001,26 @@ class NestedSampler(BaseNestedSampler):
             logger.debug("Training flow (resume)")
             return True, True
         elif (
+            self.retrain_decision is not None
+            and not self.proposal.populated
+            and not self.proposal.populating
+        ):
+            self._record_retrain_populations()
+            retrain = self.retrain_decision.decide(
+                self.iteration,
+                self._next_poolsize(),
+                remaining=self._remaining_iterations(),
+            )
+            self.proposal.max_next_poolsize = (
+                self.retrain_decision.next_poolsize
+            )
+            if retrain:
+                logger.debug("Training flow (retrain decision)")
+                return True, True
+            return False, False
+        elif self.retrain_decision is not None:
+            return False, False
+        elif (
             not self.proposal.populated
             and self.train_on_empty
             and not self.proposal.populating
@@ -919,6 +1050,15 @@ class NestedSampler(BaseNestedSampler):
         manually call `proposal.reset_model_weights`.
         """
         if not self.proposal.training_count:
+            return
+
+        if self.retrain_decision is not None and (
+            self.retrain_decision.allow_reset
+        ):
+            if self.retrain_decision.reset_next:
+                self.proposal.reset_model_weights(
+                    weights=True, permutations=True
+                )
             return
 
         if (
@@ -967,16 +1107,34 @@ class NestedSampler(BaseNestedSampler):
                     [training_data, self.nested_samples[-self.memory :].copy()]
                 )
 
+            reset = self.proposal.training_count == 0 or (
+                self.retrain_decision is not None
+                and self.retrain_decision.reset_next
+            )
             st = datetime.datetime.now()
             self.proposal.train(training_data)
-            self.training_time += datetime.datetime.now() - st
+            dt = datetime.datetime.now() - st
+            self.training_time += dt
             self.history["training_iterations"].append(self.iteration)
+            if self.retrain_decision is not None:
+                epochs = getattr(self.proposal, "last_training_epochs", None)
+                n_train = len(training_data)
+                self.retrain_decision.record_training_time(
+                    dt.total_seconds(), epochs, n_train
+                )
+                self.retrain_decision.start_episode(
+                    self.iteration, reset, epochs, n_train
+                )
+                self._retrain_snapshot = self._retrain_time_snapshot()
 
             self.block_iteration = 0
             self.block_acceptance = 0.0
             self.completed_training = True
             if self.checkpoint_on_training:
-                self.checkpoint(periodic=True)
+                # forced: a periodic checkpoint is throttled by
+                # checkpoint_interval, so the resume file would still lag
+                # the flow just saved
+                self.checkpoint(periodic=True, force=True)
 
     def check_state(self, force=False):
         """
@@ -1318,8 +1476,36 @@ class NestedSampler(BaseNestedSampler):
         # Refine evidence estimate
         self.update_state(force=True)
         self.state.finalise()
+        if self.retrain_decision is not None:
+            self.finalise_retrain_decision()
         # output the chain and evidence
         self.finalised = True
+
+    def finalise_retrain_decision(self):
+        """Log and save the unit costs measured during the run."""
+        summary = self.retrain_decision.summary()
+        for key, value in summary["unit_costs"].items():
+            if value["measured"] is not None:
+                logger.info(
+                    "Retrain decision: measured %s cost %.3g s (provided: %s)",
+                    key,
+                    value["measured"],
+                    value["provided"],
+                )
+        if "long_run" in summary:
+            logger.info(
+                "Retrain decision: optimal interval between trainings "
+                "~%.0f iterations",
+                summary["long_run"]["tau"],
+            )
+        if self.output:
+            filename = os.path.join(self.output, "retrain_costs.json")
+            self.retrain_decision.cost.save(filename)
+            logger.info(
+                "Measured unit costs saved to %s. Pass this file as "
+                "`retrain_costs` to use them in a future run.",
+                filename,
+            )
 
     def nested_sampling_loop(self):
         """Main nested sampling loop.

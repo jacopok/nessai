@@ -49,8 +49,30 @@ def test_update_flow_proposal(proposal):
     """Assert the number of inputs is updated"""
     proposal.flow_config = {}
     proposal.prime_dims = 4
+    proposal.circular_prime_parameters = []
     BaseFlowProposal.update_flow_config(proposal)
     assert proposal.flow_config["n_inputs"] == 4
+    assert "circular_features" not in proposal.flow_config
+
+
+def test_update_flow_proposal_circular(proposal):
+    """Assert the circular prime parameters are passed to the flow"""
+    proposal.flow_config = {"ftype": "circular"}
+    proposal.prime_dims = 3
+    proposal.prime_parameters = ["x_prime", "phi_circ", "psi_circ"]
+    proposal.circular_prime_parameters = ["phi_circ", "psi_circ"]
+    BaseFlowProposal.update_flow_config(proposal)
+    assert proposal.flow_config["circular_features"] == [1, 2]
+
+
+def test_update_flow_proposal_circular_needs_circular_flow(proposal):
+    """Assert circular parameters with a non-circular flow raise"""
+    proposal.flow_config = {"ftype": "realnvp"}
+    proposal.prime_dims = 2
+    proposal.prime_parameters = ["x_prime", "phi_circ"]
+    proposal.circular_prime_parameters = ["phi_circ"]
+    with pytest.raises(ValueError, match="circular flow"):
+        BaseFlowProposal.update_flow_config(proposal)
 
 
 def test_flow_config(proposal):
