@@ -404,9 +404,7 @@ class NestedSampler(BaseNestedSampler):
         if not retrain_decision:
             self.retrain_decision = None
             return
-        kwargs = (
-            retrain_decision if isinstance(retrain_decision, dict) else {}
-        )
+        kwargs = retrain_decision if isinstance(retrain_decision, dict) else {}
         self._retrain_benchmark = retrain_costs == "benchmark"
         self.retrain_decision = RetrainDecision(
             self.nlive,
@@ -422,7 +420,9 @@ class NestedSampler(BaseNestedSampler):
         ProposalClass, flow_config, kwargs = self._flow_proposal_config
         filename = None
         if self.output:
-            filename = os.path.join(self.output, "retrain_costs_benchmark.json")
+            filename = os.path.join(
+                self.output, "retrain_costs_benchmark.json"
+            )
         logger.info("Measuring the retrain unit costs on this hardware")
         costs = measure_retrain_costs(
             self.model,
@@ -445,7 +445,10 @@ class NestedSampler(BaseNestedSampler):
     def _record_retrain_populations(self):
         """Record the cost of the pool that has just been used."""
         snap = self._retrain_time_snapshot()
-        if self._retrain_snapshot is not None and self.proposal.samples is not None:
+        if (
+            self._retrain_snapshot is not None
+            and self.proposal.samples is not None
+        ):
             dt, dl, dn = (a - b for a, b in zip(snap, self._retrain_snapshot))
             self.retrain_decision.record_populations(
                 dt, self.proposal.samples.size, dl, dn
@@ -471,9 +474,7 @@ class NestedSampler(BaseNestedSampler):
             return 0.0
         # log(expm1(c)) = c + log(-expm1(-c)), stable for large c
         c = self.condition
-        return self.nlive * (
-            c + np.log(-np.expm1(-c)) - np.log(np.expm1(tol))
-        )
+        return self.nlive * (c + np.log(-np.expm1(-c)) - np.log(np.expm1(tol)))
 
     def configure_uninformed_proposal(
         self,

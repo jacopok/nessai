@@ -425,7 +425,15 @@ def test_retrain_logs_calculation(rng, caplog):
     assert d.decide(it, 2000) is True
     full, short = caplog.records[-2:]
     assert full.levelno == logging.DEBUG
-    for key in ("Retraining", "c*P=", "g**n=", "acc=", "decay=", "T=", "tau*="):
+    for key in (
+        "Retraining",
+        "c*P=",
+        "g**n=",
+        "acc=",
+        "decay=",
+        "T=",
+        "tau*=",
+    ):
         assert key in full.getMessage()
     assert "reset gain" in full.getMessage()
     assert short.levelno == logging.INFO
