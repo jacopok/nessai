@@ -693,6 +693,8 @@ class FlowModel:
             plot_loss(
                 epoch, history, filename=os.path.join(output, "loss.png")
             )
+        # the epochs of the last training (read by the retrain decision)
+        self.last_training_history = history
         return history
 
     def save_weights(self, weights_file):

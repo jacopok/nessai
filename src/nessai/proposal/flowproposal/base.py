@@ -912,21 +912,23 @@ class BaseFlowProposal(RejectionProposal):
             x_prime, self.prime_parameters, copy=True
         )
 
-        history = self.flow.train(
+        self.flow.train(
             x_prime_array,
             output=block_output,
             plot=self._plot_training and plot,
         )
+
+        if self._plot_training and plot:
+            self._plot_training_data(block_output)
+
         # read by the cost-based retrain decision
+        history = getattr(self.flow, "last_training_history", None)
         if isinstance(history, dict) and "epochs" in history:
             self.last_training_epochs = history["epochs"]
         elif isinstance(history, dict) and "loss" in history:
             self.last_training_epochs = len(history["loss"])
         else:
             self.last_training_epochs = None
-
-        if self._plot_training and plot:
-            self._plot_training_data(block_output)
 
         self.populated = False
         self.training_count += 1
