@@ -67,9 +67,7 @@ def test_wraps(circular):
     x_prime["phi_circ"] = 3 * np.pi + 0.5
     x_prime["psi_circ"] = -np.pi - 0.5
     x_out = empty_structured_array(1, names=["phi", "psi"])
-    x_out, _, _ = circular.inverse_reparameterise(
-        x_out, x_prime, np.zeros(1)
-    )
+    x_out, _, _ = circular.inverse_reparameterise(x_out, x_prime, np.zeros(1))
     np.testing.assert_allclose(x_out["phi"], 0.5)
     np.testing.assert_allclose(x_out["psi"], 1.0 + (2 * np.pi - 0.5) / 2)
 
@@ -82,9 +80,7 @@ class PeriodicModel(Model):
         self.bounds = {"phi": [0, 2 * np.pi], "x": [-5, 5]}
 
     def log_prior(self, x):
-        return np.log(self.in_bounds(x), dtype=float) - np.log(
-            20 * np.pi
-        )
+        return np.log(self.in_bounds(x), dtype=float) - np.log(20 * np.pi)
 
     def log_likelihood(self, x):
         return 5 * np.cos(x["phi"]) + norm.logpdf(x["x"])

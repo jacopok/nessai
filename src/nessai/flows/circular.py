@@ -56,7 +56,11 @@ def embed(x, circular):
     if not circular.any():
         return x
     return torch.cat(
-        [x[:, ~circular], torch.cos(x[:, circular]), torch.sin(x[:, circular])],
+        [
+            x[:, ~circular],
+            torch.cos(x[:, circular]),
+            torch.sin(x[:, circular]),
+        ],
         dim=1,
     )
 
@@ -101,9 +105,7 @@ class CircularUniformNormal(Distribution):
     def _sample(self, num_samples, context):
         if context is not None:
             num_samples = num_samples * context.shape[0]
-        x = torch.randn(
-            num_samples, *self._shape, device=self.circular.device
-        )
+        x = torch.randn(num_samples, *self._shape, device=self.circular.device)
         n_circ = int(self.circular.sum())
         x[:, self.circular] = math.pi * (
             2 * torch.rand(num_samples, n_circ, device=x.device) - 1
@@ -180,12 +182,8 @@ class MixedCouplingTransform(transforms.Transform):
 
         self.register_buffer("mask", mask, persistent=False)
         self.register_buffer("circular", circular, persistent=False)
-        self.register_buffer(
-            "circ_out", circular[mask], persistent=False
-        )
-        self.register_buffer(
-            "circ_in", circular[~mask], persistent=False
-        )
+        self.register_buffer("circ_out", circular[mask], persistent=False)
+        self.register_buffer("circ_in", circular[~mask], persistent=False)
         # Gather and scatter with index tensors: boolean-mask indexing and
         # in-place scatters dominate the cost of small batches otherwise
         m, c = mask.numpy(), circular.numpy()
@@ -294,7 +292,9 @@ class MixedCouplingTransform(transforms.Transform):
         bad = ~(torch.isfinite(x) & torch.isfinite(params).all(dim=-1))
         if bool(bad.any()):
             x = torch.where(bad, torch.zeros_like(x), x)
-            params = torch.where(bad[..., None], torch.zeros_like(params), params)
+            params = torch.where(
+                bad[..., None], torch.zeros_like(params), params
+            )
         widths, heights, derivs = self._spline_inputs(params)
         # Equal end derivatives: smooth across the seam
         derivs = derivs + _UNIT_DERIVATIVE
@@ -407,7 +407,8 @@ class SubsetTransform(transforms.Transform):
             "indices", torch.as_tensor(indices, dtype=torch.long)
         )
         self.register_buffer(
-            "_others", torch.as_tensor(others, dtype=torch.long),
+            "_others",
+            torch.as_tensor(others, dtype=torch.long),
             persistent=False,
         )
         self.register_buffer(
@@ -450,7 +451,9 @@ def mixed_coupling_masks(features, num_layers, rng=None):
             masks.append(np.ones(1, dtype=bool))
             continue
         if i % 2 == 0:
-            order = np.arange(features) if i == 0 else rng.permutation(features)
+            order = (
+                np.arange(features) if i == 0 else rng.permutation(features)
+            )
             mask = np.zeros(features, dtype=bool)
             mask[order[::2]] = True
             masks.append(mask)

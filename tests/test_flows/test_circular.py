@@ -50,8 +50,10 @@ def test_base_distribution():
     dist = CircularUniformNormal([True, False])
     x = dist.sample(1000)
     assert (x[:, 0].abs() <= math.pi).all()
-    expected = -math.log(2 * math.pi) - 0.5 * x[:, 1] ** 2 - 0.5 * math.log(
-        2 * math.pi
+    expected = (
+        -math.log(2 * math.pi)
+        - 0.5 * x[:, 1] ** 2
+        - 0.5 * math.log(2 * math.pi)
     )
     np.testing.assert_allclose(dist.log_prob(x), expected)
     assert dist.log_prob(torch.tensor([[3.5, 0.0]])).item() == -math.inf
