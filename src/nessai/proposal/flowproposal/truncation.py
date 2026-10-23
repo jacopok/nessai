@@ -9,6 +9,7 @@ from copy import deepcopy
 import numpy as np
 from scipy.special import logsumexp
 
+from ...livepoint import empty_structured_array
 from ...utils import compute_radius
 from ...utils.structures import get_subset_arrays
 
@@ -447,9 +448,37 @@ def _threshold_points(proposal):
     return proposal.training_data
 
 
+def _with_auxiliary_parameters(proposal, points):
+    """``points`` with the auxiliary x-space parameters of the
+    reparameterisations (e.g. the radius of an
+    :class:`~nessai.reparameterisations.Angle`) drawn once.
+
+    Live points do not carry them, so without this their prior
+    (:meth:`compute_weights`) cannot be evaluated, and each pass through the
+    flow would draw new ones. With the values attached, the flow density,
+    the mirror copies and the prior of a live point all use the same.
+    """
+    names = getattr(getattr(proposal, "x_dtype", None), "names", None) or ()
+    present = points.dtype.names or ()
+    missing = [n for n in names if n not in present]
+    if not missing or not len(points):
+        return points
+    x_prime, _ = proposal.rescale(points.copy())
+    x, _ = proposal.inverse_rescale(x_prime)
+    out = empty_structured_array(len(points), dtype=proposal.x_dtype)
+    for name in present:
+        if name in names:
+            out[name] = points[name]
+    # rows past ``len(points)`` are boundary-inversion mirror copies
+    for name in missing:
+        out[name] = x[name][: len(points)]
+    return out
+
+
 def _live_log_q(proposal):
     """``log q`` of the live points (:func:`_threshold_points`) under the
-    density the pool is drawn from.
+    density the pool is drawn from, and the live points it was evaluated at
+    (with their auxiliary parameters, :func:`_with_auxiliary_parameters`).
 
     ``backward_pass`` scores draws with the *tempered* latent density
     (``latent_log_prob(z, latent_temperature)``) while ``forward_pass``
@@ -457,7 +486,9 @@ def _live_log_q(proposal):
     the live points are rescored at the same temperature before a threshold
     is taken from them.
     """
-    live_points = _threshold_points(proposal).copy()
+    live_points = _with_auxiliary_parameters(
+        proposal, _threshold_points(proposal).copy()
+    )
     if getattr(proposal, "sum_mirror_density", False) is True and len(
         live_points
     ):
@@ -829,11 +860,11 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
         return thr
 
     def prepare(self, proposal, worst_point, radius=None):
-        _, log_q = _live_log_q(proposal)
-        n = len(proposal.training_data)
+        live_points, log_q = _live_log_q(proposal)
+        n = len(live_points)
         # rows past ``n`` are boundary-inversion mirror copies
         pieces, level = self._best(
-            *self._levels(proposal, proposal.training_data, log_q[:n])
+            *self._levels(proposal, live_points, log_q[:n])
         )
         self._threshold = float(np.quantile(level, self.quantile))
         if self.share_cap is not None:
@@ -1042,8 +1073,10 @@ class LogWeightThresholdTruncation(BaseTruncationRule):
 
     def prepare(self, proposal, worst_point, radius=None):
         live_points, log_q = _live_log_q(proposal)
+        # boundary inversion with duplication appends mirror copies of the
+        # live points in blocks of ``len(live_points)`` rows
         log_w = proposal.compute_weights(
-            live_points,
+            np.tile(live_points, len(log_q) // max(len(live_points), 1)),
             log_q=log_q,
         )
 
