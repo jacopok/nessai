@@ -1367,8 +1367,6 @@ class NestedSampler(BaseNestedSampler):
                 for k, c in enumerate(children)
             )
         )
-        if self.memory:
-            logger.warning("Partition: the regions train without memory")
         if not first:
             self.regions.remove(parent)
             if parent.proposal is not None:
@@ -1783,6 +1781,23 @@ class NestedSampler(BaseNestedSampler):
             ),
         )
 
+    def _region_memory(self, region):
+        """A region's share of ``memory``: the last ``memory * nlive_region /
+        nlive`` dead points inside the region (its frozen part of the prior),
+        as the unsplit run's last ``memory`` dead points. Dead points from
+        before the split count when they fall inside the region."""
+        n = int(round(self.memory * region.nlive / self.nlive))
+        if n < 1 or not self.nested_samples:
+            return np.empty(0, dtype=region.live_points.dtype)
+        found, end = [], len(self.nested_samples)
+        while end > 0 and sum(len(f) for f in found) < n:
+            start = max(0, end - 4 * n)
+            chunk = np.array(self.nested_samples[start:end])
+            found.insert(0, chunk[region.membership.contains(chunk)])
+            end = start
+        out = np.concatenate(found)[-n:] if found else found
+        return out.astype(region.live_points.dtype, copy=False)
+
     def _train_region(self, region, force=False):
         """:meth:`train_proposal` for a region, on its own live points."""
         if (
@@ -1797,6 +1812,10 @@ class NestedSampler(BaseNestedSampler):
         self._region_flow_reset(region)
         training_data = region.live_points.copy()
         proposal.current_live_points = region.live_points
+        if self.memory:
+            extra = self._region_memory(region)
+            if len(extra):
+                training_data = np.concatenate([training_data, extra])
         reset = proposal.training_count == 0 or (
             decision is not None and decision.reset_next
         )

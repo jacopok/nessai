@@ -95,6 +95,25 @@ def test_partition_sampling(tmp_path):
     assert os.path.exists(os.path.join(output, "result.hdf5"))
 
 
+def test_partition_sampling_memory(tmp_path):
+    """Regions train on their live points plus their share of the recent
+    dead points inside them (memory): the evidence and shares hold."""
+    model = TwoModes()
+    fs = FlowSampler(
+        model,
+        output=str(tmp_path / "memory"),
+        nlive=500,
+        seed=1234,
+        plot=False,
+        checkpointing=False,
+        flow_config=FLOW,
+        memory=750,
+        partition={"coordinates": ["x"]},
+    )
+    fs.run(plot=False, save=False)
+    _check_result(fs.ns, model)
+
+
 @pytest.mark.slow_integration_test
 def test_partition_resume_after_split(tmp_path):
     model = TwoModes()

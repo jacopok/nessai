@@ -264,3 +264,28 @@ def test_first_of(rng):
         np.mod(rng.normal(1.0, 0.04, 900), 1), rng.uniform(0.45, 0.5, 100)
     ]
     assert "gap_ratios" in splitter.propose(gap[:, None], [1.0]).info
+
+
+def test_region_memory_last_dead_points_inside(points):
+    """A region's memory: its share of ``memory`` among the most recent dead
+    points inside it, pre-split ones included, in their order."""
+    from types import SimpleNamespace
+
+    from nessai.samplers.nestedsampler import NestedSampler
+
+    coords = ParameterCoordinates(["x"], periods=[None])
+    region = SimpleNamespace(
+        membership=RegionMembership().child(coords, IntervalCut([0.5]), 1),
+        nlive=250,
+        live_points=points[:10],
+    )
+    dead = points[np.argsort(points["logL"])]
+    sampler = SimpleNamespace(memory=300, nlive=1000, nested_samples=list(dead))
+    out = NestedSampler._region_memory(sampler, region)
+    inside = dead[dead["x"] > 0.5]
+    assert len(out) == 75  # 300 x 250 / 1000
+    for name in ("x", "y", "logL", "it"):
+        np.testing.assert_array_equal(out[name], inside[-75:][name])
+    assert out.dtype == points.dtype
+    sampler.memory = 2
+    assert len(NestedSampler._region_memory(sampler, region)) == 0
