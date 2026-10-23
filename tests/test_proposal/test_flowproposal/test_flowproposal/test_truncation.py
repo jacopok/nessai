@@ -487,9 +487,7 @@ def test_log_proposal_threshold_uses_tempered_live_log_q(temperature):
 
     expected = log_q
     if temperature not in (None, 1.0):
-        expected = (
-            log_q + latent_log_prob(z, temperature) - latent_log_prob(z)
-        )
+        expected = log_q + latent_log_prob(z, temperature) - latent_log_prob(z)
     assert rule.threshold == pytest.approx(np.quantile(expected, 0.5))
 
 
@@ -508,7 +506,7 @@ def test_log_proposal_threshold_prior_relative():
         return a
 
     def log_q_of(x):
-        return -x["x"] ** 2
+        return -(x["x"] ** 2)
 
     def log_prior(x):
         return 2.0 * x["x"]
@@ -524,8 +522,9 @@ def test_log_proposal_threshold_prior_relative():
     proposal.forward_pass = MagicMock(
         side_effect=lambda x: (
             np.zeros((2 * len(x), 1)),
-            np.concatenate([log_q_of(x), -(x["x"] + 4) ** 2]),
-        ))
+            np.concatenate([log_q_of(x), -((x["x"] + 4) ** 2)]),
+        )
+    )
 
     def compute_weights(x, log_q):
         assert len(x) == len(log_q)
@@ -536,13 +535,15 @@ def test_log_proposal_threshold_prior_relative():
     rule = LogProposalThresholdTruncation(quantile=0.1, prior_relative=True)
     rule.prepare(proposal, worst_point=None)
     # each mirror row is paired with its live point's prior
-    live_level = np.concatenate([
-        log_q_of(live), -(live["x"] + 4) ** 2]) - np.tile(log_prior(live), 2)
+    live_level = np.concatenate(
+        [log_q_of(live), -((live["x"] + 4) ** 2)]
+    ) - np.tile(log_prior(live), 2)
     assert rule.threshold == pytest.approx(np.quantile(live_level, 0.1))
 
     x = arr(np.linspace(-1, 1, 2001))
     out, _, _ = rule.apply_after_backward(
-        proposal, x, log_q_of(x), np.zeros((len(x), 1)))
+        proposal, x, log_q_of(x), np.zeros((len(x), 1))
+    )
     assert len(out) == np.sum(log_q_of(x) - log_prior(x) > rule.threshold)
     assert np.all(log_prior(out) - log_q_of(out) < -rule.threshold)
 
@@ -550,8 +551,11 @@ def test_log_proposal_threshold_prior_relative():
     # mirror copies too
     del rule.prior_relative
     rule.prepare(proposal, worst_point=None)
-    assert rule.threshold == pytest.approx(np.quantile(
-        np.concatenate([log_q_of(live), -(live["x"] + 4) ** 2]), 0.1))
+    assert rule.threshold == pytest.approx(
+        np.quantile(
+            np.concatenate([log_q_of(live), -((live["x"] + 4) ** 2)]), 0.1
+        )
+    )
 
 
 def _prior_relative_proposal(live_x):
@@ -565,7 +569,8 @@ def _prior_relative_proposal(live_x):
     proposal.training_data = live
     proposal.latent_temperature = None
     proposal.forward_pass = MagicMock(
-        side_effect=lambda x: (np.zeros((len(x), 1)), -x["x"] ** 2))
+        side_effect=lambda x: (np.zeros((len(x), 1)), -(x["x"] ** 2))
+    )
     proposal.compute_weights = MagicMock(side_effect=lambda x, log_q: -log_q)
     return proposal
 
@@ -581,9 +586,10 @@ def test_log_proposal_threshold_lost_mass(mode):
 
     live_x = np.random.default_rng(4).normal(size=2000)
     proposal = _prior_relative_proposal(live_x)
-    level = -live_x**2
+    level = -(live_x**2)
     rule = LogProposalThresholdTruncation(
-        quantile=0.5, prior_relative=True, mode=mode, lost_mass=0.01)
+        quantile=0.5, prior_relative=True, mode=mode, lost_mass=0.01
+    )
     rule.prepare(proposal, worst_point=None)
     t = rule.threshold
     if mode == "clip":
@@ -606,9 +612,10 @@ def test_log_proposal_threshold_lost_mass_recorded_with_quantile():
 
     live_x = np.random.default_rng(5).normal(size=2000)
     rule = LogProposalThresholdTruncation(
-        quantile=0.005, prior_relative=True, mode="clip")
+        quantile=0.005, prior_relative=True, mode="clip"
+    )
     rule.prepare(_prior_relative_proposal(live_x), worst_point=None)
-    level = -live_x**2
+    level = -(live_x**2)
     expected = np.mean(1 - np.minimum(1, np.exp(level - rule.threshold)))
     assert rule.lost_live_mass == pytest.approx(expected)
     assert 0 < rule.lost_live_mass < 0.005
@@ -626,10 +633,11 @@ def test_log_proposal_threshold_lost_mass_validation_and_old_pickles():
     # a rule pickled before the option existed uses its quantile
     live_x = np.random.default_rng(6).normal(size=500)
     rule = LogProposalThresholdTruncation(
-        quantile=0.1, prior_relative=True, mode="clip")
+        quantile=0.1, prior_relative=True, mode="clip"
+    )
     del rule.lost_mass
     rule.prepare(_prior_relative_proposal(live_x), worst_point=None)
-    assert rule.threshold == pytest.approx(np.quantile(-live_x**2, 0.1))
+    assert rule.threshold == pytest.approx(np.quantile(-(live_x**2), 0.1))
 
 
 # -- log_level_threshold ------------------------------------------------------
@@ -647,20 +655,29 @@ def _level_proposal(live_x, weights, with_pieces=True):
         p = (x["x"] < 0).astype(int)
         return p, np.log(np.asarray(weights, float))[p]
 
-    proposal = MagicMock(spec=["training_data", "forward_pass",
-                               "latent_temperature", "compute_weights",
-                               "training_count", "mixture_levels"])
+    proposal = MagicMock(
+        spec=[
+            "training_data",
+            "forward_pass",
+            "latent_temperature",
+            "compute_weights",
+            "training_count",
+            "mixture_levels",
+        ]
+    )
     proposal.training_data = arr(live_x)
     proposal.latent_temperature = None
     proposal.training_count = 0
 
     def log_q_of(x):
         p, log_pi = pieces(x)
-        return -x["x"] ** 2 + (log_pi if with_pieces else 0.0)
+        return -(x["x"] ** 2) + (log_pi if with_pieces else 0.0)
 
     proposal.forward_pass = MagicMock(
-        side_effect=lambda x: (np.zeros((len(x), 1)), log_q_of(x)))
+        side_effect=lambda x: (np.zeros((len(x), 1)), log_q_of(x))
+    )
     proposal.compute_weights = MagicMock(side_effect=lambda x, log_q: -log_q)
+
     def levels(x, log_q, z=None):
         p, log_pi = pieces(x)
         return p[:, None], (np.asarray(log_q) - log_pi)[:, None]
@@ -685,10 +702,11 @@ def test_log_level_threshold_ignores_piece_weights():
         proposal, arr, log_q_of = _level_proposal(live_x, weights)
         rule = LogLevelThresholdTruncation(quantile=0.1)
         rule.prepare(proposal, worst_point=None)
-        assert rule.threshold == pytest.approx(np.quantile(-live_x**2, 0.1))
+        assert rule.threshold == pytest.approx(np.quantile(-(live_x**2), 0.1))
         x = arr(draws)
         out, _, _ = rule.apply_after_backward(
-            proposal, x, log_q_of(x), np.zeros((len(x), 1)))
+            proposal, x, log_q_of(x), np.zeros((len(x), 1))
+        )
         kept.append(np.sort(out["x"]))
     np.testing.assert_array_equal(kept[0], kept[1])
 
@@ -699,12 +717,14 @@ def test_log_level_threshold_without_pieces_is_log_q_threshold():
     )
 
     live_x = np.linspace(-1, 1, 101)
-    proposal, _, log_q_of = _level_proposal(live_x, [0.3, 0.7],
-                                            with_pieces=False)
+    proposal, _, log_q_of = _level_proposal(
+        live_x, [0.3, 0.7], with_pieces=False
+    )
     rule = LogLevelThresholdTruncation(quantile=0.2)
     rule.prepare(proposal, worst_point=None)
     assert rule.threshold == pytest.approx(
-        np.quantile(log_q_of(proposal.training_data), 0.2))
+        np.quantile(log_q_of(proposal.training_data), 0.2)
+    )
 
 
 def test_log_level_threshold_tightens_an_overrepresented_piece():
@@ -720,10 +740,12 @@ def test_log_level_threshold_tightens_an_overrepresented_piece():
     rule = LogLevelThresholdTruncation(quantile=0.005, share_cap=4.0)
     # through the scheme, as populate() does: its reset must keep the draws
     scheme = TruncationScheme([rule])
-    scheme.prepare(proposal, worst_point=None)    # new flow: no floors yet
+    scheme.prepare(proposal, worst_point=None)  # new flow: no floors yet
     assert rule.floors == {}
     x = arr(rng.uniform(-1, 1, 20000))
-    scheme.apply_after_backward(proposal, x, log_q_of(x), np.zeros((len(x), 1)))
+    scheme.apply_after_backward(
+        proposal, x, log_q_of(x), np.zeros((len(x), 1))
+    )
     scheme.prepare(proposal, worst_point=None)
     # the share target (4 x ~1 % of the pool) sits above piece 1's lowest
     # live point, so the floor stops there: no live point is cut out
@@ -731,7 +753,8 @@ def test_log_level_threshold_tightens_an_overrepresented_piece():
     assert rule.floors[1] == pytest.approx(-(0.2**2))
     x = arr(rng.uniform(-1, 1, 20000))
     out, _, _ = rule.apply_after_backward(
-        proposal, x, log_q_of(x), np.zeros((len(x), 1)))
+        proposal, x, log_q_of(x), np.zeros((len(x), 1))
+    )
     neg = out["x"][out["x"] < 0]
     assert neg.min() > -0.2
     assert np.all(out["x"][out["x"] >= 0] ** 2 < -rule.threshold)
@@ -753,17 +776,20 @@ def test_log_level_threshold_pilot_sets_floors_before_first_pool():
     proposal, arr, log_q_of = _level_proposal(live_x, [0.5, 0.5])
     proposal.drawsize = 5000
 
-    def backward_pass(z, rescale=True, return_z=False,
-                      return_unit_hypercube=False):
+    def backward_pass(
+        z, rescale=True, return_z=False, return_unit_hypercube=False
+    ):
         x = arr(z[:, 0])
         return x, log_q_of(x), z
 
     proposal.sample_latent_distribution = MagicMock(
-        side_effect=lambda n: rng.uniform(-1, 1, (n, 1)))
+        side_effect=lambda n: rng.uniform(-1, 1, (n, 1))
+    )
     proposal.backward_pass = MagicMock(side_effect=backward_pass)
 
     rule = LogLevelThresholdTruncation(
-        quantile=0.005, share_cap=4.0, pilot_size=20000)
+        quantile=0.005, share_cap=4.0, pilot_size=20000
+    )
     rule.prepare(proposal, worst_point=None)
     assert proposal.sample_latent_distribution.call_count == 4
     assert list(rule.floors) == [1]
@@ -796,12 +822,20 @@ def test_log_level_threshold_keeps_a_point_any_candidate_clears():
 
     live = empty_structured_array(100, names=["x"])
     live["x"] = np.linspace(0, 1, 100)
-    proposal = MagicMock(spec=["training_data", "forward_pass",
-                               "latent_temperature", "mixture_levels"])
+    proposal = MagicMock(
+        spec=[
+            "training_data",
+            "forward_pass",
+            "latent_temperature",
+            "mixture_levels",
+        ]
+    )
     proposal.training_data = live
     proposal.latent_temperature = None
     proposal.forward_pass = MagicMock(
-        side_effect=lambda x: (np.zeros((len(x), 1)), -x["x"]))
+        side_effect=lambda x: (np.zeros((len(x), 1)), -x["x"])
+    )
+
     # candidate 0: level -x (piece 0); candidate 1: level -x - 5 (piece 1),
     # except points with x > 2, where piece 0 has zero weight and piece 1
     # has level 0
@@ -820,7 +854,8 @@ def test_log_level_threshold_keeps_a_point_any_candidate_clears():
     x = empty_structured_array(4, names=["x"])
     x["x"] = [0.2, 0.9, 3.0, 1.5]
     out, _, _ = rule.apply_after_backward(
-        proposal, x, -x["x"], np.zeros((4, 1)))
+        proposal, x, -x["x"], np.zeros((4, 1))
+    )
     np.testing.assert_array_equal(out["x"], [0.2, 3.0])
 
 
@@ -842,7 +877,8 @@ def test_log_level_threshold_keeps_nothing_from_an_empty_batch():
     rule = LogLevelThresholdTruncation(quantile=0.2, share_cap=4.0)
     rule.prepare(proposal, worst_point=None)
     out, log_q, z = rule.apply_after_backward(
-        proposal, np.array([]), np.array([]), np.array([]))
+        proposal, np.array([]), np.array([]), np.array([])
+    )
     assert len(out) == len(log_q) == len(z) == 0
 
 
@@ -861,17 +897,20 @@ def test_log_level_threshold_prior_relative():
         return 2.0 * x["x"]
 
     proposal.compute_weights = MagicMock(
-        side_effect=lambda x, log_q: log_prior(x) - log_q)
+        side_effect=lambda x, log_q: log_prior(x) - log_q
+    )
     rule = LogLevelThresholdTruncation(quantile=0.1, prior_relative=True)
     rule.prepare(proposal, worst_point=None)
     assert rule.threshold == pytest.approx(
-        np.quantile(-live_x**2 - 2.0 * live_x, 0.1))
+        np.quantile(-(live_x**2) - 2.0 * live_x, 0.1)
+    )
     x = arr(np.linspace(-1, 1, 2001))
     out, _, _ = rule.apply_after_backward(
-        proposal, x, log_q_of(x), np.zeros((len(x), 1)))
-    level = -out["x"] ** 2 - 2.0 * out["x"]
+        proposal, x, log_q_of(x), np.zeros((len(x), 1))
+    )
+    level = -(out["x"] ** 2) - 2.0 * out["x"]
     assert np.all(level > rule.threshold)
-    assert len(out) == np.sum(-x["x"] ** 2 - 2.0 * x["x"] > rule.threshold)
+    assert len(out) == np.sum(-(x["x"] ** 2) - 2.0 * x["x"] > rule.threshold)
     # weights in the support are bounded by exp(-threshold) (here w_piece
     # = 1/2 for both pieces)
     log_w = log_prior(out) - log_q_of(out)
@@ -880,4 +919,4 @@ def test_log_level_threshold_prior_relative():
     # a rule pickled before the option existed thresholds log q - log w_p
     del rule.prior_relative
     rule.prepare(proposal, worst_point=None)
-    assert rule.threshold == pytest.approx(np.quantile(-live_x**2, 0.1))
+    assert rule.threshold == pytest.approx(np.quantile(-(live_x**2), 0.1))

@@ -5,7 +5,6 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-import torch
 
 from nessai.livepoint import empty_structured_array
 from nessai.proposal.flowproposal.truncation import (
@@ -30,7 +29,7 @@ def _proposal(training, current=None, from_live=False):
     proposal.sum_mirror_density = False
     proposal.latent_temperature = None
     proposal.forward_pass = MagicMock(
-        side_effect=lambda x: (np.zeros((len(x), 1)), -x["x"] ** 2)
+        side_effect=lambda x: (np.zeros((len(x), 1)), -(x["x"] ** 2))
     )
     proposal.compute_weights = MagicMock(
         side_effect=lambda x, log_q: 2.0 * x["x"] - log_q
@@ -68,13 +67,15 @@ def test_clip_keeps_draws_and_sets_cap(mode):
     live = _arr(rng.uniform(-1, 1, 1000), logl=rng.normal(size=1000))
     proposal = _proposal(live)
     rule = LogProposalThresholdTruncation(
-        quantile=0.05, prior_relative=True, mode=mode,
+        quantile=0.05,
+        prior_relative=True,
+        mode=mode,
         roundtrip_tolerance=None,
     )
     scheme = TruncationScheme([rule])
     scheme.prepare(proposal, worst_point=None)
     x = _arr(np.linspace(-1.5, 1.5, 301))
-    log_q = -x["x"] ** 2
+    log_q = -(x["x"] ** 2)
     log_q[0] = -np.inf  # infinite weight: dropped in both modes
     out, _, _ = scheme.apply_after_backward(
         proposal, x, log_q, np.zeros((len(x), 1))

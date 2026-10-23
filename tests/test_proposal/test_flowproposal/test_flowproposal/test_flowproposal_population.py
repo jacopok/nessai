@@ -47,7 +47,8 @@ def configure_population_test_proposal(proposal, rng, samples):
     proposal.clip_population_weights = False
     proposal._get_population_log_weights = (
         lambda log_w, **kw: FlowProposal._get_population_log_weights(
-            proposal, log_w, **kw)
+            proposal, log_w, **kw
+        )
     )
     proposal.drawsize = 3
     proposal.flow = MagicMock()
@@ -255,9 +256,10 @@ def test_population_weight_cap_keeps_a_minimum_yield(proposal):
     proposal.population_weight_cap_mass = 0.005
     n = 10_000
     w = np.ones(n)
-    w[:3] = 1e6   # three draws hold ~99.7 % of the mass
+    w[:3] = 1e6  # three draws hold ~99.7 % of the mass
     out = FlowProposal._get_population_log_weights(
-        proposal, np.log(w), min_yield=50.0)
+        proposal, np.log(w), min_yield=50.0
+    )
     assert np.exp(out).sum() == pytest.approx(50.0)
     assert proposal._population_cap_lost_mass > 0.99
     # without the floor the mass cap yields ~3 points
@@ -268,7 +270,8 @@ def test_population_weight_cap_keeps_a_minimum_yield(proposal):
     rng = np.random.default_rng(2)
     log_w = np.log(rng.pareto(3.0, size=n) + 1.0)
     out = FlowProposal._get_population_log_weights(
-        proposal, log_w, min_yield=50.0)
+        proposal, log_w, min_yield=50.0
+    )
     assert np.exp(out).sum() > 50.0
     assert proposal._population_cap_lost_mass is None
     # the yield cap solves sum(min(w, c)) / c = Y
@@ -286,7 +289,9 @@ def test_population_weight_cap_mass_validation(proposal):
             )
     with pytest.raises(ValueError, match="mutually exclusive"):
         FlowProposal.configure_population(
-            proposal, 10, clip_population_weights=True,
+            proposal,
+            10,
+            clip_population_weights=True,
             population_weight_cap_mass=0.01,
         )
 
@@ -300,8 +305,11 @@ def test_max_samples_warning_once_per_training_round(caplog):
         FlowProposal._warn_max_samples(proposal, 10)
     proposal.training_count = 4
     FlowProposal._warn_max_samples(proposal, 10)
-    levels = [r.levelname for r in caplog.records
-              if "Reached max samples" in r.getMessage()]
+    levels = [
+        r.levelname
+        for r in caplog.records
+        if "Reached max samples" in r.getMessage()
+    ]
     assert levels == ["WARNING", "DEBUG", "DEBUG", "WARNING"]
 
 

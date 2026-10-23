@@ -958,8 +958,9 @@ class NestedSampler(BaseNestedSampler):
             self.check_flow_model_reset()
 
             training_data = self.live_points.copy()
-            if hasattr(getattr(self, "_flow_proposal", None),
-                       "current_live_points"):
+            if hasattr(
+                getattr(self, "_flow_proposal", None), "current_live_points"
+            ):
                 self._flow_proposal.current_live_points = self.live_points
             if self.memory and (len(self.nested_samples) >= self.memory):
                 training_data = np.concatenate(

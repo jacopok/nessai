@@ -606,7 +606,9 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
             self._threshold = float(np.quantile(level, self.quantile))
         self._record_excluded(live_points, level)
         if getattr(self, "prior_relative", False) and len(level):
-            self.lost_live_mass = float(self._lost_mass(level, self._threshold))
+            self.lost_live_mass = float(
+                self._lost_mass(level, self._threshold)
+            )
 
     def _lost_mass(self, level, threshold):
         """Mean share of the live points' mass lost at ``threshold`` (levels
@@ -708,9 +710,9 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
             return keep
         bad = idx[~(gap <= tol)]
         keep[bad] = False
-        self.roundtrip_discarded = (
-            getattr(self, "roundtrip_discarded", 0) + len(bad)
-        )
+        self.roundtrip_discarded = getattr(
+            self, "roundtrip_discarded", 0
+        ) + len(bad)
         return keep
 
 
@@ -791,7 +793,7 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
 
     def __getstate__(self):
         state = super().__getstate__()
-        state["_draws"] = []   # up to a pool's worth of draws: not checkpointed
+        state["_draws"] = []  # up to a pool's worth of draws: not checkpointed
         return state
 
     @property
@@ -879,7 +881,9 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
         changed = []
         for piece in all_pieces:
             in_live = valid & (live_pieces == piece)
-            live_share = (in_live.sum() + 0.5) / (n_live + 0.5 * len(all_pieces))
+            live_share = (in_live.sum() + 0.5) / (
+                n_live + 0.5 * len(all_pieces)
+            )
             sel = d_piece == piece
             share = w[sel].sum() / total
             floor = self._floors.get(piece, -np.inf)
@@ -887,7 +891,11 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
                 order = np.argsort(-d_level[sel])
                 cum = np.cumsum(w[sel][order])
                 idx = min(
-                    int(np.searchsorted(cum, self.share_cap * live_share * total)),
+                    int(
+                        np.searchsorted(
+                            cum, self.share_cap * live_share * total
+                        )
+                    ),
                     len(order) - 1,
                 )
                 floor = max(floor, float(d_level[sel][order][idx]))
@@ -909,7 +917,7 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
                 self._threshold,
                 len(self._floors),
                 ", ".join(
-                    f"{p}: {s:.3g}/{l:.3g}" for p, s, l in changed[:8]
+                    f"{p}: {s:.3g}/{ls:.3g}" for p, s, ls in changed[:8]
                 ),
             )
 
@@ -967,7 +975,7 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
             self._threshold,
             len(tightened),
             len(self._floors),
-            ", ".join(f"{p}: {s:.3g}/{l:.3g}" for p, (s, l) in worst[:8]),
+            ", ".join(f"{p}: {s:.3g}/{ls:.3g}" for p, (s, ls) in worst[:8]),
         )
 
     def apply_after_backward(self, proposal, x, log_q, z):

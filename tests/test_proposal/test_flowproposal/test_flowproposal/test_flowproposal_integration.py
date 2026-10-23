@@ -416,4 +416,6 @@ def test_prior_relative_threshold_with_auxiliary_radius(
 
     fp.populate(live[np.argmin(live["logL"])], n_samples=50, plot=False)
     assert fp.populated
-    assert np.isfinite(fp.get_truncation_rule("log_proposal_threshold").threshold)
+    assert np.isfinite(
+        fp.get_truncation_rule("log_proposal_threshold").threshold
+    )
