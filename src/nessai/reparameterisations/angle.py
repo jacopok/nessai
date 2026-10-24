@@ -14,6 +14,23 @@ from .base import Reparameterisation
 logger = logging.getLogger(__name__)
 
 
+def _auxiliary_radius(chi, radial, x, rng):
+    """Draw the auxiliary radius of an angle from ``chi``, or keep the one
+    ``x`` already carries (a point drawn from the flow, or a live point whose
+    radius was drawn before): the prior of the radius, the flow density and
+    the mirror copies of the boundary inversion then all see the same value.
+
+    The draw is made for every point either way, so the random stream does
+    not depend on which points carry a radius.
+    """
+    r = chi.rvs(size=x.size, random_state=rng)
+    if x.dtype.names is not None and radial in x.dtype.names:
+        given = np.asarray(x[radial], dtype=float)
+        keep = np.isfinite(given) & (given > 0)
+        r = np.where(keep, given, r)
+    return r
+
+
 class Angle(Reparameterisation):
     """Reparameterisation for a single angle.
 
@@ -137,7 +154,7 @@ class Angle(Reparameterisation):
         )
 
         if self.chi:
-            r = self.chi.rvs(size=x.size, random_state=self.rng)
+            r = _auxiliary_radius(self.chi, self.radial, x, self.rng)
         else:
             r, x, x_prime, log_j = self._rescale_radial(
                 x, x_prime, log_j, **kwargs
@@ -509,7 +526,7 @@ class AnglePair(Reparameterisation):
         Convert the spherical polar angles to Cartesian coordinates
         """
         if self.chi:
-            r = self.chi.rvs(size=x.size, random_state=self.rng)
+            r = _auxiliary_radius(self.chi, self.radial, x, self.rng)
         else:
             r = self.get_parameter_value(self.radial, x, x_prime)
         if any(r < 0):
