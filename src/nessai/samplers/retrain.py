@@ -38,6 +38,45 @@ long-run regime (the remaining future is merely shifted by ``n``
 iterations, so everything else cancels). This removes the need to pick a
 look-ahead horizon.
 
+Lineage
+-------
+Warm-started trainings accumulate: a flow trained ``N`` times since its
+last reset is better than one trained once, and its costs per iteration
+fall as ``N^-b``, with one exponent for the likelihood part of the cost and
+one for the population part (``lineage_exponent``). The renewal model above
+only sees what one training buys before the flow goes stale. One more
+training also lowers the cost of every later iteration by a fraction
+``b / N(t)``, which saves
+
+.. math::
+
+    G = b \\, C \\sum_{j=0}^{H} \\frac{1}{N + j / \\tau}
+      \\approx b \\, C \\, \\tau \\ln\\left(1 + \\frac{H}{N \\tau}\\right),
+
+where ``C`` is the sampling cost per iteration, ``H`` the remaining number
+of iterations and ``tau`` the interval between trainings (later trainings
+make each one worth less). The training cost in the renewal problem is
+replaced by ``T - G``, and ``tau`` is solved for self-consistently. When
+``G >= T`` the flow is retrained whenever the pool is empty. ``C`` is
+extrapolated with the trend of the cost per iteration of recent fresh flows
+(``cost_trend``), capped at a growth of ``exp(max_cost_growth)`` over the
+horizon. With ``allow_reset``, the reset branch uses the same gain (that of
+the current lineage); what a reset costs in lineage is left to the
+measured reset gain.
+
+Reset on a drop
+---------------
+When the cost per iteration of a freshly trained flow (likelihood and
+population, at the start of its episode) rises by more than
+``reset_on_drop`` (in log), and by more than twice its uncertainty, above
+the median of the current lineage in the last ``reset_window * nlive``
+iterations, the warm-started lineage is
+assumed broken and the next training starts from a reset flow. With
+``reset_rollback`` the previous flow is kept, and when the reset flow's
+first pool costs more per iteration than the flow it replaced, the reset is
+discarded: the previous flow is restored and trained warm, and its lineage
+continues. The same check applies to resets chosen by ``allow_reset``.
+
 Uncertainties
 -------------
 * The acceptance of the current flow is described by a Gaussian posterior on
@@ -55,7 +94,11 @@ Uncertainties
 Determinism
 -----------
 Costs are computed as deterministic counts (likelihood evaluations, pool
-points, training epochs x training samples) multiplied by unit costs. The
+points or flow draws, training epochs x training samples) multiplied by unit
+costs. The population cost of a pool point depends on how many flow draws it
+takes, which changes with the flow and the state of the run. It is counted
+per draw when a cost per draw (``draw``) is provided, or when the population
+cost is measured rather than provided. The
 unit costs can be provided by the user (deterministic run), or measured
 during the run (non-deterministic). The measured values are always tracked,
 compared to the provided ones and can be saved for future runs.
@@ -72,6 +115,15 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 COST_KEYS = ("likelihood", "population", "training")
+#: Unit costs that are used when known: ``draw``, seconds per flow draw when
+#: populating (rejection sampling included)
+OPTIONAL_COST_KEYS = ("draw",)
+ALL_COST_KEYS = COST_KEYS + OPTIONAL_COST_KEYS
+
+#: Lineage exponents of the likelihood and population costs per iteration,
+#: measured for a precessing BBH with nessai-gw (cost per new point against
+#: the number of warm-started trainings, at a fixed state of the run)
+DEFAULT_LINEAGE_EXPONENT = dict(likelihood=0.07, population=0.3)
 
 #: Preset unit costs (seconds per likelihood evaluation, per pool point and
 #: per training sample-epoch). ``"gw"`` is an order-of-magnitude estimate for
@@ -115,6 +167,25 @@ def solve_renewal(y: float) -> float:
     return 0.5 * (lo + hi)
 
 
+def lineage_sum(n, tau, horizon, growth=0.0, points=256):
+    """``sum_{j=0}^{H} exp(growth j) / (n + j / tau)``: the future iterations
+    of a lineage of ``n`` trainings that gains one training every ``tau``
+    iterations, weighted by a cost per iteration that grows at the rate
+    ``growth`` (per iteration), over ``horizon`` iterations (integral
+    approximation)."""
+    if horizon <= 0 or n <= 0:
+        return 0.0
+    if not np.isfinite(tau) or tau <= 0:
+        raise ValueError("tau must be positive and finite")
+    if growth == 0.0:
+        return float(tau * np.log1p(horizon / (n * tau)))
+    # trapezoid in u = log(n + j / tau), where the integrand is smooth
+    u = np.linspace(np.log(n), np.log(n + horizon / tau), points)
+    j = tau * (np.exp(u) - n)
+    f = tau * np.exp(growth * j)
+    return float(np.sum(0.5 * (f[1:] + f[:-1]) * np.diff(u)))
+
+
 @dataclass
 class Episode:
     """Data for the period between two trainings of the flow."""
@@ -133,6 +204,24 @@ class Episode:
     slope_var: float = np.nan
     predicted: float = np.nan
     """Log-acceptance predicted for this episode before it started"""
+    points: float = 0.0
+    """Pool points populated during the episode"""
+    draws: float = 0.0
+    """Flow draws made to populate them (0 if unknown)"""
+    attempt: bool = False
+    """The episode is a reset that is compared to the flow it replaced"""
+    baseline: tuple = (np.nan, np.nan)
+    """Mean and variance of the log cost per iteration of that flow"""
+    resolved: bool = False
+    """The comparison has been made"""
+    rejected: bool = False
+    """The reset did worse and the previous flow was restored"""
+
+    @property
+    def draws_per_point(self):
+        if self.points > 0 and self.draws > 0:
+            return self.draws / self.points
+        return None
 
 
 def initial_level(counts, bin_size):
@@ -242,14 +331,14 @@ class RetrainCostModel:
                 costs = json.load(f)
             costs = costs.get("unit_costs", costs)
         costs = dict(costs or {})
-        unknown = set(costs) - set(COST_KEYS)
+        unknown = set(costs) - set(ALL_COST_KEYS)
         if unknown:
             raise ValueError(f"Unknown retrain cost keys: {unknown}")
-        self.provided = {k: costs.get(k) for k in COST_KEYS}
+        self.provided = {k: costs.get(k) for k in ALL_COST_KEYS}
         self.warn_ratio = warn_ratio
-        self.totals = {k: 0.0 for k in COST_KEYS}
-        self.units = {k: 0.0 for k in COST_KEYS}
-        self.samples = {k: [] for k in COST_KEYS}
+        self.totals = {k: 0.0 for k in ALL_COST_KEYS}
+        self.units = {k: 0.0 for k in ALL_COST_KEYS}
+        self.samples = {k: [] for k in ALL_COST_KEYS}
         self._warned = set()
         missing = [k for k in COST_KEYS if self.provided[k] is None]
         if missing:
@@ -260,9 +349,31 @@ class RetrainCostModel:
                 missing,
             )
 
+    def __setstate__(self, state):
+        # objects pickled before the optional unit costs existed
+        self.__dict__.update(state)
+        for d, v in (
+            (self.provided, None),
+            (self.totals, 0.0),
+            (self.units, 0.0),
+        ):
+            for k in ALL_COST_KEYS:
+                d.setdefault(k, v)
+        for k in ALL_COST_KEYS:
+            self.samples.setdefault(k, [])
+
     @property
     def deterministic(self):
-        return all(v is not None for v in self.provided.values())
+        return all(self.provided[k] is not None for k in COST_KEYS)
+
+    @property
+    def per_draw(self):
+        """Whether the population cost is counted per flow draw: when a
+        cost per draw is provided, or when the population cost is not
+        provided (so it is measured either way)."""
+        if self.provided.get("draw") is not None:
+            return True
+        return self.provided["population"] is None and self["draw"] is not None
 
     def record(self, key, seconds, units):
         """Record a measurement of ``seconds`` spent on ``units`` units."""
@@ -280,7 +391,7 @@ class RetrainCostModel:
 
     def __getitem__(self, key):
         """Unit cost used in the decision."""
-        if self.provided[key] is not None:
+        if self.provided.get(key) is not None:
             return self.provided[key]
         return self.measured(key)
 
@@ -308,7 +419,7 @@ class RetrainCostModel:
     def summary(self):
         """Measured unit costs, suitable for a future run."""
         out = {}
-        for k in COST_KEYS:
+        for k in ALL_COST_KEYS:
             s = np.array(self.samples[k])
             out[k] = dict(
                 provided=self.provided[k],
@@ -368,6 +479,29 @@ class RetrainDecision:
           ``history_length`` episodes, extrapolated to the current
           iteration, with a Gaussian prior of width ``trend_slope_sd`` (per
           ``nlive`` iterations) on the slope.
+    lineage_exponent : float, dict or None
+        Exponents ``b`` of the fall of the likelihood and population costs
+        per iteration with the number of warm-started trainings since the
+        last reset, ``N^-b`` (see the module's "Lineage" section). A float
+        applies to both; a dict has keys ``likelihood`` and ``population``.
+        None or 0 disables the lineage term.
+    lineage_horizon : float
+        Cap on the remaining iterations that the lineage term counts, in
+        units of ``nlive`` (the estimate of the remaining iterations is poor
+        early in a run).
+    reset_on_drop : float or None
+        Reset the flow when the log cost per iteration of a fresh flow rises
+        by more than this (and by more than twice its uncertainty) above the
+        median of the current lineage over the last ``reset_window`` x
+        ``nlive`` iterations. None disables it.
+    reset_window : float
+        Window for ``reset_on_drop``, in units of ``nlive``.
+    reset_rollback : bool
+        Keep the flow that a reset replaces, and restore it when the reset
+        flow costs more per iteration (by more than ``reset_tolerance`` in
+        log) over its first pool.
+    reset_tolerance : float
+        See ``reset_rollback``.
     """
 
     # Prior on the slope: acceptance tracks the prior volume, k = 1 / nlive
@@ -400,6 +534,23 @@ class RetrainDecision:
     """Scatter of a single training outcome"""
     reset_drift = 0.05
     """Growth of the uncertainty on a reference level per nlive iterations"""
+    # Defaults of objects pickled before these options existed: off
+    lineage_exponent = None
+    lineage_horizon = 50.0
+    reset_on_drop = None
+    reset_window = 1.0
+    reset_rollback = False
+    reset_tolerance = 0.0
+    drop_sigma = 2.0
+    """Significance (in standard deviations) a drop must also have"""
+    trend_window = 2.0
+    """Window (x nlive iterations) for the trend of the cost per iteration"""
+    max_cost_growth = 3.0
+    """Cap on the log growth of the cost per iteration over the horizon"""
+    rollback_next = False
+    _attempt_next = None
+    _drop_anchor = -np.inf
+    _horizon = None
 
     def __init__(
         self,
@@ -411,6 +562,12 @@ class RetrainDecision:
         horizon=True,
         plan_pool=True,
         fresh_predictor="average",
+        lineage_exponent=DEFAULT_LINEAGE_EXPONENT,
+        lineage_horizon=50.0,
+        reset_on_drop=np.log(4.0),
+        reset_window=1.0,
+        reset_rollback=True,
+        reset_tolerance=0.0,
     ):
         self.nlive = nlive
         self.cost = RetrainCostModel(costs)
@@ -422,6 +579,23 @@ class RetrainDecision:
         if fresh_predictor not in ("average", "last", "trend"):
             raise ValueError(f"Unknown fresh_predictor: {fresh_predictor}")
         self.fresh_predictor = fresh_predictor
+        if isinstance(lineage_exponent, dict):
+            unknown = set(lineage_exponent) - {"likelihood", "population"}
+            if unknown:
+                raise ValueError(f"Unknown lineage exponent keys: {unknown}")
+            lineage_exponent = dict(lineage_exponent)
+        elif lineage_exponent is not None and lineage_exponent < 0:
+            raise ValueError("lineage_exponent must be non-negative")
+        self.lineage_exponent = lineage_exponent
+        self.lineage_horizon = lineage_horizon
+        self.reset_on_drop = reset_on_drop
+        self.reset_window = reset_window
+        self.reset_rollback = reset_rollback
+        self.reset_tolerance = reset_tolerance
+        self.rollback_next = False
+        self._attempt_next = None
+        self._drop_anchor = -np.inf
+        self._horizon = None
         self.next_poolsize = None
         self.episodes = []
         self.log = []
@@ -433,20 +607,29 @@ class RetrainDecision:
     def current(self) -> Optional[Episode]:
         return self.episodes[-1] if self.episodes else None
 
+    @property
+    def can_reset(self):
+        """Whether the decision may reset the flow."""
+        return bool(self.allow_reset) or self.reset_on_drop is not None
+
     def start_episode(self, iteration, reset, epochs, n_train):
         """Record a training of the flow."""
         if self.current is not None:
             self._finish_episode(self.current)
         units = epochs * n_train if epochs is not None else np.nan
         warm = self._warm_level(at=iteration)
-        self.episodes.append(
-            Episode(
-                start=iteration,
-                reset=reset,
-                train_cost_units=units,
-                predicted=warm[0] if (warm and not reset) else np.nan,
-            )
+        ep = Episode(
+            start=iteration,
+            reset=reset,
+            train_cost_units=units,
+            predicted=warm[0] if (warm and not reset) else np.nan,
         )
+        if reset and self._attempt_next is not None:
+            ep.attempt = True
+            ep.baseline = self._attempt_next
+        self._attempt_next = None
+        self.rollback_next = False
+        self.episodes.append(ep)
 
     def record_training_time(self, seconds, epochs, n_train):
         if epochs is not None:
@@ -456,15 +639,24 @@ class RetrainDecision:
         if self.current is not None:
             self.current.counts.append(count)
 
-    def record_populations(self, seconds, n_points, like_seconds, n_like):
+    def record_populations(
+        self, seconds, n_points, like_seconds, n_like, n_draws=None
+    ):
         """Record the time spent between trainings.
 
         ``seconds`` should include everything except training, it is
-        attributed to pool points after subtracting the likelihood time.
+        attributed to pool points (and to flow draws, if ``n_draws`` is
+        given) after subtracting the likelihood time.
         """
         self.cost.record("likelihood", like_seconds, n_like)
         self.cost.record("population", seconds - like_seconds, n_points)
+        if n_draws:
+            self.cost.record("draw", seconds - like_seconds, n_draws)
         self._like_per_point = n_like / n_points if n_points else 1.0
+        ep = self.current
+        if ep is not None and n_points:
+            ep.points += n_points
+            ep.draws += n_draws or 0.0
 
     def _finish_episode(self, ep: Episode):
         # Short episodes are fitted as a single bin with the slope from its
@@ -489,13 +681,26 @@ class RetrainDecision:
     def _finished(self, episodes):
         return [e for e in episodes if np.isfinite(e.log_a0)]
 
-    def _lineage(self):
-        """Finished episodes since the last reset (or the first training)."""
+    def _lineage_start(self):
+        """Index of the episode that started the current lineage: the last
+        reset that was kept (or the first training)."""
         start = 0
         for i, e in enumerate(self.episodes):
-            if e.reset:
+            if e.reset and not e.rejected:
                 start = i
-        return self._finished(self.episodes[start:-1])
+        return start
+
+    def _lineage_episodes(self, include_current=True):
+        eps = self.episodes if include_current else self.episodes[:-1]
+        return [e for e in eps[self._lineage_start() :] if not e.rejected]
+
+    def lineage_length(self):
+        """Number of trainings of the current flow since its last reset."""
+        return max(len(self._lineage_episodes()), 1)
+
+    def _lineage(self):
+        """Finished episodes since the last reset (or the first training)."""
+        return self._finished(self._lineage_episodes(include_current=False))
 
     def _level_history(self, include_current=True):
         """``(iteration, log-acceptance, variance)`` at the start of the
@@ -504,13 +709,14 @@ class RetrainDecision:
         The running episode is included by default: the decision to retrain
         is taken when it ends, so the next flow follows it.
         """
-        start = 0
-        for i, e in enumerate(self.episodes):
-            if e.reset:
-                start = i
-        eps = self.episodes if include_current else self.episodes[:-1]
+        start = self._lineage_start()
+        eps_all = self.episodes if include_current else self.episodes[:-1]
+        eps = [e for e in eps_all if not e.rejected]
+        lineage_eps = [
+            e for i, e in enumerate(eps_all) if i >= start and not e.rejected
+        ]
         rows = []
-        for lineage in (eps[start:], eps):
+        for lineage in (lineage_eps, eps):
             rows = [
                 (e.start, *initial_level(e.counts, self.bin_size))
                 for e in lineage
@@ -643,15 +849,110 @@ class RetrainDecision:
             return None
         return float(np.mean([e.train_cost_units for e in eps]))
 
-    def pool_point_cost(self):
+    def _draws_per_point(self, episode=None):
+        """Flow draws per pool point of an episode, or of the most recent one
+        that recorded them."""
+        if episode is not None and episode.draws_per_point is not None:
+            return episode.draws_per_point
+        for e in reversed(self.episodes):
+            if e.draws_per_point is not None:
+                return e.draws_per_point
+        return None
+
+    def cost_components(self, episode=None):
+        """Likelihood and population costs of one pool point (for the flow of
+        ``episode``, default: the latest one)."""
         lk = self.cost["likelihood"]
-        pop = self.cost["population"]
-        if lk is None or pop is None:
+        if lk is None:
             return None
-        return pop + lk * getattr(self, "_like_per_point", 1.0)
+        like = lk * getattr(self, "_like_per_point", 1.0)
+        dpp = self._draws_per_point(episode)
+        if self.cost.per_draw and dpp is not None:
+            pop = self.cost["draw"] * dpp
+        else:
+            pop = self.cost["population"]
+        if pop is None:
+            return None
+        return like, pop
+
+    def pool_point_cost(self, episode=None):
+        parts = self.cost_components(episode)
+        return None if parts is None else float(sum(parts))
+
+    def _lineage_weights(self):
+        b = self.lineage_exponent
+        if not b:
+            return None
+        if isinstance(b, dict):
+            return b.get("likelihood", 0.0), b.get("population", 0.0)
+        return float(b), float(b)
+
+    def lineage_gain(self, tau, c, a, k, horizon=None):
+        """Saving over the rest of the run from one more training of the
+        current lineage, if the flow is then trained every ``tau``
+        iterations (``c``, ``a`` and ``k``: cost per pool point, fresh
+        acceptance and decay rate)."""
+        weights = self._lineage_weights()
+        parts = self.cost_components()
+        horizon = self._horizon if horizon is None else horizon
+        if weights is None or parts is None or horizon is None:
+            return 0.0
+        h = self.lineage_horizon * self.nlive
+        if np.isfinite(horizon):
+            h = min(horizon, h)
+        if h <= 0:
+            return 0.0
+        like, pop = parts
+        b = (weights[0] * like + weights[1] * pop) / (like + pop)
+        t = max(tau, float(self._min_block()))
+        # sampling cost per iteration, averaged over a cycle
+        cost = c / a * np.expm1(k * t) / (k * t)
+        growth = self.cost_trend()[0]
+        if growth * h > self.max_cost_growth:
+            growth = self.max_cost_growth / h
+        return float(
+            b * cost * lineage_sum(self.lineage_length(), t, h, growth=growth)
+        )
+
+    def cost_trend(self):
+        """Mean and variance of the rate (per iteration) at which the log
+        cost per iteration of a fresh flow changes, from the episodes of the
+        current lineage in the last ``trend_window`` x ``nlive`` iterations,
+        with a Gaussian prior of width ``trend_slope_sd`` per ``nlive``
+        centred on zero."""
+        ep = self.current
+        now = ep.start + len(ep.counts) if ep is not None else 0
+        rows = []
+        for e in self._lineage_episodes():
+            if e.start < now - self.trend_window * self.nlive:
+                continue
+            if len(e.counts) < self.min_episode_length:
+                continue
+            level = self._episode_log_cost(e)
+            if level is not None:
+                rows.append((e.start, *level))
+        prior_prec = (self.nlive / self.trend_slope_sd) ** 2
+        if len(rows) < 3:
+            return 0.0, 1.0 / prior_prec
+        x = np.array([r[0] for r in rows], dtype=float)
+        y = np.array([r[1] for r in rows])
+        w = 1.0 / (np.array([r[2] for r in rows]) + self.fresh_prior_sd**2)
+        xc = x - np.sum(w * x) / np.sum(w)
+        prec = np.sum(w * xc**2) + prior_prec
+        return float(np.sum(w * xc * y) / prec), float(1.0 / prec)
+
+    def _renewal(self, T, c, a, k):
+        y = T * k * a / c
+        x = solve_renewal(y)
+        return dict(g=x * c / a, tau=np.log(x) / k, T=T, c=c, a=a, k=k, y=y)
 
     def long_run_rate(self, reset=False):
-        """Optimal long-run cost per iteration, g*, and the cycle length."""
+        """Optimal long-run cost per iteration, g*, and the cycle length.
+
+        With the lineage term, ``T`` in the result is the training cost
+        less the lineage gain ``G`` (``T_train`` is the cost itself), for
+        the cycle length that this lower cost implies.
+        """
         c = self.pool_point_cost()
         units = self.training_units(reset=reset)
         fresh = self.fresh_acceptance(reset=reset)
@@ -668,17 +969,30 @@ class RetrainDecision:
             return None
         # E[1 / k] to second order
         k_eff = k / (1 + k_var / k**2)
-        y = T * k_eff * a_eff / c
-        x = solve_renewal(y)
-        return dict(
-            g=x * c / a_eff,
-            tau=np.log(x) / k_eff,
-            T=T,
-            c=c,
-            a=a_eff,
-            k=k_eff,
-            y=y,
-        )
+        base = self._renewal(T, c, a_eff, k_eff)
+        if self._lineage_weights() is None or self._horizon is None:
+            return base | dict(T_train=T, G=0.0)
+
+        def solve(tau):
+            gain = self.lineage_gain(tau, c, a_eff, k_eff)
+            return self._renewal(max(T - gain, 0.0), c, a_eff, k_eff), gain
+
+        # The gain grows with the cycle length and the cycle length falls
+        # with the gain, so the self-consistent cycle is unique
+        lo = float(self._min_block())
+        best, gain = solve(lo)
+        if best["tau"] > lo:
+            hi = max(base["tau"], lo)
+            for _ in range(60):
+                mid = 0.5 * (lo + hi)
+                if solve(mid)[0]["tau"] > mid:
+                    lo = mid
+                else:
+                    hi = mid
+                if hi - lo < 1e-3 * hi:
+                    break
+            best, gain = solve(hi)
+        return best | dict(T_train=T, G=gain)
 
     def current_fit(self):
         """Posterior of (log A, slope) for the current flow."""
@@ -730,9 +1044,34 @@ class RetrainDecision:
         """
         ep = self.current
         self.reset_next = False
+        self.rollback_next = False
+        self._attempt_next = None
         if ep is None:
             return True
+        self._horizon = remaining
         s = len(ep.counts)
+        if ep.attempt and not ep.resolved and s:
+            if self._resolve_attempt(iteration, ep):
+                return True
+        if self.reset_on_drop is not None and not ep.reset:
+            drop = self._drop()
+            if drop is not None and (
+                drop[0] > self.reset_on_drop + self.drop_sigma * drop[1]
+            ):
+                self.reset_next = True
+                self._attempt_next = drop[2] if self.reset_rollback else None
+                self._drop_anchor = iteration
+                self.next_poolsize = None
+                self._log(
+                    iteration,
+                    s,
+                    True,
+                    reason="drop",
+                    reset=True,
+                    drop=drop[0],
+                    drop_sd=drop[1],
+                )
+                return True
         c = self.pool_point_cost()
         warm = self.long_run_rate(reset=False)
         if c is None or warm is None:
@@ -776,6 +1115,8 @@ class RetrainDecision:
             retrain = bool(cost_optimal < cost_continue)
             reason = "horizon"
         self.reset_next = retrain and reset
+        if self.reset_next and self.reset_rollback:
+            self._attempt_next = self._episode_log_cost(ep)
         self.next_poolsize = None
         if self.plan_pool:
             if retrain:
@@ -809,6 +1150,9 @@ class RetrainDecision:
             reset_gain_sd=np.sqrt(gain[1]) if gain else None,
             c=c,
             T=best["T"],
+            T_train=best.get("T_train", best["T"]),
+            G=best.get("G", 0.0),
+            lineage=self.lineage_length(),
             g=best["g"],
             tau=best["tau"],
             y=best["y"],
@@ -816,6 +1160,100 @@ class RetrainDecision:
             poolsize=self.next_poolsize,
         )
         return retrain
+
+    def _episode_log_cost(self, ep):
+        """Mean and variance of the log cost per iteration of the flow of an
+        episode at its start (likelihood and population)."""
+        if not ep.counts:
+            return None
+        c = self.pool_point_cost(ep)
+        if c is None:
+            return None
+        log_a, var = initial_level(ep.counts, self.bin_size)
+        return float(np.log(c) - log_a), float(var)
+
+    def _drop(self):
+        """Rise of the log cost per iteration of the current flow above the
+        median of the current lineage in the recent window: ``(rise, sd,
+        (mean, variance) of the current flow)``.
+
+        The reference is the median of the window, and the standard
+        deviation combines the measurement of the current flow with a robust
+        scatter of fresh flows (from the median error of past predictions,
+        so it includes the scatter between trainings), so that the first
+        flows after a drop neither drag the reference down nor inflate the
+        scatter.
+        """
+        ep = self.current
+        cur = self._episode_log_cost(ep)
+        if cur is None:
+            return None
+        since = max(
+            ep.start - self.reset_window * self.nlive, self._drop_anchor
+        )
+        refs = [
+            self._episode_log_cost(e)
+            for e in self._lineage_episodes(include_current=False)
+            if e.start >= since and len(e.counts) >= self.min_episode_length
+        ]
+        refs = [r for r in refs if r is not None]
+        if not refs:
+            return None
+        ref = float(np.median([r[0] for r in refs]))
+        var = cur[1] + self._robust_scatter() * (1.0 + 1.0 / len(refs))
+        return cur[0] - ref, float(np.sqrt(var)), cur
+
+    def _robust_scatter(self):
+        """Variance of the log-acceptance of a fresh flow about its
+        prediction, from the median absolute error of the last
+        ``error_window`` predictions (the running episode excluded),
+        combined with the prior as in :meth:`_warm_level`."""
+        errors = [
+            initial_level(e.counts, self.bin_size)[0] - e.predicted
+            for e in self.episodes[:-1]
+            if len(e.counts) >= self.min_episode_length
+            and np.isfinite(e.predicted)
+            and not e.rejected
+        ][-self.error_window :]
+        w = self.fresh_prior_weight
+        var = w * self.fresh_prior_sd**2
+        if errors:
+            mad = 1.4826 * np.median(np.abs(errors))
+            var += len(errors) * mad**2
+        var /= w + len(errors)
+        return max(var, self.min_log_a0_sd**2)
+
+    def _resolve_attempt(self, iteration, ep):
+        """Compare a reset flow with the flow it replaced after its first
+        pool. Returns True if the reset is discarded (the previous flow is
+        to be restored and retrained)."""
+        ep.resolved = True
+        cur = self._episode_log_cost(ep)
+        if cur is None or not np.isfinite(ep.baseline[0]):
+            return False
+        excess = cur[0] - ep.baseline[0]
+        if self.reset_rollback and excess > self.reset_tolerance:
+            ep.rejected = True
+            self.rollback_next = True
+            self._drop_anchor = iteration
+            self.next_poolsize = None
+            self._log(
+                iteration,
+                len(ep.counts),
+                True,
+                reason="rollback",
+                excess=excess,
+                excess_sd=float(np.sqrt(cur[1] + ep.baseline[1])),
+            )
+            return True
+        logger.info(
+            "Keeping the reset flow at iteration %d: log cost per iteration "
+            "%.2f against %.2f for the flow it replaced",
+            iteration,
+            cur[0],
+            ep.baseline[0],
+        )
+        return False
 
     def _min_block(self):
         """Minimum number of iterations a pool should provide."""
@@ -837,6 +1275,27 @@ class RetrainDecision:
         d = dict(iteration=iteration, since_training=s, retrain=retrain)
         d.update(kwargs)
         self.log.append(d)
+        if kwargs.get("reason") == "drop":
+            logger.info(
+                "Resetting the flow at iteration %d: the cost per iteration "
+                "of a fresh flow rose by %.2f +/- %.2f (log) in the last "
+                "%.3g x nlive iterations",
+                iteration,
+                kwargs["drop"],
+                kwargs["drop_sd"],
+                self.reset_window,
+            )
+            return
+        if kwargs.get("reason") == "rollback":
+            logger.info(
+                "Discarding the reset flow at iteration %d: its cost per "
+                "iteration is higher by %.2f +/- %.2f (log) than the flow it "
+                "replaced, which is restored and retrained",
+                iteration,
+                kwargs["excess"],
+                kwargs["excess_sd"],
+            )
+            return
         if "g" not in kwargs:
             if retrain:
                 logger.info(
@@ -887,7 +1346,9 @@ class RetrainDecision:
             f"/nlive. Fresh flow: acc={np.exp(d['fresh_log_a']):.3g} "
             f"(log sd {d['fresh_log_a_sd']:.2f}), "
             f"decay={d['k'] * nlive:.2f}+/-{d['k_sd'] * nlive:.2f}/nlive. "
-            f"Costs: c={d['c']:.3g}s/point, T={d['T']:.3g}s -> "
+            f"Costs: c={d['c']:.3g}s/point, T={d.get('T_train', d['T']):.3g}s"
+            f" less lineage gain {d.get('G', 0.0):.3g}s (N={d.get('lineage')})"
+            f" -> "
             f"y={d['y']:.3g}, g*={d['g']:.3g}s/it, tau*={d['tau']:.0f} it"
             f"{reset}{pool}"
         )
@@ -915,4 +1376,6 @@ class RetrainDecision:
             out["long_run"] = {k: float(v) for k, v in warm.items()}
         out["n_trainings"] = len(self.episodes)
         out["n_resets"] = int(sum(e.reset for e in self.episodes[1:]))
+        out["n_resets_discarded"] = int(sum(e.rejected for e in self.episodes))
+        out["lineage_length"] = self.lineage_length()
         return out

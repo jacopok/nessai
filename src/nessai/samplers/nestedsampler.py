@@ -440,6 +440,8 @@ class NestedSampler(BaseNestedSampler):
             **kwargs,
         )
         self._retrain_snapshot = None
+        self._rollback_flow = None
+        self._region_rollback = {}
 
     def benchmark_retrain_costs(self):
         """Measure the retrain unit costs with the run's configuration."""
@@ -473,8 +475,11 @@ class NestedSampler(BaseNestedSampler):
         snap = self._retrain_time_snapshot()
         if self._retrain_snapshot is not None and self.proposal.samples is not None:
             dt, dl, dn = (a - b for a, b in zip(snap, self._retrain_snapshot))
+            n_points = self.proposal.samples.size
+            acc = getattr(self.proposal, "population_acceptance", None)
+            n_draws = n_points / acc if acc else None
             self.retrain_decision.record_populations(
-                dt, self.proposal.samples.size, dl, dn
+                dt, n_points, dl, dn, n_draws=n_draws
             )
         self._retrain_snapshot = snap
 
@@ -1715,8 +1720,13 @@ class NestedSampler(BaseNestedSampler):
         samples = getattr(region.proposal, "samples", None)
         if region._retrain_snapshot is not None and samples is not None:
             dt, dl, dn = (a - b for a, b in zip(snap, region._retrain_snapshot))
+            acc = getattr(region.proposal, "population_acceptance", None)
             region.retrain_decision.record_populations(
-                dt, samples.size, dl, dn
+                dt,
+                samples.size,
+                dl,
+                dn,
+                n_draws=samples.size / acc if acc else None,
             )
         region._retrain_snapshot = snap
 
@@ -1760,8 +1770,12 @@ class NestedSampler(BaseNestedSampler):
         decision = region.retrain_decision
         if not proposal.training_count:
             return
-        if decision is not None and decision.allow_reset:
-            if decision.reset_next:
+        if decision is not None and decision.can_reset:
+            if decision.rollback_next:
+                self._restore_rollback_flow(region)
+            elif decision.reset_next:
+                if decision.reset_rollback:
+                    self._save_rollback_flow(region)
                 proposal.reset_model_weights(weights=True, permutations=True)
             return
         if (
@@ -2063,9 +2077,13 @@ class NestedSampler(BaseNestedSampler):
             return
 
         if self.retrain_decision is not None and (
-            self.retrain_decision.allow_reset
+            self.retrain_decision.can_reset
         ):
-            if self.retrain_decision.reset_next:
+            if self.retrain_decision.rollback_next:
+                self._restore_rollback_flow()
+            elif self.retrain_decision.reset_next:
+                if self.retrain_decision.reset_rollback:
+                    self._save_rollback_flow()
                 self.proposal.reset_model_weights(
                     weights=True, permutations=True
                 )
@@ -2090,6 +2108,55 @@ class NestedSampler(BaseNestedSampler):
                 )
             ),
         )
+
+    def _save_rollback_flow(self, region=None):
+        """Keep a copy of the flows (and their optimisers) before a reset, so
+        the reset can be discarded. With a mixture proposal the secondary's
+        flow is kept too."""
+        proposal = self.proposal if region is None else region.proposal
+        saved = []
+        for p in (proposal, getattr(proposal, "secondary", None)):
+            flow = getattr(p, "flow", None)
+            if flow is not None and hasattr(flow, "model"):
+                saved.append(
+                    (flow, deepcopy((flow.model, getattr(flow, "_optimiser", None))))
+                )
+        saved = saved or None
+        if region is None:
+            self._rollback_flow = saved
+        else:
+            self.__dict__.setdefault("_region_rollback", {})[
+                region.label
+            ] = saved
+
+    def _restore_rollback_flow(self, region=None):
+        """Restore the flows saved before the last reset."""
+        if region is None:
+            saved, self._rollback_flow = (
+                getattr(self, "_rollback_flow", None),
+                None,
+            )
+            proposal = self.proposal
+        else:
+            saved = getattr(self, "_region_rollback", {}).pop(
+                region.label, None
+            )
+            proposal = region.proposal
+        if saved is None:
+            logger.warning(
+                "The flow from before the reset is not available (resumed "
+                "run?), keeping the reset flow"
+            )
+            return
+        for flow, (model, optimiser) in saved:
+            flow.model = model
+            flow._optimiser = (
+                optimiser if optimiser is not None else flow.get_optimiser()
+            )
+        realign = getattr(proposal, "_realign_prime_space_action", None)
+        if callable(realign):
+            realign()
+        logger.debug("Restored the flow from before the reset")
 
     def train_proposal(self, force=False):
         """
