@@ -3,7 +3,7 @@
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -91,7 +91,9 @@ def test_log_proposal_threshold_prepare(samples, quantile, expected):
     proposal = SimpleNamespace(
         training_data=live_points, forward_pass=forward_pass
     )
-    rule = LogProposalThresholdTruncation(quantile=quantile)
+    rule = LogProposalThresholdTruncation(
+        quantile=quantile, prior_relative=False, mode="drop"
+    )
     rule.prepare(proposal, None)
 
     assert rule.threshold == expected
@@ -107,7 +109,7 @@ def test_log_proposal_threshold_filters_aligned_arrays(
     x = samples([(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)])
     log_q = np.array([-3.0, -2.0, -1.0])
     z = np.arange(6).reshape(3, 2)
-    rule = LogProposalThresholdTruncation()
+    rule = LogProposalThresholdTruncation(prior_relative=False, mode="drop")
     rule._threshold = threshold
 
     result = rule.apply_after_backward(None, x, log_q, z)
@@ -570,3 +572,178 @@ def test_truncation_scheme_prepare_and_reset(proposal):
     assert np.isnan(radius_rule.radius)
     assert np.isnan(radius_rule.threshold)
     assert np.isnan(likelihood_rule.threshold)
+
+
+@pytest.mark.parametrize("temperature", [None, 1.0, 2.0])
+def test_log_proposal_threshold_uses_tempered_live_log_q(temperature):
+    """The live points are scored at the pool's latent temperature, so the
+    threshold is comparable with the tempered ``log_q`` of the draws."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    z = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]])
+    log_q = np.array([-1.0, -2.0, -3.0, -4.0])
+    proposal = MagicMock()
+    proposal.training_data = np.zeros(4)
+    proposal.forward_pass = MagicMock(return_value=(z, log_q))
+    proposal.latent_temperature = temperature
+
+    def latent_log_prob(z, temperature=None):
+        t = 1.0 if temperature is None else temperature
+        return -0.5 * np.sum(z**2, axis=-1) / t - 0.5 * z.shape[-1] * np.log(t)
+
+    proposal.latent_log_prob = latent_log_prob
+
+    rule = LogProposalThresholdTruncation(
+        quantile=0.5, prior_relative=False, mode="drop"
+    )
+    rule.prepare(proposal, worst_point=None)
+
+    expected = log_q
+    if temperature not in (None, 1.0):
+        expected = log_q + latent_log_prob(z, temperature) - latent_log_prob(z)
+    assert rule.threshold == pytest.approx(np.quantile(expected, 0.5))
+
+
+def test_log_proposal_threshold_prior_relative():
+    """With ``prior_relative`` the threshold is on ``log q - log prior``,
+    over the live points and their boundary-inversion mirror copies: the kept
+    draws have log-weights below ``-threshold``, whatever their ``log q``."""
+    from nessai.livepoint import empty_structured_array
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    def arr(v):
+        a = empty_structured_array(len(v), names=["x"])
+        a["x"] = v
+        return a
+
+    def log_q_of(x):
+        return -(x["x"] ** 2)
+
+    def log_prior(x):
+        return 2.0 * x["x"]
+
+    rng = np.random.default_rng(3)
+    live = arr(rng.uniform(-1, 1, 1000))
+    proposal = MagicMock()
+    proposal.training_data = live
+    proposal.latent_temperature = None
+    # the flow's rescale appends a boundary-inversion mirror copy of every
+    # point (x -> -x - 4, far below the live points' log q): forward_pass
+    # returns twice as many rows as the live points
+    proposal.forward_pass = MagicMock(
+        side_effect=lambda x: (
+            np.zeros((2 * len(x), 1)),
+            np.concatenate([log_q_of(x), -((x["x"] + 4) ** 2)]),
+        )
+    )
+
+    def compute_weights(x, log_q):
+        assert len(x) == len(log_q)
+        return log_prior(x) - log_q
+
+    proposal.compute_weights = MagicMock(side_effect=compute_weights)
+
+    rule = LogProposalThresholdTruncation(quantile=0.1, prior_relative=True)
+    rule.prepare(proposal, worst_point=None)
+    # each mirror row is paired with its live point's prior
+    live_level = np.concatenate(
+        [log_q_of(live), -((live["x"] + 4) ** 2)]
+    ) - np.tile(log_prior(live), 2)
+    assert rule.threshold == pytest.approx(np.quantile(live_level, 0.1))
+
+    x = arr(np.linspace(-1, 1, 2001))
+    out, _, _ = rule.apply_after_backward(
+        proposal, x, log_q_of(x), np.zeros((len(x), 1))
+    )
+    assert len(out) == np.sum(log_q_of(x) - log_prior(x) > rule.threshold)
+    assert np.all(log_prior(out) - log_q_of(out) < -rule.threshold)
+
+    # without prior_relative the threshold is on log q, over the mirror
+    # copies too
+    rule.prior_relative = False
+    rule.prepare(proposal, worst_point=None)
+    assert rule.threshold == pytest.approx(
+        np.quantile(
+            np.concatenate([log_q_of(live), -((live["x"] + 4) ** 2)]), 0.1
+        )
+    )
+
+
+def _prior_relative_proposal(live_x):
+    """Mock proposal on a line with log q = -x**2 and a flat prior, so the
+    level (log q - log prior) of a point is -x**2."""
+    from nessai.livepoint import empty_structured_array
+
+    live = empty_structured_array(len(live_x), names=["x"])
+    live["x"] = live_x
+    proposal = MagicMock()
+    proposal.training_data = live
+    proposal.latent_temperature = None
+    proposal.forward_pass = MagicMock(
+        side_effect=lambda x: (np.zeros((len(x), 1)), -(x["x"] ** 2))
+    )
+    proposal.compute_weights = MagicMock(side_effect=lambda x, log_q: -log_q)
+    return proposal
+
+
+@pytest.mark.parametrize("mode", ["clip", "drop"])
+def test_log_proposal_threshold_lost_mass(mode):
+    """``lost_mass`` sets the threshold at which the live points' mean lost
+    share is the target: ``1 - min(1, c / w)`` in clip mode, the share below
+    the threshold (a quantile) in drop mode."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    live_x = np.random.default_rng(4).normal(size=2000)
+    proposal = _prior_relative_proposal(live_x)
+    level = -(live_x**2)
+    rule = LogProposalThresholdTruncation(
+        quantile=0.5, prior_relative=True, mode=mode, lost_mass=0.01
+    )
+    rule.prepare(proposal, worst_point=None)
+    t = rule.threshold
+    if mode == "clip":
+        lost = np.mean(1 - np.minimum(1, np.exp(level - t)))
+        assert lost == pytest.approx(0.01, rel=1e-4)
+        # the clip only underweights the points beyond its cap, so losing as
+        # much needs a lower cap (higher threshold) than the drop's quantile
+        assert t > np.quantile(level, 0.01)
+        assert rule.log_weight_cap == -t
+    else:
+        assert t == pytest.approx(np.quantile(level, 0.01))
+    assert rule.lost_live_mass == pytest.approx(0.01, rel=1e-3)
+
+
+def test_log_proposal_threshold_lost_mass_recorded_with_quantile():
+    """Set by ``quantile``, the rule still records the mass it loses."""
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    live_x = np.random.default_rng(5).normal(size=2000)
+    rule = LogProposalThresholdTruncation(
+        quantile=0.005, prior_relative=True, mode="clip"
+    )
+    rule.prepare(_prior_relative_proposal(live_x), worst_point=None)
+    level = -(live_x**2)
+    expected = np.mean(1 - np.minimum(1, np.exp(level - rule.threshold)))
+    assert rule.lost_live_mass == pytest.approx(expected)
+    assert 0 < rule.lost_live_mass < 0.005
+
+
+def test_log_proposal_threshold_lost_mass_validation():
+    from nessai.proposal.flowproposal.truncation import (
+        LogProposalThresholdTruncation,
+    )
+
+    with pytest.raises(ValueError, match="prior_relative"):
+        LogProposalThresholdTruncation(
+            prior_relative=False, mode="drop", lost_mass=0.01
+        )
+    with pytest.raises(ValueError, match=r"\(0, 1\)"):
+        LogProposalThresholdTruncation(prior_relative=True, lost_mass=1.5)

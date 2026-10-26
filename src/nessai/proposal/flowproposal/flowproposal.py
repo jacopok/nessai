@@ -11,7 +11,7 @@ import numpy as np
 from scipy.special import logsumexp
 
 from ... import config
-from ...livepoint import empty_structured_array
+from ...livepoint import empty_structured_array, live_points_to_array
 from ...utils.structures import get_subset_arrays
 from .base import BaseFlowProposal
 from .truncation import (
@@ -78,7 +78,8 @@ class FlowProposal(BaseFlowProposal):
         and should be configured via :code:`truncation_methods` and
         :code:`truncation_kwargs` instead.
     drawsize : int, optional
-        The number of samples to draw from the flow when populating the pool.
+        The number of samples to draw from the flow per batch when populating
+        the pool, at most the pool size (default: the initial pool size).
     truncate_log_q : bool, optional
         Whether to truncate the log q values when populating the pool. This
         argument is deprecated and should be configured via
@@ -111,6 +112,13 @@ class FlowProposal(BaseFlowProposal):
         The keyword arguments to use for the truncation methods when populating
         the pool. When using :code:`truncation_methods`, the keys of this
         dictionary should match the names of the truncation methods.
+    sum_mirror_density : bool, optional
+        With boundary inversion and duplication, score draws and live points
+        with the flow density summed over the mirror copies (one extra flow
+        evaluation per draw).
+    threshold_from_live_points : bool, optional
+        Set truncation thresholds from the sampler's current live points
+        instead of the flow's training data.
     **kwargs
         Additional keyword arguments to pass to the base class.
     """
@@ -137,9 +145,14 @@ class FlowProposal(BaseFlowProposal):
         truncation_methods=None,
         truncation_kwargs=None,
         clip_population_weights=False,
+        sum_mirror_density=False,
+        threshold_from_live_points=False,
         **kwargs,
     ):
         super().__init__(model, poolsize=poolsize, **kwargs)
+        self.sum_mirror_density = bool(sum_mirror_density)
+        self.threshold_from_live_points = bool(threshold_from_live_points)
+        self.current_live_points = None
         logger.debug("Initialising FlowProposal")
         self._warn_for_deprecated_latent_prior(latent_prior)
 
@@ -408,17 +421,79 @@ class FlowProposal(BaseFlowProposal):
         for i, parameter in enumerate(self.prime_parameters):
             x[parameter] = x_array[:, i]
 
+        sum_sides = (
+            getattr(self, "sum_mirror_density", False)
+            and rescale
+            and not return_unit_hypercube
+        )
         if rescale:
             x, log_J = self.inverse_rescale(
                 x, return_unit_hypercube=return_unit_hypercube
             )
             log_prob -= log_J
-            if not return_unit_hypercube:
+            if sum_sides:
+                x, z, log_prob, x_array = self.check_prior_bounds(
+                    x, z, log_prob, x_array
+                )
+            elif not return_unit_hypercube:
                 x, z, log_prob = self.check_prior_bounds(x, z, log_prob)
+
+        if sum_sides and len(x):
+            log_q_sides = self.mirror_log_q(
+                x, drawn_prime=x_array, drawn_log_q=log_prob
+            )
+            if log_q_sides.shape[0] > 1:
+                log_prob = logsumexp(log_q_sides, axis=0)
 
         if return_z:
             return x, log_prob, z
         return x, log_prob
+
+    def mirror_log_q(self, x, drawn_prime=None, drawn_log_q=None):
+        """``log q`` of each point of ``x`` on each side of the boundary
+        inversion, shape ``(n_sides, len(x))``, at the latent temperature.
+
+        With ``drawn_prime`` and ``drawn_log_q``, each draw's own side reuses
+        its density and only the other sides are evaluated.
+        """
+        n = len(x)
+        x_prime, log_j = self.rescale(x.copy())
+        arr = live_points_to_array(
+            x_prime, names=self.prime_parameters, copy=True
+        )
+        if arr.ndim == 1:
+            arr = arr[:, np.newaxis]
+        log_j = np.asarray(log_j, dtype=float)
+        if len(arr) % n:
+            raise RuntimeError(
+                f"{len(arr)} rows of log q for {n} points: not whole blocks "
+                "of mirror copies"
+            )
+        # mirror copies come in blocks of ``len(x)`` rows
+        k = len(arr) // n
+        todo = np.ones((k, n), dtype=bool)
+        log_q = np.empty((k, n))
+        if drawn_prime is not None and k > 1:
+            drawn_prime = np.asarray(drawn_prime, dtype=float).reshape(n, -1)
+            dist = np.sum(
+                (arr.reshape(k, n, -1) - drawn_prime[None]) ** 2, axis=-1
+            )
+            own = np.argmin(dist, axis=0)
+            log_q[own, np.arange(n)] = drawn_log_q
+            todo[own, np.arange(n)] = False
+        rows = todo.ravel()
+        temperature = getattr(self, "latent_temperature", None)
+        if temperature in (None, 1.0):
+            lq = self.flow.log_prob(arr[rows])
+        else:
+            z, lq = self.flow.forward_and_log_prob(arr[rows])
+            lq = (
+                lq
+                + self.latent_log_prob(z, temperature)
+                - self.latent_log_prob(z, None)
+            )
+        log_q[todo] = np.asarray(lq, dtype=float) + log_j[rows]
+        return log_q
 
     def populate(
         self,
@@ -459,8 +534,11 @@ class FlowProposal(BaseFlowProposal):
         n_accepted = 0
         accept = None
 
+        # clip mode of a truncation rule: weights above the cap are clipped
+        log_cap = self._truncation_scheme.log_weight_cap
+
         while n_accepted < n_samples:
-            z = self.sample_latent_distribution(self.drawsize)
+            z = self.sample_latent_distribution(min(self.drawsize, n_samples))
             n_proposed += z.shape[0]
             z = self._truncation_scheme.apply_latent(self, z)
             if not len(z):
@@ -475,9 +553,11 @@ class FlowProposal(BaseFlowProposal):
                 return_z=True,
                 return_unit_hypercube=self.map_to_unit_hypercube,
             )
-            x, log_q, z = self._truncation_scheme.apply_after_backward(
-                self, x, log_q, z
-            )
+            # empty if the flow inverse failed
+            if len(x):
+                x, log_q, z = self._truncation_scheme.apply_after_backward(
+                    self, x, log_q, z
+                )
             if not len(x):
                 if n_proposed > max_samples:
                     logger.warning("Reached max samples (%s)", max_samples)
@@ -497,7 +577,7 @@ class FlowProposal(BaseFlowProposal):
                         break
                     continue
 
-            log_w = self.compute_weights(x, log_q)
+            log_w = np.minimum(self.compute_weights(x, log_q), log_cap)
 
             if self.accumulate_weights:
                 samples = np.concatenate([samples, x])
@@ -575,4 +655,14 @@ class FlowProposal(BaseFlowProposal):
         self._truncation_scheme.reset()
 
     def __getstate__(self):
-        return super().__getstate__()
+        state = super().__getstate__()
+        # the sampler pickles its own live points
+        state["current_live_points"] = None
+        return state
+
+    def __setstate__(self, state):
+        # resume files from before these options existed
+        state.setdefault("sum_mirror_density", False)
+        state.setdefault("threshold_from_live_points", False)
+        state.setdefault("current_live_points", None)
+        self.__dict__.update(state)
