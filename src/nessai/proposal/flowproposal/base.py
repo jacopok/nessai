@@ -912,10 +912,16 @@ class BaseFlowProposal(RejectionProposal):
             x_prime, self.prime_parameters, copy=True
         )
 
+        train_kwargs = {}
+        n_rows = x_prime_array.shape[0]
+        if n_rows > len(x) and n_rows % len(x) == 0:
+            # keep each live point's mirror copies on one side of the split
+            train_kwargs["groups"] = np.arange(n_rows) % len(x)
         self.flow.train(
             x_prime_array,
             output=block_output,
             plot=self._plot_training and plot,
+            **train_kwargs,
         )
 
         if self._plot_training and plot:
