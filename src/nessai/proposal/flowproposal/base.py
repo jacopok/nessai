@@ -1267,14 +1267,28 @@ class BaseFlowProposal(RejectionProposal):
         self.initialise(resumed=True)
 
         if weights_file is None:
-            weights_file = self.weights_file
+            weights_file = self._own_weights_file(self.weights_file)
 
         # Flow might have exited before any weights were saved.
-        if weights_file is not None:
-            if os.path.exists(weights_file):
-                self.flow.reload_weights(weights_file)
+        if weights_file is not None and os.path.exists(weights_file):
+            self.flow.reload_weights(weights_file)
         else:
-            logger.warning("Could not reload weights for flow")
+            logger.warning(
+                f"Could not reload weights for flow (from {weights_file})"
+            )
+
+    def _own_weights_file(self, weights_file):
+        """``weights_file`` in the current output directory, if it exists
+        there (e.g. a resumed copy of a run directory)."""
+        if weights_file is None or not getattr(self, "output", None):
+            return weights_file
+        own = os.path.join(self.output, os.path.basename(weights_file))
+        if os.path.abspath(own) != os.path.abspath(weights_file) and (
+            os.path.exists(own)
+        ):
+            logger.info(f"Reloading the flow from {own}, not {weights_file}")
+            return own
+        return weights_file
 
     def reset(self):
         """Reset the proposal"""

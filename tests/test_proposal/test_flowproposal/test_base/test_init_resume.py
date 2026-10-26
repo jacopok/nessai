@@ -58,6 +58,7 @@ def test_resume(proposal):
     proposal.mask = [1, 0]
     proposal.update_bounds = False
     proposal.weights_file = None
+    proposal._own_weights_file = lambda w: w
     model = MagicMock()
     with patch("nessai.proposal.base.Proposal.resume") as mock:
         BaseFlowProposal.resume(proposal, model, {})
@@ -81,6 +82,35 @@ def test_resume_w_weights(osexist, proposal):
     osexist.assert_called_once_with("weights.pt")
     proposal.initialise.assert_called_once()
     proposal.flow.reload_weights.assert_called_once_with("weights.pt")
+
+
+def test_own_weights_file(proposal, tmp_path):
+    """A run resumed in another directory (a copy) reloads the flow saved in
+    its own output, not the one at the path the checkpoint stored."""
+    old = tmp_path / "old" / "proposal"
+    new = tmp_path / "new" / "proposal"
+    for d in (old, new):
+        d.mkdir(parents=True)
+        (d / "model.pt").write_text("")
+    proposal.output = str(new)
+    own = BaseFlowProposal._own_weights_file
+    assert own(proposal, str(old / "model.pt")) == str(new / "model.pt")
+    assert own(proposal, str(new / "model.pt")) == str(new / "model.pt")
+    assert own(proposal, None) is None
+    (new / "model.pt").unlink()
+    assert own(proposal, str(old / "model.pt")) == str(old / "model.pt")
+
+
+def test_resume_missing_weights_warns(proposal, caplog):
+    proposal.initialise = MagicMock()
+    proposal.flow = MagicMock()
+    proposal.mask = None
+    proposal.weights_file = "/no/such/model.pt"
+    proposal._own_weights_file = lambda w: w
+    with patch("nessai.proposal.base.Proposal.resume"):
+        BaseFlowProposal.resume(proposal, MagicMock(), {})
+    proposal.flow.reload_weights.assert_not_called()
+    assert "Could not reload weights" in caplog.text
 
 
 @pytest.mark.parametrize("populated", [False, True])
