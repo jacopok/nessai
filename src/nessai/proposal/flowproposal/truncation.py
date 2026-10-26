@@ -6,7 +6,9 @@ import logging
 from copy import deepcopy
 
 import numpy as np
+from scipy.special import logsumexp
 
+from ...livepoint import empty_structured_array
 from ...utils import compute_radius
 from ...utils.structures import get_subset_arrays
 
@@ -395,6 +397,186 @@ class MinLogQTruncation(BaseTruncationRule):
         return get_subset_arrays(keep, x, log_q, z)
 
 
+def _threshold_points(proposal):
+    """Live points to set thresholds from: the current ones with
+    ``threshold_from_live_points``, else the flow's training data."""
+    live = getattr(proposal, "current_live_points", None)
+    if getattr(proposal, "threshold_from_live_points", False) is True and (
+        live is not None and len(live)
+    ):
+        return live
+    return proposal.training_data
+
+
+def _with_auxiliary_parameters(proposal, points):
+    """``points`` with the auxiliary parameters of the reparameterisations
+    (e.g. an angle's radius) drawn once, so their prior can be evaluated."""
+    names = getattr(getattr(proposal, "x_dtype", None), "names", None) or ()
+    present = points.dtype.names or ()
+    missing = [n for n in names if n not in present]
+    if not missing or not len(points):
+        return points
+    x_prime, _ = proposal.rescale(points.copy())
+    x, _ = proposal.inverse_rescale(x_prime)
+    out = empty_structured_array(len(points), dtype=proposal.x_dtype)
+    for name in present:
+        if name in names:
+            out[name] = points[name]
+    # rows past ``len(points)`` are boundary-inversion mirror copies
+    for name in missing:
+        out[name] = x[name][: len(points)]
+    return out
+
+
+def _live_log_q(proposal):
+    """The threshold live points and their ``log q``, scored as the draws
+    are (latent temperature, summed mirror density)."""
+    live_points = _with_auxiliary_parameters(
+        proposal, _threshold_points(proposal).copy()
+    )
+    if getattr(proposal, "sum_mirror_density", False) is True and len(
+        live_points
+    ):
+        sides = proposal.mirror_log_q(live_points)
+        return live_points, logsumexp(sides, axis=0)
+    z, log_q = proposal.forward_pass(live_points)
+    temperature = getattr(proposal, "latent_temperature", None)
+    if temperature not in (None, 1.0):
+        log_q = (
+            log_q
+            + proposal.latent_log_prob(z, temperature)
+            - proposal.latent_log_prob(z, None)
+        )
+    return live_points, log_q
+
+
+class LogProposalThresholdTruncation(BaseTruncationRule):
+    """Truncate draws below a quantile of the live points' ``log q``.
+
+    With ``prior_relative`` the level is ``log q - log prior``, which caps
+    the rejection weight at ``exp(-threshold)``. ``mode="drop"`` discards
+    draws above the cap; ``mode="clip"`` keeps them with the weight clipped.
+    ``lost_mass`` sets the threshold so that this share of the live points'
+    mass is lost, instead of from ``quantile``.
+    """
+
+    name = "log_proposal_threshold"
+    _transient_defaults = {"_threshold": np.nan}
+    _modes = ("drop", "clip")
+
+    def __init__(
+        self,
+        quantile: float = 0.005,
+        prior_relative: bool = True,
+        mode: str = "clip",
+        lost_mass: float | None = None,
+    ) -> None:
+        super().__init__()
+        self.quantile = float(quantile)
+        self.prior_relative = bool(prior_relative)
+        if mode not in self._modes:
+            raise ValueError(f"mode must be one of {self._modes}")
+        if mode == "clip" and not self.prior_relative:
+            raise ValueError("mode='clip' requires prior_relative=True")
+        if lost_mass is not None:
+            if not self.prior_relative:
+                raise ValueError("lost_mass requires prior_relative=True")
+            if not 0 < lost_mass < 1:
+                raise ValueError("lost_mass must be in (0, 1)")
+            lost_mass = float(lost_mass)
+        self.lost_mass = lost_mass
+        self.mode = mode
+        self.lost_live_mass = np.nan
+
+    @property
+    def threshold(self) -> float:
+        return self._threshold
+
+    @property
+    def clip(self) -> bool:
+        return self.mode == "clip"
+
+    @property
+    def log_weight_cap(self) -> float:
+        """The cap on the rejection log-weights in clip mode, else ``inf``."""
+        if self.clip and np.isfinite(self._threshold):
+            return -self._threshold
+        return np.inf
+
+    def _levels(self, proposal, x, log_q):
+        log_q = np.asarray(log_q, dtype=float)
+        if not self.prior_relative or not len(x):
+            return log_q
+        log_w = np.asarray(proposal.compute_weights(x, log_q), dtype=float)
+        return np.where(np.isfinite(log_w), -log_w, -np.inf)
+
+    def prepare(self, proposal, worst_point, radius=None):
+        live_points, log_q = _live_log_q(proposal)
+        log_q = np.asarray(log_q)
+        if self.prior_relative and len(live_points):
+            # mirror copies come in blocks of ``len(live_points)`` rows
+            n = len(live_points)
+            if len(log_q) % n:
+                raise RuntimeError(
+                    f"{len(log_q)} rows of log q for {n} live points: not "
+                    "whole blocks of mirror copies"
+                )
+            live_points = np.tile(live_points, len(log_q) // n)
+        level = self._levels(proposal, live_points, log_q)
+        if self.lost_mass is not None and len(level):
+            self._threshold = self._threshold_for_lost_mass(
+                level, self.lost_mass
+            )
+        else:
+            self._threshold = float(np.quantile(level, self.quantile))
+        if self.prior_relative and len(level):
+            self.lost_live_mass = self._lost_mass(level, self._threshold)
+
+    def _lost_mass(self, level, threshold):
+        """Mean share of the live points' mass lost at ``threshold``."""
+        level = np.asarray(level, dtype=float)
+        if not self.clip:
+            return float(np.mean(level < threshold))
+        return float(np.mean(-np.expm1(np.minimum(level - threshold, 0.0))))
+
+    def _threshold_for_lost_mass(self, level, target, tol=1e-6):
+        """Bisect for the threshold at which :meth:`_lost_mass` is
+        ``target``."""
+        level = np.asarray(level, dtype=float)
+        finite = level[np.isfinite(level)]
+        if not len(finite):
+            return float(np.quantile(level, self.quantile))
+        if not self.clip:
+            return float(np.quantile(level, target))
+        lo, hi = float(finite.min()), float(finite.max())
+        if self._lost_mass(level, lo) >= target:
+            return lo
+        if self._lost_mass(level, hi) <= target:
+            return hi
+        while hi - lo > tol:
+            mid = 0.5 * (lo + hi)
+            if self._lost_mass(level, mid) < target:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    def apply_after_backward(self, proposal, x, log_q, z):
+        levels = self._levels(proposal, x, log_q)
+        if self.clip:
+            # non-finite weights are dropped in either mode
+            keep = np.isfinite(levels)
+        else:
+            keep = levels > self.threshold
+        logger.debug(
+            "Accepting %s / %s samples (log-proposal threshold, %s)",
+            int(keep.sum()),
+            len(x),
+            self.mode,
+        )
+        return get_subset_arrays(keep, x, log_q, z)
+
+
 class LikelihoodThresholdTruncation(BaseTruncationRule):
     """Truncate samples using the current likelihood threshold."""
 
@@ -433,6 +615,7 @@ TRUNCATION_REGISTRY = {
     "latent_radius": LatentRadiusTruncation,
     "min_log_q": MinLogQTruncation,
     "likelihood_threshold": LikelihoodThresholdTruncation,
+    "log_proposal_threshold": LogProposalThresholdTruncation,
 }
 
 
@@ -502,6 +685,12 @@ class TruncationScheme:
         for rule in self.rules:
             x, log_q, z = rule.apply_after_likelihood(proposal, x, log_q, z)
         return x, log_q, z
+
+    @property
+    def log_weight_cap(self) -> float:
+        """Tightest rejection log-weight cap of the rules (``inf`` if none)."""
+        caps = [getattr(rule, "log_weight_cap", np.inf) for rule in self.rules]
+        return float(min(caps, default=np.inf))
 
     def reset(self) -> None:
         for rule in self.rules:

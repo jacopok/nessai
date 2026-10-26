@@ -11,6 +11,7 @@ from nessai.proposal import FlowProposal
 from nessai.proposal.flowproposal.truncation import (
     LatentRadiusTruncation,
     LikelihoodThresholdTruncation,
+    LogProposalThresholdTruncation,
     MinLogQTruncation,
     TruncationScheme,
 )
@@ -41,6 +42,7 @@ def configure_population_test_proposal(proposal, rng, samples):
     proposal.model = MagicMock()
     proposal.training_data = samples([(0.0, 0.0), (1.0, 1.0)])
     proposal._truncation_scheme = TruncationScheme()
+    proposal.adapt_latent_temperature = False
     proposal.drawsize = 3
     proposal.flow = MagicMock()
     proposal.sample_latent_distribution = MagicMock(
@@ -76,7 +78,8 @@ def test_populate_applies_truncation_in_stages(proposal, rng, point, samples):
         proposal, point(0.0, 0.0, logl=0.5), n_samples=1, plot=False
     )
 
-    proposal.sample_latent_distribution.assert_called_once_with(3)
+    # a batch is capped at the pool size (drawsize 3, pool of 1)
+    proposal.sample_latent_distribution.assert_called_once_with(1)
     proposal.backward_pass.assert_called_once()
     proposal.model.batch_evaluate_log_likelihood.assert_called_once()
     proposal.compute_weights.assert_called_once()
@@ -165,10 +168,10 @@ def test_populate_stops_at_max_samples_after_empty_latent_batches(
         point(0.0, 0.0, logl=0.5),
         n_samples=1,
         plot=False,
-        max_samples=2,
+        max_samples=0,
     )
 
-    proposal.sample_latent_distribution.assert_called_once_with(3)
+    proposal.sample_latent_distribution.assert_called_once_with(1)
     assert proposal.backward_pass.call_count == 0
     assert proposal.x.size == 0
     assert proposal.population_acceptance == 0.0
@@ -196,11 +199,41 @@ def test_populate_stops_at_max_samples_after_all_likelihood_rejected(
         point(0.0, 0.0, logl=0.5),
         n_samples=1,
         plot=False,
-        max_samples=2,
+        max_samples=0,
     )
 
-    proposal.sample_latent_distribution.assert_called_once_with(3)
+    proposal.sample_latent_distribution.assert_called_once_with(1)
     proposal.backward_pass.assert_called_once()
     proposal.compute_weights.assert_not_called()
     assert proposal.x.size == 0
     assert proposal.population_acceptance == 0.0
+
+
+def test_populate_continues_after_failed_backward_pass(
+    proposal, rng, point, samples
+):
+    """An AssertionError in the flow inverse makes backward_pass return plain
+    empty arrays; populate must skip that batch."""
+    configure_population_test_proposal(proposal, rng, samples)
+    proposal._truncation_scheme = TruncationScheme(
+        [LogProposalThresholdTruncation(quantile=0.0)]
+    )
+    proposal.latent_temperature = None
+    proposal.forward_pass = MagicMock(
+        return_value=(np.zeros((2, 2)), np.array([0.0, -1.0]))
+    )
+    proposal.flow.sample_latent_distribution.return_value = np.zeros((1, 2))
+    proposal.backward_pass = MagicMock(
+        side_effect=[
+            (np.array([]), np.array([]), np.array([])),
+            (samples([(1.0, 1.0)]), np.array([0.5]), np.zeros((1, 2))),
+        ]
+    )
+    proposal.model.batch_evaluate_log_likelihood.return_value = np.array([1.0])
+
+    FlowProposal.populate(
+        proposal, point(0.0, 0.0, logl=0.5), n_samples=1, plot=False
+    )
+
+    assert proposal.backward_pass.call_count == 2
+    assert proposal.x.size == 1
