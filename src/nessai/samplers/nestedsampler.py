@@ -965,7 +965,8 @@ class NestedSampler(BaseNestedSampler):
             self.block_acceptance = 0.0
             self.completed_training = True
             if self.checkpoint_on_training:
-                self.checkpoint(periodic=True)
+                # not throttled by checkpoint_interval
+                self.checkpoint(periodic=True, force=True)
 
     def check_state(self, force=False):
         """
