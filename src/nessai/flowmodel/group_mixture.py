@@ -3656,7 +3656,6 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
         if not (
             isinstance(model, ClusteredGroupMixtureFlowWrapper)
             and model._n_active_experts() >= 2
-            and weights is None
             and conditional is None
         ):
             return super().train(
@@ -3683,6 +3682,7 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
         try:
             for j in range(k):
                 sub = np.ascontiguousarray(samples[labels == j])
+                w_j = None if weights is None else np.asarray(weights)[labels == j]
                 if model.is_frozen(j):
                     model.experts[j]._last_training = dict(
                         n=None, frozen=True
@@ -3707,7 +3707,7 @@ class ClusteredGroupMixtureFlowModel(GroupMixtureFlowModel):
                 self.model = model.experts[j]
                 self._optimiser = self.get_optimiser()
                 hj = super().train(
-                    sub, plot=False,
+                    sub, weights=w_j, plot=False,
                     output=os.path.join(output, f"expert_{j}"), groups=g_j,
                     **kwargs,
                 )
