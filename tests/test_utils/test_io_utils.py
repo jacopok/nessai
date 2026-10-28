@@ -235,3 +235,21 @@ def test_save_dict_to_hdf5_integration(tmp_path, data_dict):
     with h5py.File(filename, "r") as f:
         keys = list(f.keys())
     assert keys == sorted(list(data_dict.keys()))
+
+
+def test_safe_file_dump_interrupted_keeps_existing(tmp_path):
+    """A dump that fails part-way leaves the file and its .old untouched."""
+    import pickle
+
+    f = tmp_path / "test.pkl"
+    f.write_bytes(pickle.dumps("current"))
+    (tmp_path / "test.pkl.old").write_bytes(pickle.dumps("previous"))
+
+    class Unpicklable:
+        def __reduce__(self):
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        safe_file_dump(Unpicklable(), str(f), pickle, save_existing=True)
+    assert pickle.loads(f.read_bytes()) == "current"
+    assert pickle.loads((tmp_path / "test.pkl.old").read_bytes()) == "previous"

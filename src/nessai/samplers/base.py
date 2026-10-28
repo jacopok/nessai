@@ -20,6 +20,10 @@ from ..utils import safe_file_dump
 
 logger = logging.getLogger(__name__)
 
+#: ids of the samplers writing a checkpoint (a module-level set, not an
+#: attribute: the pickled sampler would carry it)
+_CHECKPOINTS_IN_PROGRESS = set()
+
 
 class BaseNestedSampler(ABC):
     """Base nested sampler class.
@@ -313,40 +317,53 @@ class BaseNestedSampler(ABC):
             If True, the previous checkpoint will be copied to `.old`.
             If False, the new checkpoint will override the previous file.
         """
-        now = datetime.datetime.now()
-        if not periodic:
-            if self.history:
-                self.history["checkpoint_iterations"] += [self.iteration]
-            else:
-                logger.warning(
-                    "Could not log checkpoint iteration in the history"
-                )
-        elif force:
-            pass
-        else:
-            if self.checkpoint_on_iteration:
-                if (
-                    self.iteration - self._last_checkpoint
-                ) >= self.checkpoint_interval:
-                    self._last_checkpoint = self.iteration
-                else:
-                    return
-            else:
-                if (
-                    now - self._last_checkpoint
-                ).total_seconds() >= self.checkpoint_interval:
-                    self._last_checkpoint = now
-                else:
-                    return
-        self.sampling_time += now - self.sampling_start_time
-        logger.info("Checkpointing nested sampling")
-        if self.checkpoint_callback:
-            self.checkpoint_callback(self)
-        else:
-            safe_file_dump(
-                self, self.resume_file, pickle, save_existing=save_existing
+        # a signal handler (the walltime's checkpoint-and-exit) runs between
+        # any two bytecodes, so it can ask for a checkpoint while one is being
+        # written: two dumps to the same temporary file corrupt the resume
+        # file. The one in progress completes; this one is skipped.
+        if id(self) in _CHECKPOINTS_IN_PROGRESS:
+            logger.warning(
+                "Checkpoint requested while one is being written: skipped"
             )
-        self.sampling_start_time = datetime.datetime.now()
+            return
+        _CHECKPOINTS_IN_PROGRESS.add(id(self))
+        try:
+            now = datetime.datetime.now()
+            if not periodic:
+                if self.history:
+                    self.history["checkpoint_iterations"] += [self.iteration]
+                else:
+                    logger.warning(
+                        "Could not log checkpoint iteration in the history"
+                    )
+            elif force:
+                pass
+            else:
+                if self.checkpoint_on_iteration:
+                    if (
+                        self.iteration - self._last_checkpoint
+                    ) >= self.checkpoint_interval:
+                        self._last_checkpoint = self.iteration
+                    else:
+                        return
+                else:
+                    if (
+                        now - self._last_checkpoint
+                    ).total_seconds() >= self.checkpoint_interval:
+                        self._last_checkpoint = now
+                    else:
+                        return
+            self.sampling_time += now - self.sampling_start_time
+            logger.info("Checkpointing nested sampling")
+            if self.checkpoint_callback:
+                self.checkpoint_callback(self)
+            else:
+                safe_file_dump(
+                    self, self.resume_file, pickle, save_existing=save_existing
+                )
+            self.sampling_start_time = datetime.datetime.now()
+        finally:
+            _CHECKPOINTS_IN_PROGRESS.discard(id(self))
 
     @classmethod
     def resume_from_pickled_sampler(

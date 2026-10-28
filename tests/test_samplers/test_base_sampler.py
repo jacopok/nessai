@@ -579,3 +579,31 @@ def test_update_output(sampler, tmp_path):
     BaseNestedSampler.update_output(sampler, new_output)
     assert sampler.output == new_output
     assert sampler.resume_file == str(new_output / "resume.pkl")
+
+
+def test_checkpoint_reentrant_is_skipped(sampler):
+    """A checkpoint asked for while one is being written (by a signal
+    handler) is skipped; the one in progress completes."""
+    sampler.checkpoint_on_iteration = True
+    sampler.checkpoint_interval = 10
+    sampler.checkpoint_callback = None
+    sampler._last_checkpoint = 0
+    sampler.iteration = 20
+    sampler.history = None
+    sampler.sampling_start_time = datetime.datetime.now()
+    sampler.sampling_time = datetime.timedelta()
+    sampler.resume_file = "test.pkl"
+    calls = []
+
+    def dump(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            BaseNestedSampler.checkpoint(sampler, periodic=True, force=True)
+
+    with patch("nessai.samplers.base.safe_file_dump", side_effect=dump):
+        BaseNestedSampler.checkpoint(sampler, periodic=True)
+    assert len(calls) == 1
+    # and the next checkpoint goes ahead
+    with patch("nessai.samplers.base.safe_file_dump") as sfd_mock:
+        BaseNestedSampler.checkpoint(sampler, periodic=True, force=True)
+    sfd_mock.assert_called_once()

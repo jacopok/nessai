@@ -102,14 +102,16 @@ def safe_file_dump(data, filename, module, save_existing=False):
     save_existing : bool, optional
         If true move the existing file to <file>.old.
     """
+    # the data are written in full before the existing file is touched: a
+    # dump interrupted part-way (an exception, a signal) leaves the file and
+    # its .old as they were
+    temp_filename = filename + ".temp"
+    with open(temp_filename, "wb") as file:
+        module.dump(data, file)
     if save_existing:
         if os.path.exists(filename):
             old_filename = filename + ".old"
             shutil.move(filename, old_filename)
-
-    temp_filename = filename + ".temp"
-    with open(temp_filename, "wb") as file:
-        module.dump(data, file)
     shutil.move(temp_filename, filename)
 
 
