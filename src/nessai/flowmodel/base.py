@@ -456,6 +456,7 @@ class FlowModel:
             train_data = train_data[p, :].split(self._batch_size)
 
         n = 0
+        skipped = 0
         for data in train_data:
             if is_dataloader:
                 x = data[0].to(self.device)
@@ -474,8 +475,18 @@ class FlowModel:
                 else:
                     conditional = None
                 loss = loss_fn(x, conditional)
-            train_loss += loss.item()
             loss.backward()
+            # a non-finite loss or gradient (one point at log_prob = -inf)
+            # would make every weight NaN, and Adam's moments with them: the
+            # optimiser then turns any later weights NaN at its first step
+            if not torch.isfinite(loss) or not all(
+                torch.isfinite(p.grad).all()
+                for p in model.parameters()
+                if p.grad is not None
+            ):
+                skipped += 1
+                continue
+            train_loss += loss.item()
             if self.training_config["clip_grad_norm"]:
                 clip_grad_norm_(
                     model.parameters(),
@@ -484,12 +495,18 @@ class FlowModel:
             self._optimiser.step()
             n += 1
 
+        if skipped:
+            logger.warning(
+                f"Skipped {skipped} of {skipped + n} training batches with a "
+                "non-finite loss or gradient"
+            )
+
         self.end_iteration()
 
         if self.training_config["annealing"]:
             self.scheduler.step()
 
-        return train_loss / n
+        return train_loss / n if n else np.nan
 
     def _validate(
         self,
@@ -633,6 +650,16 @@ class FlowModel:
         if val_size is None:
             val_size = self.training_config["val_size"]
 
+        optimiser = getattr(self, "_optimiser", None)
+        if optimiser is not None and not all(
+            torch.isfinite(v).all()
+            for state in optimiser.state.values()
+            for v in state.values()
+            if torch.is_tensor(v) and v.is_floating_point()
+        ):
+            logger.warning("Non-finite optimiser state: resetting optimiser")
+            self._optimiser = self.get_optimiser()
+
         if val_size == 0.0:
             validate = False
         else:
@@ -726,6 +753,11 @@ class FlowModel:
         # Make sure cache for LU is reset.
         self.model.train()
         self.model.eval()
+        if validate and not best_epoch:
+            logger.warning(
+                "No finite validation loss: keeping the weights from before "
+                "the training"
+            )
         if validate:
             logger.debug(f"Loading best model from epoch {best_epoch}")
             self.model.load_state_dict(best_model)

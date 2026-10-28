@@ -887,3 +887,58 @@ def test_prep_data_with_groups(data_dim):
     for row in val:
         assert np.isclose(val, -row, atol=1e-6).all(axis=1).any()
 
+
+
+def _small_flow(tmp_path):
+    flow = FlowModel(
+        flow_config=dict(n_inputs=2, n_blocks=2, linear_transform="lu"),
+        training_config=dict(max_epochs=5, patience=10, batch_size=20),
+        output=tmp_path,
+    )
+    flow.initialise()
+    return flow
+
+
+def _all_finite(flow):
+    return all(torch.isfinite(p).all() for p in flow.model.parameters()) and all(
+        torch.isfinite(v).all()
+        for state in flow._optimiser.state.values()
+        for v in state.values()
+        if torch.is_tensor(v) and v.is_floating_point()
+    )
+
+
+@pytest.mark.integration_test
+def test_train_skips_non_finite_batch(tmp_path, caplog):
+    """A batch with a point at log_prob = -inf is skipped, so neither the
+    weights nor the optimiser's state become NaN"""
+    flow = _small_flow(tmp_path)
+    log_prob = flow.model.log_prob
+    calls = []
+
+    def bad_log_prob(x, *args, **kwargs):
+        lp = log_prob(x, *args, **kwargs)
+        calls.append(1)
+        if len(calls) == 2 and torch.is_grad_enabled():
+            lp = torch.cat([lp[:1] - torch.inf, lp[1:]])
+        return lp
+
+    flow.model.log_prob = bad_log_prob
+    history = flow.train(np.random.randn(200, 2), plot=False)
+    assert "Skipped 1 of" in caplog.text
+    assert np.isfinite(history["val_loss"]).all()
+    assert _all_finite(flow)
+
+
+@pytest.mark.integration_test
+def test_train_resets_non_finite_optimiser(tmp_path, caplog):
+    """An optimiser with NaN moments (from an earlier training) is replaced
+    before the next training"""
+    flow = _small_flow(tmp_path)
+    flow.train(np.random.randn(200, 2), plot=False)
+    for state in flow._optimiser.state.values():
+        state["exp_avg"].fill_(torch.nan)
+    history = flow.train(np.random.randn(200, 2), plot=False)
+    assert "resetting optimiser" in caplog.text
+    assert np.isfinite(history["val_loss"]).all()
+    assert _all_finite(flow)
