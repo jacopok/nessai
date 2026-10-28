@@ -33,12 +33,12 @@ from nessai.flowsampler import FlowSampler
 from nessai.model import Model
 from nessai.utils import configure_logger
 
-N_DIMS = 4
+N_DIMS = 6
 DOF = 3
 BOUND = 10
-QUANTILE = 0.1
-N_SEEDS = 6
-NLIVE = 300
+QUANTILE = 0.01
+N_SEEDS = 3
+NLIVE = 500
 
 output = "./outdir/clip_vs_drop/"
 logger = configure_logger(output=output, log_level="WARNING")
