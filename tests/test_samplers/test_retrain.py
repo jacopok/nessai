@@ -12,6 +12,7 @@ from nessai.samplers.retrain import (
     RetrainCostModel,
     RetrainDecision,
     fit_log_acceptance,
+    lineage_sum,
     solve_renewal,
 )
 
@@ -487,3 +488,547 @@ def test_fresh_predictor_missing_after_unpickling(rng):
     del d.__dict__["fresh_predictor"]
     d = pickle.loads(pickle.dumps(d))
     assert d.fresh_acceptance() is not None
+
+
+# ------------------------------------------------------------------ lineage
+def test_lineage_sum_matches_the_sum():
+    n, tau, h = 5, 50.0, 5000
+    exact = np.sum(1.0 / (n + np.arange(h) / tau))
+    assert lineage_sum(n, tau, h) == pytest.approx(exact, rel=0.02)
+    growth = 2e-4
+    exact = np.sum(np.exp(growth * np.arange(h)) / (n + np.arange(h) / tau))
+    assert lineage_sum(n, tau, h, growth=growth) == pytest.approx(
+        exact, rel=0.02
+    )
+
+
+def test_lineage_sum_edge_cases():
+    assert lineage_sum(5, 50.0, 0) == 0.0
+    with pytest.raises(ValueError, match="tau"):
+        lineage_sum(5, 0.0, 100)
+
+
+def lineage_decision(rng, levels=None, length=300, **kwargs):
+    d = make_decision(**kwargs)
+    run_episodes(d, rng, levels or [np.log(0.3)] * 6, length)
+    d._horizon = 5000.0
+    return d
+
+
+@pytest.mark.parametrize(
+    "exponent", [None, 0, 0.0, dict(likelihood=0.0, population=0.0)]
+)
+def test_lineage_gain_off(rng, exponent):
+    d = lineage_decision(rng, lineage_exponent=exponent)
+    rate = d.long_run_rate()
+    assert rate["G"] == 0.0
+    assert rate["T"] == rate["T_train"]
+
+
+def test_lineage_gain_without_horizon(rng):
+    d = lineage_decision(rng)
+    d._horizon = None
+    assert d.lineage_gain(100.0, 1e-3, 0.3, 1 / d.nlive) == 0.0
+
+
+def test_lineage_gain_scales(rng):
+    """The gain grows with the exponent and the horizon and falls with the
+    length of the lineage."""
+    args = (100.0, 1e-3, 0.3, 1 / 500)
+    d1 = lineage_decision(rng, lineage_exponent=0.1)
+    g1 = d1.lineage_gain(*args)
+    assert g1 > 0
+    d1.lineage_exponent = 0.2
+    assert d1.lineage_gain(*args) == pytest.approx(2 * g1, rel=1e-6)
+    d1.lineage_exponent = 0.1
+    assert d1.lineage_gain(*args, horizon=1000.0) < g1
+    longer = lineage_decision(
+        rng, levels=[np.log(0.3)] * 20, lineage_exponent=0.1
+    )
+    assert longer.lineage_length() == 20
+    longer._horizon = 5000.0
+    assert longer.lineage_gain(*args) < g1
+
+
+def test_lineage_gain_weights_cost_components(rng):
+    """Each exponent applies to its share of the cost of a pool point."""
+    d = lineage_decision(rng, lineage_exponent=0.2)
+    like, pop = d.cost_components()
+    args = (100.0, 1e-3, 0.3, 1 / 500)
+    full = d.lineage_gain(*args)
+    d.lineage_exponent = dict(likelihood=0.2)
+    assert d.lineage_gain(*args) == pytest.approx(
+        full * like / (like + pop), rel=1e-6
+    )
+
+
+def test_lineage_exponent_invalid():
+    with pytest.raises(ValueError, match="lineage exponent keys"):
+        RetrainDecision(100, lineage_exponent=dict(training=0.1))
+    with pytest.raises(ValueError, match="non-negative"):
+        RetrainDecision(100, lineage_exponent=-0.1)
+
+
+def test_long_run_rate_with_lineage_is_self_consistent(rng):
+    d = lineage_decision(rng, lineage_exponent=0.3)
+    off = lineage_decision(rng, lineage_exponent=None).long_run_rate()
+    rate = d.long_run_rate()
+    assert 0 < rate["G"]
+    assert rate["T"] == pytest.approx(max(rate["T_train"] - rate["G"], 0.0))
+    assert rate["tau"] <= off["tau"]
+    assert rate["g"] <= off["g"]
+    # the gain is the one at the cycle the lower cost implies
+    tau = max(rate["tau"], d._min_block())
+    gain = d.lineage_gain(tau, rate["c"], rate["a"], rate["k"])
+    assert gain == pytest.approx(rate["G"], rel=0.05)
+
+
+def test_lineage_retrains_more_often(rng):
+    """With the lineage term the decision retrains where it otherwise would
+    continue."""
+    kwargs = dict(horizon=False, plan_pool=False, reset_on_drop=None)
+    old = make_decision(lineage_exponent=None, **kwargs)
+    new = make_decision(lineage_exponent=0.3, **kwargs)
+    for d in (old, new):
+        d.cost.provided["training"] = 1.6e-5
+        it = run_episodes(d, np.random.default_rng(3), [np.log(0.3)] * 4, 150)
+    assert old.decide(it, 300, remaining=20_000) is False
+    assert new.decide(it, 300, remaining=20_000) is True
+    assert new.log[-1]["G"] > 0
+
+
+def test_cost_trend(rng):
+    d = make_decision()
+    levels = [np.log(0.3) - 0.5 * i for i in range(8)]
+    run_episodes(d, rng, levels, 250)
+    slope, var = d.cost_trend()
+    # the log cost per iteration rises by 0.5 per episode of 250 iterations
+    assert slope * 250 == pytest.approx(0.5, abs=0.15)
+    assert var > 0
+    flat = make_decision()
+    run_episodes(flat, rng, [np.log(0.3)] * 8, 250)
+    assert abs(flat.cost_trend()[0] * 250) < 0.1
+
+
+# ------------------------------------------------------- population costs
+def test_cost_model_per_draw():
+    assert RetrainCostModel(COSTS).per_draw is False
+    assert RetrainCostModel(COSTS | dict(draw=1e-6)).per_draw is True
+    measured = RetrainCostModel(None)
+    assert measured.per_draw is False
+    measured.record("draw", 1.0, 1e5)
+    assert measured.per_draw is True
+    assert measured["draw"] == pytest.approx(1e-5)
+
+
+def test_pool_point_cost_counts_draws():
+    d = RetrainDecision(500, costs=COSTS | dict(draw=1e-6))
+    d.start_episode(0, True, 10, 500)
+    d.record_populations(1.0, 1000, 0.5, 1000, n_draws=50_000)
+    like, pop = d.cost_components()
+    assert like == pytest.approx(1e-3)
+    assert pop == pytest.approx(1e-6 * 50)
+    # a later flow whose pool takes fewer draws costs less
+    d.start_episode(100, False, 10, 500)
+    d.record_populations(1.0, 1000, 0.5, 1000, n_draws=10_000)
+    assert d.pool_point_cost() == pytest.approx(1e-3 + 1e-5)
+    assert d.pool_point_cost(d.episodes[0]) == pytest.approx(1e-3 + 5e-5)
+
+
+def test_pool_point_cost_without_draws():
+    """Without draws the provided cost per pool point is used."""
+    d = RetrainDecision(500, costs=COSTS | dict(draw=1e-6))
+    d.start_episode(0, True, 10, 500)
+    d.record_populations(1.0, 1000, 0.5, 1000)
+    d._like_per_point = 1.0
+    assert d.pool_point_cost() == pytest.approx(1e-3 + 1e-4)
+
+
+def test_cost_model_unpickles_without_draw():
+    cost = RetrainCostModel(COSTS)
+    for attr in ("provided", "totals", "units", "samples"):
+        del getattr(cost, attr)["draw"]
+    new = pickle.loads(pickle.dumps(cost))
+    assert new.provided["draw"] is None
+    new.record("draw", 1.0, 10)
+    assert new.measured("draw") == pytest.approx(0.1)
+
+
+def test_cost_model_saves_draw(tmp_path):
+    cost = RetrainCostModel(COSTS)
+    cost.record("draw", 1.0, 1e5)
+    cost.save(tmp_path / "costs.json")
+    new = RetrainCostModel(str(tmp_path / "costs.json"))
+    assert new.provided["draw"] == pytest.approx(1e-5)
+    assert new.per_draw
+
+
+# ---------------------------------------------------------- reset on drop
+def drop_decision(rng, drop=3.0, n_before=6, length=300, **kwargs):
+    """A lineage at a steady level whose latest warm training is ``drop``
+    lower in log acceptance."""
+    d = make_decision(**kwargs)
+    levels = [np.log(0.3)] * n_before + [np.log(0.3) - drop]
+    it = run_episodes(d, rng, levels, length)
+    return d, it
+
+
+def test_drop_triggers_reset(rng, caplog):
+    caplog.set_level(logging.INFO)
+    d, it = drop_decision(rng)
+    assert d.decide(it, 1000) is True
+    assert d.reset_next is True
+    assert d.log[-1]["reason"] == "drop"
+    assert d.log[-1]["drop"] > np.log(4)
+    assert "Resetting the flow" in caplog.text
+    # the flow it replaces is the baseline of the reset
+    d.start_episode(it, True, 100, d.nlive)
+    assert d.current.attempt
+    assert np.isfinite(d.current.baseline[0])
+
+
+@pytest.mark.parametrize("drop", [0.0, 0.5, 1.0])
+def test_no_reset_on_small_drop(rng, drop):
+    d, it = drop_decision(rng, drop=drop)
+    d.decide(it, 1000)
+    assert d.reset_next is False
+
+
+def test_no_reset_on_gradual_drift(rng):
+    """A cost that rises steadily over the run is not a drop."""
+    d = make_decision()
+    levels = [np.log(0.3) - 0.15 * i for i in range(30)]
+    it = 0
+    for level in levels:
+        d.start_episode(it, it == 0, 50, d.nlive)
+        for c in geometric_counts(rng, level, -1.0 / d.nlive, 100):
+            d.record_iteration(int(c))
+        it += 100
+        d.decide(it, 1000)
+        assert d.log[-1]["reason"] != "drop"
+
+
+def test_drop_disabled(rng):
+    d, it = drop_decision(rng, reset_on_drop=None)
+    d.decide(it, 1000)
+    assert not d.reset_next
+    assert d.log[-1]["reason"] != "drop"
+
+
+def test_no_reset_on_drop_of_noisy_trainings(rng):
+    """Trainings that scatter widely do not trigger resets."""
+    d = make_decision()
+    noisy = np.random.default_rng(1)
+    it = 0
+    resets = 0
+    for i in range(40):
+        d.start_episode(it, it == 0, 50, d.nlive)
+        level = np.log(0.2) + noisy.normal(0, 0.5)
+        for c in geometric_counts(rng, level, -1.0 / d.nlive, 100):
+            d.record_iteration(int(c))
+        it += 100
+        d.decide(it, 1000)
+        resets += d.reset_next
+    assert resets == 0
+
+
+def attempt(d, rng, it, level, length=100):
+    d.start_episode(it, True, 100, d.nlive)
+    for c in geometric_counts(rng, level, -1.0 / d.nlive, length):
+        d.record_iteration(int(c))
+    return it + length
+
+
+def test_reset_discarded_when_worse(rng, caplog):
+    caplog.set_level(logging.INFO)
+    d, it = drop_decision(rng)
+    n = d.lineage_length()
+    d.decide(it, 1000)
+    it = attempt(d, rng, it, np.log(0.3) - 4.0)
+    assert d.lineage_length() == 1
+    assert d.decide(it, 1000) is True
+    assert d.rollback_next is True
+    assert d.reset_next is False
+    assert d.current.rejected
+    assert d.log[-1]["reason"] == "rollback"
+    assert "Discarding the reset flow" in caplog.text
+    # the restored flow continues its lineage
+    d.start_episode(it, False, 50, d.nlive)
+    assert d.rollback_next is False
+    assert d.lineage_length() == n + 1
+    assert d.summary()["n_resets_discarded"] == 1
+    # and is not reset again straight away
+    for c in geometric_counts(rng, np.log(0.3) - 3.0, -1.0 / d.nlive, 100):
+        d.record_iteration(int(c))
+    d.decide(it + 100, 1000)
+    assert not d.reset_next
+
+
+def test_reset_kept_when_better(rng, caplog):
+    caplog.set_level(logging.INFO)
+    d, it = drop_decision(rng)
+    d.decide(it, 1000)
+    it = attempt(d, rng, it, np.log(0.3))
+    d.decide(it, 1000)
+    assert d.rollback_next is False
+    assert d.current.resolved and not d.current.rejected
+    assert "Keeping the reset flow" in caplog.text
+    assert d.lineage_length() == 1
+
+
+def test_reset_kept_without_rollback(rng):
+    d, it = drop_decision(rng, reset_rollback=False)
+    d.decide(it, 1000)
+    assert d.reset_next
+    it = attempt(d, rng, it, np.log(0.3) - 4.0)
+    assert not d.current.attempt
+    d.decide(it, 1000)
+    assert d.rollback_next is False
+
+
+def test_cost_based_reset_is_checked(rng):
+    """Resets chosen by ``allow_reset`` are also compared to the flow they
+    replace."""
+    d = make_decision(allow_reset=True, reset_on_drop=None)
+    run_episodes(d, rng, [-0.5, -1.0, -1.5, -2.0, -2.5, -2.5], 500)
+    it = 3000
+    for _ in range(20):
+        retrain = d.decide(it, 2000)
+        if retrain and d.reset_next:
+            break
+        it += 1
+    else:
+        pytest.skip("no reset chosen")
+    assert d._attempt_next is not None
+
+
+def test_new_options_missing_after_unpickling(rng):
+    """Decisions pickled before the lineage and drop options keep the old
+    behaviour."""
+    d = make_decision()
+    run_episodes(d, rng, [np.log(0.3)] * 3, 200)
+    for attr in (
+        "lineage_exponent",
+        "lineage_horizon",
+        "reset_on_drop",
+        "reset_window",
+        "reset_rollback",
+        "reset_tolerance",
+        "rollback_next",
+        "_attempt_next",
+        "_drop_anchor",
+        "_horizon",
+    ):
+        del d.__dict__[attr]
+    d2 = pickle.loads(pickle.dumps(d))
+    assert d2.lineage_exponent is None
+    assert d2.reset_on_drop is None
+    assert d2.can_reset is False
+    d2.decide(600, 1000, remaining=1000)
+    assert d2.log[-1].get("G", 0.0) == 0.0
+
+
+# -------------------------------------------------------- sampler rollback
+class _Flow:
+    def __init__(self):
+        import torch
+
+        self.model = torch.nn.Linear(2, 2)
+        self._optimiser = torch.optim.Adam(self.model.parameters())
+
+    def get_optimiser(self):
+        import torch
+
+        return torch.optim.Adam(self.model.parameters())
+
+
+def test_sampler_saves_and_restores_flow():
+    from types import SimpleNamespace
+
+    import torch
+
+    from nessai.samplers.nestedsampler import NestedSampler
+
+    ns = object.__new__(NestedSampler)
+    ns.proposal = SimpleNamespace(flow=_Flow())
+    before = ns.proposal.flow.model.weight.detach().clone()
+    ns._save_rollback_flow()
+    with torch.no_grad():
+        ns.proposal.flow.model.weight += 1.0
+    ns._restore_rollback_flow()
+    assert torch.equal(ns.proposal.flow.model.weight, before)
+    opt = ns.proposal.flow._optimiser
+    assert opt.param_groups[0]["params"][0] is ns.proposal.flow.model.weight
+    assert ns._rollback_flow is None
+
+
+def test_sampler_restore_without_saved_flow(caplog):
+    from types import SimpleNamespace
+
+    from nessai.samplers.nestedsampler import NestedSampler
+
+    ns = object.__new__(NestedSampler)
+    ns.proposal = SimpleNamespace(flow=_Flow())
+    ns._rollback_flow = None
+    model = ns.proposal.flow.model
+    ns._restore_rollback_flow()
+    assert ns.proposal.flow.model is model
+    assert "not available" in caplog.text
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+def test_check_flow_model_reset_with_decision(rollback):
+    from unittest.mock import MagicMock
+
+    from nessai.samplers.nestedsampler import NestedSampler
+
+    ns = object.__new__(NestedSampler)
+    ns.proposal = MagicMock(training_count=3)
+    ns.retrain_decision = MagicMock(
+        can_reset=True,
+        rollback_next=rollback,
+        reset_next=not rollback,
+        reset_rollback=True,
+    )
+    ns._save_rollback_flow = MagicMock()
+    ns._restore_rollback_flow = MagicMock()
+    ns.check_flow_model_reset()
+    if rollback:
+        ns._restore_rollback_flow.assert_called_once()
+        ns.proposal.reset_model_weights.assert_not_called()
+    else:
+        ns._save_rollback_flow.assert_called_once()
+        ns.proposal.reset_model_weights.assert_called_once_with(
+            weights=True, permutations=True
+        )
+
+
+def test_sampler_checkpoint_excludes_saved_flow():
+    from nessai.samplers.nestedsampler import NestedSampler
+
+    ns = object.__new__(NestedSampler)
+    ns.__dict__.update(
+        model=MagicModel(),
+        proposal=None,
+        checkpoint_callback=None,
+        _rollback_flow=("big", "flow"),
+        other=1,
+    )
+    state = ns.__getstate__()
+    assert "_rollback_flow" not in state
+    assert state["other"] == 1
+
+
+class MagicModel:
+    likelihood_evaluations = 0
+
+    class _T:
+        @staticmethod
+        def total_seconds():
+            return 0.0
+
+    likelihood_evaluation_time = _T()
+
+
+@pytest.mark.slow_integration_test
+def test_sampling_with_resets_and_rollbacks(
+    integration_model, flow_config, tmp_path
+):
+    """A run in which every warm training counts as a drop, so the flow is
+    reset (and compared, and maybe restored) many times."""
+    from nessai.flowsampler import FlowSampler
+
+    fs = FlowSampler(
+        integration_model,
+        output=str(tmp_path),
+        nlive=100,
+        plot=False,
+        flow_config=flow_config,
+        retrain_decision=dict(reset_on_drop=-50.0, reset_window=10.0),
+        retrain_costs=COSTS,
+        seed=1234,
+        max_iteration=1500,
+        checkpointing=False,
+    )
+    fs.run(plot=False)
+    summary = fs.ns.retrain_decision.summary()
+    assert summary["n_resets"] > 0
+    episodes = fs.ns.retrain_decision.episodes
+    assert any(e.attempt and e.resolved for e in episodes)
+
+
+def test_region_saves_and_restores_flow_and_secondary():
+    """A region's reset is discarded with its own flows, the mixture's
+    secondary included, and the prime-space action is realigned."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import torch
+
+    from nessai.samplers.nestedsampler import NestedSampler
+
+    ns = object.__new__(NestedSampler)
+    ns.proposal = SimpleNamespace(flow=_Flow())
+    proposal = SimpleNamespace(
+        flow=_Flow(),
+        secondary=SimpleNamespace(flow=_Flow()),
+        _realign_prime_space_action=MagicMock(),
+    )
+    region = SimpleNamespace(label="1", proposal=proposal)
+    flows = (proposal.flow, proposal.secondary.flow)
+    before = [f.model.weight.detach().clone() for f in flows]
+    run_flow = ns.proposal.flow.model
+    ns._save_rollback_flow(region)
+    with torch.no_grad():
+        for f in flows:
+            f.model.weight += 1.0
+    ns._restore_rollback_flow(region)
+    for f, b in zip(flows, before):
+        assert torch.equal(f.model.weight, b)
+    proposal._realign_prime_space_action.assert_called_once()
+    assert ns.proposal.flow.model is run_flow
+    assert ns._region_rollback == {}
+
+
+def test_region_restore_after_resume(caplog):
+    """After a resume the saved flows are gone: the reset flow is kept."""
+    from types import SimpleNamespace
+
+    from nessai.samplers.nestedsampler import NestedSampler
+
+    ns = object.__new__(NestedSampler)
+    region = SimpleNamespace(label="0", proposal=SimpleNamespace(flow=_Flow()))
+    model = region.proposal.flow.model
+    ns._restore_rollback_flow(region)
+    assert region.proposal.flow.model is model
+    assert "not available" in caplog.text
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+def test_region_flow_reset_with_decision(rollback):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from nessai.samplers.nestedsampler import NestedSampler
+
+    ns = object.__new__(NestedSampler)
+    region = SimpleNamespace(
+        proposal=MagicMock(training_count=3),
+        retrain_decision=MagicMock(
+            can_reset=True,
+            rollback_next=rollback,
+            reset_next=not rollback,
+            reset_rollback=True,
+        ),
+    )
+    ns._save_rollback_flow = MagicMock()
+    ns._restore_rollback_flow = MagicMock()
+    ns._region_flow_reset(region)
+    if rollback:
+        ns._restore_rollback_flow.assert_called_once_with(region)
+        region.proposal.reset_model_weights.assert_not_called()
+    else:
+        ns._save_rollback_flow.assert_called_once_with(region)
+        region.proposal.reset_model_weights.assert_called_once_with(
+            weights=True, permutations=True
+        )

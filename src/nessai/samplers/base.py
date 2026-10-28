@@ -474,7 +474,14 @@ class BaseNestedSampler(ABC):
 
     def __getstate__(self):
         d = self.__dict__
-        exclude = {"model", "proposal", "checkpoint_callback"}
+        # the flow kept for discarding a reset is not checkpointed
+        exclude = {
+            "model",
+            "proposal",
+            "checkpoint_callback",
+            "_rollback_flow",
+            "_region_rollback",
+        }
         state = {k: d[k] for k in d.keys() - exclude}
         state["_previous_likelihood_evaluations"] = d[
             "model"
