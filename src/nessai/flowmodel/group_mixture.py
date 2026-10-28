@@ -1360,6 +1360,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         (re)gained live points, and so has no estimate yet, enters at its
         live-point weight until the next pool measures it.
         """
+        if self._fitted_branch_weights is not None:
+            return self._fitted_branch_weights
         if not (self.importance_weights and bool(self._proposal_weights_seen)):
             return self.weights
         active = self.weights > 0
@@ -1375,6 +1377,39 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         if not bool(total > 0):
             return self.weights
         return pw / total
+
+    # Fitted branch weights (``set_branch_weights``): the element weights of
+    # the generative / density path fitted after a training to raise the low
+    # tail of the live points' ``log q - log p``
+    # (:mod:`nessai.proposal.flowproposal.branch_weights`). They replace
+    # :attr:`proposal_weights` until cleared. A plain attribute, as the
+    # latent distortion: the proposal re-applies it after a reload.
+    _fitted_branch_weights = None
+
+    def set_branch_weights(self, weights=None):
+        """Set (``weights``: ``[group_size]``, summing to one, zero where
+        :attr:`weights` is) or clear (``None``) the fitted element weights."""
+        if weights is None:
+            self._fitted_branch_weights = None
+            return
+        w = torch.as_tensor(
+            weights, dtype=self.weights.dtype, device=self.weights.device
+        )
+        if w.shape != self.weights.shape:
+            raise ValueError(
+                f"branch weights of shape {tuple(w.shape)} for a group of "
+                f"{self.group_size}"
+            )
+        if bool((w[self.weights <= 0] != 0).any()):
+            raise ValueError("branch weights on inactive group elements")
+        self._fitted_branch_weights = w / w.sum()
+
+    @property
+    def fitted_branch_weights(self):
+        """The fitted element weights as a numpy array, or ``None``."""
+        if self._fitted_branch_weights is None:
+            return None
+        return self._fitted_branch_weights.detach().cpu().numpy()
 
     @torch.no_grad()
     def update_proposal_weights(
@@ -2784,6 +2819,22 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
                 e.set_latent_distortion(None)
             else:
                 e.set_latent_distortion(mu[j], log_sigma[j])
+
+    def set_branch_weights(self, weights=None):
+        """Per active expert fitted element weights (``weights``: a sequence
+        of ``[group_size]`` arrays), or ``None`` to clear them on every expert
+        (see :meth:`DiscreteGroupMixtureFlowWrapper.set_branch_weights`)."""
+        for j, e in enumerate(self.experts):
+            if weights is None or j >= len(weights):
+                e.set_branch_weights(None)
+            else:
+                e.set_branch_weights(weights[j])
+
+    @property
+    def fitted_branch_weights(self):
+        act = self._active()
+        w = [self.experts[j].fitted_branch_weights for j in range(act)]
+        return None if all(x is None for x in w) else w
 
     @property
     def latent_distortion(self):

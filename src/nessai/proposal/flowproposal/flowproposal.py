@@ -219,6 +219,14 @@ class FlowProposal(BaseFlowProposal):
         :mod:`nessai.proposal.flowproposal.latent_distortion`.
     latent_distortion_kwargs : dict, optional
         Options of :func:`~nessai.proposal.flowproposal.latent_distortion.fit_and_check`.
+    branch_weights : bool
+        Fit the group-mixture element (branch) weights after every training,
+        after the latent distortion, to raise the low tail of the live
+        points' ``log q - log p``, and draw and score the pool with them. A
+        fit that fails the held-out or exactness checks leaves the weights
+        in place. See :mod:`nessai.proposal.flowproposal.branch_weights`.
+    branch_weights_kwargs : dict, optional
+        Options of :func:`~nessai.proposal.flowproposal.branch_weights.fit_and_check`.
     **kwargs
         Additional keyword arguments to pass to the base class.
     """
@@ -255,6 +263,8 @@ class FlowProposal(BaseFlowProposal):
         threshold_from_live_points=False,
         latent_distortion=None,
         latent_distortion_kwargs=None,
+        branch_weights=False,
+        branch_weights_kwargs=None,
         **kwargs,
     ):
         super().__init__(model, poolsize=poolsize, **kwargs)
@@ -264,6 +274,10 @@ class FlowProposal(BaseFlowProposal):
         self.configure_latent_distortion(
             latent_distortion, latent_distortion_kwargs, latent_temperature
         )
+        self.branch_weights = bool(branch_weights)
+        self.branch_weights_kwargs = dict(branch_weights_kwargs or {})
+        self.branch_weights_params = None
+        self.branch_weights_history = []
         self.population_truncation_history = []
         logger.debug("Initialising FlowProposal")
         self._warn_for_deprecated_latent_prior(latent_prior)
@@ -1137,5 +1151,9 @@ class FlowProposal(BaseFlowProposal):
         state.setdefault("latent_distortion_kwargs", {})
         state.setdefault("latent_distortion_params", None)
         state.setdefault("latent_distortion_history", [])
+        state.setdefault("branch_weights", False)
+        state.setdefault("branch_weights_kwargs", {})
+        state.setdefault("branch_weights_params", None)
+        state.setdefault("branch_weights_history", [])
         state.setdefault("population_truncation_history", [])
         self.__dict__.update(state)

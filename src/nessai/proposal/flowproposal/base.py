@@ -943,6 +943,7 @@ class BaseFlowProposal(RejectionProposal):
             raise RuntimeError(f"{self.__name__} is not initialised.")
         # the flow trains (and the mixture weights are set) undistorted
         self._clear_latent_distortion()
+        self._clear_branch_weights()
 
         if (plot and self._plot_training) or self.save_training_data:
             block_output = os.path.join(
@@ -1002,6 +1003,7 @@ class BaseFlowProposal(RejectionProposal):
         self.populated = False
         self.training_count += 1
         self._update_latent_distortion()
+        self._update_branch_weights()
 
     def _clear_latent_distortion(self):
         """Remove the latent distortion from the flow (see
@@ -1069,6 +1071,62 @@ class BaseFlowProposal(RejectionProposal):
                 mode,
                 info.get("reason"),
             )
+
+    def _clear_branch_weights(self):
+        """Remove the fitted element weights from the flow (see
+        :meth:`_update_branch_weights`)."""
+        if not getattr(self, "branch_weights", False):
+            return
+        model = getattr(getattr(self, "flow", None), "model", None)
+        if hasattr(model, "set_branch_weights"):
+            model.set_branch_weights(None)
+        self.branch_weights_params = None
+
+    def _update_branch_weights(self):
+        """Fit the group-mixture element weights to the live points and
+        install them in the flow if they pass the checks (``branch_weights``
+        option of :class:`FlowProposal`), after the latent distortion."""
+        if not getattr(self, "branch_weights", False):
+            return
+        from .branch_weights import fit_and_check, supports_branch_weights
+
+        model = self.flow.model
+        info = dict(training_count=int(self.training_count))
+        if not supports_branch_weights(model):
+            info.update(accepted=False, reason="flow model not supported")
+        else:
+            scheme = getattr(self, "_truncation_scheme", None)
+            rule = scheme.get_rule("log_proposal_threshold") if scheme else None
+            quantile = rule.quantile if rule is not None else 0.01
+            kwargs = dict(getattr(self, "branch_weights_kwargs", {}) or {})
+            st = datetime.datetime.now()
+            live = getattr(self, "current_live_points", None)
+            x = live if live is not None and len(live) else self.training_data
+            w, fit_info = fit_and_check(self, x, quantile, **kwargs)
+            info.update(fit_info)
+            info["time"] = (datetime.datetime.now() - st).total_seconds()
+            if w is not None:
+                params = list(w) if hasattr(model, "experts") else w[0]
+                model.set_branch_weights(params)
+                self.branch_weights_params = params
+                w0 = info.pop("weights_in_place")
+                act = w0 > 0
+                ratio = np.abs(np.log(w[act] / w0[act]))
+                info.update(max_log_ratio=float(ratio.max()))
+        if not hasattr(self, "branch_weights_history"):
+            self.branch_weights_history = []
+        self.branch_weights_history.append(info)
+        if info.get("accepted"):
+            logger.info(
+                "Branch weights: held-out threshold gain %.2f nats, excluded "
+                "%.3g; |log w / w_in_place| <= %.2f (%.1f s)",
+                info["heldout_gain"],
+                info["heldout_excluded"],
+                info["max_log_ratio"],
+                info["time"],
+            )
+        else:
+            logger.info("Branch weights not fitted: %s", info.get("reason"))
 
     def _post_train_diagnostics(self):
         """Hook called immediately after :meth:`FlowModel.train` completes.
@@ -1437,6 +1495,11 @@ class BaseFlowProposal(RejectionProposal):
             model = getattr(getattr(self, "flow", None), "model", None)
             if hasattr(model, "set_latent_distortion"):
                 model.set_latent_distortion(*params)
+        params = getattr(self, "branch_weights_params", None)
+        if params is not None:
+            model = getattr(getattr(self, "flow", None), "model", None)
+            if hasattr(model, "set_branch_weights"):
+                model.set_branch_weights(params)
 
     def _own_weights_file(self, weights_file):
         """The weights file of this run: ``weights_file`` (an absolute path
