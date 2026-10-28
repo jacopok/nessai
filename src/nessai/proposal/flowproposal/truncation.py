@@ -460,6 +460,12 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
     threshold instead, so their weight is capped at ``prior / exp(threshold)``.
     ``lost_mass`` sets the threshold so that this share of the live points'
     mass is lost, instead of from ``quantile``.
+
+    In clip mode a clipped draw whose latent the flow's forward map does not
+    return to (``roundtrip_tolerance`` on the latent norm: a numerical
+    failure of the inverse, whose density is then wrong) is discarded; a
+    latent distortion with ``sigma > 1`` turns those draws into huge
+    weights. ``roundtrip_discarded`` counts them.
     """
 
     name = "log_proposal_threshold"
@@ -472,6 +478,7 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
         prior_relative: bool = True,
         mode: str = "clip",
         lost_mass: float | None = None,
+        roundtrip_tolerance: float | None = 2.0,
     ) -> None:
         super().__init__()
         self.quantile = float(quantile)
@@ -486,7 +493,11 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
             lost_mass = float(lost_mass)
         self.lost_mass = lost_mass
         self.mode = mode
+        self.roundtrip_tolerance = (
+            None if roundtrip_tolerance is None else float(roundtrip_tolerance)
+        )
         self.lost_live_mass = np.nan
+        self.roundtrip_discarded = 0
 
     @property
     def threshold(self) -> float:
@@ -566,7 +577,9 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
         levels = self._levels(proposal, x, log_q)
         if self.clip:
             # non-finite weights are dropped in either mode
-            keep = np.isfinite(levels)
+            keep = np.isfinite(levels) & self._roundtrip_keep(
+                proposal, x, z, levels <= self.threshold
+            )
             if not self.prior_relative and np.isfinite(self.threshold):
                 log_q = np.maximum(log_q, self.threshold)
         else:
@@ -578,6 +591,38 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
             self.mode,
         )
         return get_subset_arrays(keep, x, log_q, z)
+
+    def _roundtrip_keep(self, proposal, x, z, above):
+        """Keep every draw except the ones above the cap that fail the
+        round-trip check (only those: below the cap a wrong density costs
+        nothing, it is rejected like any other)."""
+        keep = np.ones(len(x), dtype=bool)
+        tol = getattr(self, "roundtrip_tolerance", None)
+        if tol is None or z is None or not above.any():
+            return keep
+        from .latent_distortion import roundtrip_gap
+
+        idx = np.flatnonzero(above)
+        try:
+            gap = roundtrip_gap(proposal, x[idx], np.asarray(z)[idx])
+        except Exception as e:  # a diagnostic guard must not stop a run
+            if not getattr(self, "_roundtrip_warned", False):
+                logger.warning(
+                    "Round-trip check failed (%s: %s): clipped draws kept "
+                    "unchecked",
+                    type(e).__name__,
+                    e,
+                )
+                self._roundtrip_warned = True
+            return keep
+        if gap is None:
+            return keep
+        bad = idx[~(gap <= tol)]
+        keep[bad] = False
+        self.roundtrip_discarded = getattr(
+            self, "roundtrip_discarded", 0
+        ) + len(bad)
+        return keep
 
 
 class LikelihoodThresholdTruncation(BaseTruncationRule):

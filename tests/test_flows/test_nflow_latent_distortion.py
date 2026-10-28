@@ -48,9 +48,7 @@ def test_distorted_density_is_exact(flow, distortion):
         flow.set_latent_distortion(None)
         lp, zu = flow.latent_components(x)
     zu, lp = zu.numpy(), lp.numpy()
-    delta = (
-        -0.5 * ((zu - mu) / np.exp(ls)) ** 2 - ls + 0.5 * zu**2
-    ).sum(-1)
+    delta = (-0.5 * ((zu - mu) / np.exp(ls)) ** 2 - ls + 0.5 * zu**2).sum(-1)
     np.testing.assert_allclose(lp + delta, lq.numpy(), atol=1e-8)
 
 

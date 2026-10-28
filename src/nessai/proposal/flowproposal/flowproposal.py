@@ -119,6 +119,18 @@ class FlowProposal(BaseFlowProposal):
     threshold_from_live_points : bool, optional
         Set truncation thresholds from the sampler's current live points
         instead of the flow's training data.
+    latent_distortion : {None, 'temperature', 'shared', 'expert'}
+        Fit an affine latent distortion (``z' = mu + sigma z`` per real
+        latent dim; ``'temperature'``: one sigma; ``'shared'``: per dim;
+        ``'expert'``: per expert and dim, the same as ``'shared'`` for a
+        plain flow) after every training, to raise the low tail of the live
+        points' ``log q' - log p``, and draw and score the pool with it.
+        Incompatible with ``latent_temperature``. A fit that fails the
+        held-out or exactness checks leaves the identity. See
+        :mod:`nessai.proposal.flowproposal.latent_distortion`.
+    latent_distortion_kwargs : dict, optional
+        Options of
+        :func:`~nessai.proposal.flowproposal.latent_distortion.fit_and_check`.
     **kwargs
         Additional keyword arguments to pass to the base class.
     """
@@ -147,6 +159,8 @@ class FlowProposal(BaseFlowProposal):
         clip_population_weights=False,
         sum_mirror_density=False,
         threshold_from_live_points=False,
+        latent_distortion=None,
+        latent_distortion_kwargs=None,
         **kwargs,
     ):
         super().__init__(model, poolsize=poolsize, **kwargs)
@@ -161,6 +175,9 @@ class FlowProposal(BaseFlowProposal):
             latent_prior=latent_prior,
             latent_temperature=latent_temperature,
             clip_population_weights=clip_population_weights,
+        )
+        self.configure_latent_distortion(
+            latent_distortion, latent_distortion_kwargs, latent_temperature
         )
 
         self._truncation_scheme = TruncationScheme()
@@ -305,6 +322,30 @@ class FlowProposal(BaseFlowProposal):
         self.latent_prior = "flow"
         self.latent_temperature = latent_temperature
         self.clip_population_weights = clip_population_weights
+
+    def configure_latent_distortion(
+        self,
+        latent_distortion=None,
+        latent_distortion_kwargs=None,
+        latent_temperature=None,
+    ) -> None:
+        """Validate and store the latent-distortion settings."""
+        from .latent_distortion import MODES
+
+        if latent_distortion is not None:
+            if latent_distortion not in MODES:
+                raise ValueError(
+                    f"latent_distortion must be None or one of {MODES}"
+                )
+            if latent_temperature not in (None, 1.0):
+                raise ValueError(
+                    "latent_distortion replaces the latent temperature: "
+                    "set latent_temperature to None or 1"
+                )
+        self.latent_distortion = latent_distortion
+        self.latent_distortion_kwargs = dict(latent_distortion_kwargs or {})
+        self.latent_distortion_params = None
+        self.latent_distortion_history = []
 
     def _get_population_log_weights(self, log_weights) -> np.ndarray:
         """Return log-weights used in the rejection step during population."""
@@ -665,4 +706,8 @@ class FlowProposal(BaseFlowProposal):
         state.setdefault("sum_mirror_density", False)
         state.setdefault("threshold_from_live_points", False)
         state.setdefault("current_live_points", None)
+        state.setdefault("latent_distortion", None)
+        state.setdefault("latent_distortion_kwargs", {})
+        state.setdefault("latent_distortion_params", None)
+        state.setdefault("latent_distortion_history", [])
         self.__dict__.update(state)
