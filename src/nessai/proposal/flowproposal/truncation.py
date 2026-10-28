@@ -456,6 +456,8 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
     With ``prior_relative`` the level is ``log q - log prior``, which caps
     the rejection weight at ``exp(-threshold)``. ``mode="drop"`` discards
     draws above the cap; ``mode="clip"`` keeps them with the weight clipped.
+    Without ``prior_relative``, clip mode raises the draws' ``log q`` to the
+    threshold instead, so their weight is capped at ``prior / exp(threshold)``.
     ``lost_mass`` sets the threshold so that this share of the live points'
     mass is lost, instead of from ``quantile``.
     """
@@ -476,8 +478,6 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
         self.prior_relative = bool(prior_relative)
         if mode not in self._modes:
             raise ValueError(f"mode must be one of {self._modes}")
-        if mode == "clip" and not self.prior_relative:
-            raise ValueError("mode='clip' requires prior_relative=True")
         if lost_mass is not None:
             if not self.prior_relative:
                 raise ValueError("lost_mass requires prior_relative=True")
@@ -498,8 +498,9 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
 
     @property
     def log_weight_cap(self) -> float:
-        """The cap on the rejection log-weights in clip mode, else ``inf``."""
-        if self.clip and np.isfinite(self._threshold):
+        """The cap on the rejection log-weights in prior-relative clip mode,
+        else ``inf``."""
+        if self.clip and self.prior_relative and np.isfinite(self._threshold):
             return -self._threshold
         return np.inf
 
@@ -566,6 +567,8 @@ class LogProposalThresholdTruncation(BaseTruncationRule):
         if self.clip:
             # non-finite weights are dropped in either mode
             keep = np.isfinite(levels)
+            if not self.prior_relative and np.isfinite(self.threshold):
+                log_q = np.maximum(log_q, self.threshold)
         else:
             keep = levels > self.threshold
         logger.debug(

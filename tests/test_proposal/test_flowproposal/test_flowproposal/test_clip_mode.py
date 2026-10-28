@@ -52,11 +52,36 @@ def test_threshold_source(from_live):
     assert rule.threshold == pytest.approx(np.quantile(level, 0.1))
 
 
-def test_clip_requires_prior_relative():
-    with pytest.raises(ValueError, match="prior_relative"):
-        LogProposalThresholdTruncation(prior_relative=False, mode="clip")
+def test_invalid_mode():
     with pytest.raises(ValueError, match="mode"):
         LogProposalThresholdTruncation(prior_relative=True, mode="cut")
+
+
+def test_clip_without_prior_raises_log_q():
+    """Without ``prior_relative``, clip mode keeps every draw with a finite
+    log q and raises it to the threshold, with no scalar weight cap."""
+    rng = np.random.default_rng(2)
+    live = _arr(rng.uniform(-1, 1, 1000))
+    proposal = _proposal(live)
+    rule = LogProposalThresholdTruncation(
+        quantile=0.1, prior_relative=False, mode="clip"
+    )
+    scheme = TruncationScheme([rule])
+    scheme.prepare(proposal, worst_point=None)
+    assert rule.threshold == pytest.approx(
+        np.quantile(-(live["x"] ** 2), 0.1)
+    )
+    x = _arr(np.linspace(-1.5, 1.5, 301))
+    log_q = -(x["x"] ** 2)
+    log_q[0] = -np.inf
+    out, out_log_q, _ = scheme.apply_after_backward(
+        proposal, x, log_q, np.zeros((len(x), 1))
+    )
+    assert len(out) == len(x) - 1
+    np.testing.assert_array_equal(
+        out_log_q, np.maximum(log_q[1:], rule.threshold)
+    )
+    assert scheme.log_weight_cap == np.inf
 
 
 @pytest.mark.parametrize("mode", ["drop", "clip"])
