@@ -119,7 +119,9 @@ def components(proposal, x):
     lp, z = model.latent_components(xt)
     if lp.dim() == 1:  # a single group-mixture wrapper: one expert
         lp, z = lp[:, None], z[:, None, :]
-    lp = lp.cpu().numpy().astype(float) + log_j[:, None]
+    # inf - inf at a few points: NaN, dropped downstream as non-finite
+    with np.errstate(invalid="ignore"):
+        lp = lp.cpu().numpy().astype(float) + log_j[:, None]
     z = z.cpu().numpy().astype(float)
     return lp.reshape(k, n, -1), z.reshape(k, n, z.shape[-2], z.shape[-1])
 

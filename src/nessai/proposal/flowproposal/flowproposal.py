@@ -706,7 +706,10 @@ class FlowProposal(BaseFlowProposal):
                 + self.latent_log_prob(z, temperature)
                 - self.latent_log_prob(z, None)
             )
-        log_q[todo] = np.asarray(lq, dtype=float) + log_j[rows]
+        # a few points have an infinite density and the opposite infinite
+        # Jacobian: NaN, which the weights and pools drop as non-finite
+        with np.errstate(invalid="ignore"):
+            log_q[todo] = np.asarray(lq, dtype=float) + log_j[rows]
         return log_q
 
     def configure_latent_distortion(
