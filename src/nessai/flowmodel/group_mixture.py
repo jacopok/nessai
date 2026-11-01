@@ -277,6 +277,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         base_symmetry=None,
         circular_standardisation=False,
         curvature_shear=None,
+        mode_shift=None,
     ):
         super().__init__()
         self.base_flow = base_flow
@@ -452,6 +453,52 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             )
         self.register_buffer(
             "_shear_coef", torch.zeros(len(self._SHEAR_POWERS), num_features)
+        )
+
+        # Optional per-mode shift of the standardisation centre
+        # (``mode_shift``, a list of parameters): the canonical points of
+        # group element ``g`` are standardised about ``mean + d_g`` rather
+        # than ``mean``, with ``d_g`` non-zero only in those parameters. For
+        # a group that is a symmetry of the likelihood only approximately
+        # (e.g. a detector's sky symmetry broken by the Earth's rotation over
+        # a long signal), the images of a mode fold onto slightly different
+        # places; with a per-mode shift they are stacked into one shape again.
+        # ``d_g`` is the median offset of element ``g``'s points from the
+        # pooled centre, refitted (and averaged) with the standardisation and
+        # weighted to zero mean over the points; a translation, it has unit
+        # Jacobian, and every density is evaluated at its own element's
+        # shift, so the proposal density stays exact.
+        self.mode_shift = list(mode_shift) if mode_shift else None
+        self._mode_shift_mask = None
+        if self.mode_shift:
+            if prime_space_action is None:
+                raise ValueError(
+                    "mode_shift is only supported on the prime_space_action "
+                    "path."
+                )
+            missing = [p for p in self.mode_shift if p not in self.param_names]
+            if missing:
+                raise ValueError(
+                    f"mode_shift parameters {missing} are not in the "
+                    f"parameters {self.param_names}."
+                )
+            clash = set(self.mode_shift) & (
+                set(self.reflect_parameters or []) | {curvature_shear}
+            )
+            if clash:
+                raise ValueError(
+                    f"mode_shift parameters {sorted(clash)} cannot be "
+                    "reflected or the curvature shear's parameter."
+                )
+            if base_symmetry is not None:
+                raise ValueError(
+                    "mode_shift cannot be combined with base_symmetry."
+                )
+            self._mode_shift_mask = torch.tensor(
+                [n in self.mode_shift for n in self.param_names]
+            )
+        self.register_buffer(
+            "_mode_shift", torch.zeros(group_size, num_features)
         )
 
         # Optional symmetry of the base frame: an isometry ``h`` of the
@@ -889,19 +936,28 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         offset = self._shear_offset(t)
         return t if offset is None else t - offset
 
+    def _centre(self, modes=None):
+        """The standardisation centre: ``[d]`` shared, or ``[n, d]`` with each
+        point's group element's ``mode_shift`` (see ``mode_shift``)."""
+        if self._mode_shift_mask is None or modes is None:
+            return self._canon_mean
+        return self._canon_mean + self._mode_shift[modes]
+
     def _standardise(self, t, modes=None):
-        u = (self._shear(t) - self._canon_mean) / self._canon_std
+        centre = self._centre(modes)
+        u = (self._shear(t) - centre) / self._canon_std
         idx = self._mobius_idx(t.device)
         if idx is None:
             return u
         phi, _ = mobius_standardise(
-            _wrap_angle(t[:, idx] - self._canon_mean[idx]),
+            _wrap_angle(t[:, idx] - centre[..., idx]),
             self._canon_std[idx],
         )
         return u.index_copy(1, idx, phi)
 
     def _destandardise(self, u, modes=None):
-        t = u * self._canon_std + self._canon_mean
+        centre = self._centre(modes)
+        t = u * self._canon_std + centre
         # ``s`` itself is not sheared, so the offset reads off ``t`` as is
         offset = self._shear_offset(t)
         if offset is not None:
@@ -912,16 +968,16 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         psi, _ = mobius_destandardise(
             _wrap_angle(u[:, idx]), self._canon_std[idx]
         )
-        return t.index_copy(1, idx, _wrap_angle(psi + self._canon_mean[idx]))
+        return t.index_copy(1, idx, _wrap_angle(psi + centre[..., idx]))
 
-    def _circular_log_det(self, t):
+    def _circular_log_det(self, t, modes=None):
         """Per-point ``log|du/dt|`` of the Möbius-standardised dims (0 if
         none); the affine dims' constant is :meth:`_canon_log_det`."""
         idx = self._mobius_idx(t.device)
         if idx is None:
             return t.new_zeros(t.shape[0])
         _, log_det = mobius_standardise(
-            _wrap_angle(t[:, idx] - self._canon_mean[idx]),
+            _wrap_angle(t[:, idx] - self._centre(modes)[..., idx]),
             self._canon_std[idx],
         )
         return log_det.sum(dim=1)
@@ -986,7 +1042,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             return torch.logsumexp(lp, dim=0) + log_j
         u = self._standardise(t, modes)
         # reflect dims are never circular: the sign patterns leave this alone
-        log_j = log_j + self._circular_log_det(t)
+        log_j = log_j + self._circular_log_det(t, modes)
         if self._sign_patterns is None:
             return self._base_flow_log_prob(u, context=context) + log_j
         p = self._sign_patterns.shape[0]
@@ -1187,6 +1243,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         c, _ = self._canon_to_base(c)
         self._update_shear(c, bool(self._canon_seen))
         c = self._shear(c)
+        c = self._update_mode_shift(c, assigned[claimed])
         mean = c.mean(dim=0)
         std = c.std(dim=0).clamp_min(self._min_canon_std)
         mean, std = self._pin_reflect(mean, std, c)
@@ -1244,6 +1301,57 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             | (ratio > self._frame_jump_ratio)
             | (ratio < 1 / self._frame_jump_ratio)
         )
+
+    #: Fewest points of a group element for its ``mode_shift`` to be refitted
+    #: (an element with fewer keeps its previous shift).
+    _min_mode_shift_count = 64
+
+    def _update_mode_shift(self, t, assigned):
+        """Refit the per-mode shifts (``mode_shift``) to the base-frame
+        points ``t`` (of elements ``assigned``), averaged across rounds as the
+        standardisation is; returns ``t`` with each point's shift removed (the
+        aligned points the pooled mean and std are taken from)."""
+        if self._mode_shift_mask is None:
+            return t
+        circ = getattr(self, "_circular_idx", None)
+        circ = None if circ is None or not circ.numel() else circ.to(t.device)
+
+        def wrap(d):
+            if circ is None:
+                return d
+            return d.index_copy(1, circ, _wrap_angle(d[:, circ]))
+
+        seen = bool(self._canon_seen)
+        if seen:
+            ref = self._canon_mean
+        else:
+            ref = t.median(dim=0).values
+            if circ is not None:
+                ref = ref.index_copy(
+                    0,
+                    circ,
+                    torch.atan2(
+                        torch.sin(t[:, circ]).mean(0),
+                        torch.cos(t[:, circ]).mean(0),
+                    ),
+                )
+        d = wrap(t - ref)
+        modes, counts = torch.unique(assigned, return_counts=True)
+        fitted = modes[counts >= self._min_mode_shift_count]
+        if fitted.numel():
+            shift = torch.stack(
+                [d[assigned == g].median(dim=0).values for g in fitted]
+            )
+            n = counts[counts >= self._min_mode_shift_count].to(t.dtype)
+            # zero mean over the points: the pooled centre stays theirs
+            shift = shift - (n[:, None] * shift).sum(0) / n.sum()
+            shift = shift * self._mode_shift_mask.to(t.device, t.dtype)
+            if seen:
+                beta = self._canon_ema
+                old = self._mode_shift[fitted]
+                shift = old + beta * wrap(shift - old)
+            self._mode_shift[fitted] = wrap(shift)
+        return wrap(t - self._mode_shift[assigned])
 
     def _update_shear(self, t, seen):
         """Refit the curvature shear to base-frame points ``t``, averaged
@@ -1995,6 +2103,8 @@ class GroupMixtureFlowModel(FlowModel):
     circular_standardisation = False
     #: See :class:`DiscreteGroupMixtureFlowWrapper` ``curvature_shear``.
     curvature_shear = None
+    #: See :class:`DiscreteGroupMixtureFlowWrapper` ``mode_shift``.
+    mode_shift = None
 
     def initialise(self):
         """Initialise the model and optimiser via :meth:`get_model`."""
@@ -2081,6 +2191,11 @@ class GroupMixtureFlowModel(FlowModel):
         )
         if not isinstance(curvature_shear, str):
             curvature_shear = None
+        mode_shift = config_clean.pop(
+            "mode_shift", getattr(self, "mode_shift", None)
+        )
+        if not isinstance(mode_shift, (list, tuple)):
+            mode_shift = None
         if not isinstance(circular_parameters, (list, tuple)):
             circular_parameters = None
         if circular_parameters:
@@ -2135,6 +2250,7 @@ class GroupMixtureFlowModel(FlowModel):
             base_symmetry=base_symmetry,
             circular_standardisation=bool(circular_standardisation),
             curvature_shear=curvature_shear,
+            mode_shift=mode_shift,
         )
 
 
@@ -2156,6 +2272,7 @@ def make_group_mixture_flow(
     base_symmetry=None,
     circular_standardisation=False,
     curvature_shear=None,
+    mode_shift=None,
 ):
     """Factory constructing a ``GroupMixtureFlowModel`` bound to a specific group.
 
@@ -2275,6 +2392,14 @@ def make_group_mixture_flow(
         :class:`DiscreteGroupMixtureFlowWrapper`): it straightens a ridge that
         bends with its vertex at a boundary the parameter is mirrored about.
         Default: none.
+    mode_shift : list of str, optional
+        Parameters in which each group element's canonical points are
+        standardised about their own centre, ``mean + d_g`` (see
+        :class:`DiscreteGroupMixtureFlowWrapper`): for a group that is only
+        approximately a symmetry, it stacks the slightly displaced images of
+        a mode into one shape. Not the reflected parameters nor the
+        ``curvature_shear`` one, and not with ``base_symmetry``. Default:
+        none.
 
     Notes
     -----
@@ -2308,6 +2433,9 @@ def make_group_mixture_flow(
         circular_standardisation
     )
     CustomGroupMixtureFlowModel.curvature_shear = curvature_shear
+    CustomGroupMixtureFlowModel.mode_shift = (
+        list(mode_shift) if mode_shift else None
+    )
     CustomGroupMixtureFlowModel.mode_factor_sizes = (
         [int(s) for s in mode_factor_sizes]
         if mode_factor_sizes is not None
