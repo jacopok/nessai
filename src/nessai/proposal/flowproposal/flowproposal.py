@@ -734,6 +734,16 @@ class FlowProposal(BaseFlowProposal):
         self.latent_distortion_params = None
         self.latent_distortion_history = []
 
+    def _clip_excess_supported(self) -> bool:
+        """Whether a pool point's acceptance probability before the weight
+        cap is known: with the population weights as drawn (normalised by
+        their maximum), not re-capped by ``population_weight_cap_mass`` or
+        ``clip_population_weights``."""
+        return (
+            getattr(self, "population_weight_cap_mass", None) is None
+            and not self.clip_population_weights
+        )
+
     def _record_truncation_diagnostics(self, n_clipped, log_cap) -> None:
         """Per pool: the clipped share of the pool (clip mode) and the live
         points outside the log-proposal cut."""
@@ -817,6 +827,14 @@ class FlowProposal(BaseFlowProposal):
         log_cap = self._truncation_scheme.log_weight_cap
         clipped_all = np.empty(0, dtype=bool)
         n_clipped = 0
+        # each pool point's log acceptance probability before the weight
+        # cap (clip mode): above 0 where the cap under-proposes the prior
+        # (the clip-compression excess, see :meth:`draw`)
+        log_excess_all = np.empty(0)
+        pool_log_excess = np.full(
+            0 if self.accumulate_weights else n_samples, -np.inf
+        )
+        excess_known = self._clip_excess_supported()
 
         while n_accepted < n_samples:
             # a batch is never larger than the pool: ``drawsize`` caps it
@@ -864,12 +882,15 @@ class FlowProposal(BaseFlowProposal):
                     continue
 
             log_w = self.compute_weights(x, log_q)
+            log_w_raw = log_w
             # clip mode of a truncation rule: weights above the cap are
             # clipped to it instead of the draws being dropped
             clipped = np.zeros(len(log_w), dtype=bool)
             if np.isfinite(log_cap):
                 clipped = log_w > log_cap
                 log_w = np.minimum(log_w, log_cap)
+            # the rejection step normalises by the largest (clipped) weight
+            log_w_norm = np.nanmax(log_w) if len(log_w) else 0.0
 
             if self.adapt_latent_temperature:
                 adapt_surv_z.append(np.asarray(z, dtype=float))
@@ -879,6 +900,7 @@ class FlowProposal(BaseFlowProposal):
                 samples = np.concatenate([samples, x])
                 log_weights = np.concatenate([log_weights, log_w])
                 clipped_all = np.concatenate([clipped_all, clipped])
+                log_excess_all = np.concatenate([log_excess_all, log_w_raw])
                 log_weights_rejection = self._get_population_log_weights(
                     log_weights,
                     min_yield=n_proposed * n_samples / max_samples,
@@ -909,6 +931,9 @@ class FlowProposal(BaseFlowProposal):
                 m = min(n_samples - n_accepted, n_accept_batch)
                 samples[n_accepted : n_accepted + m] = x[accept][:m]
                 n_clipped += int(clipped[accept][:m].sum())
+                pool_log_excess[n_accepted : n_accepted + m] = (
+                    log_w_raw[accept][:m] - log_w_norm
+                )
                 n_accepted += n_accept_batch
                 logger.debug("n accepted: %s / %s", n_accepted, n_samples)
                 if n_proposed > max_samples:
@@ -927,8 +952,12 @@ class FlowProposal(BaseFlowProposal):
             n_accepted = np.sum(accept)
             self.x = samples[accept][:n_samples]
             n_clipped = int(clipped_all[accept][:n_samples].sum())
+            pool_log_excess = (log_excess_all - np.nanmax(log_weights))[
+                accept
+            ][:n_samples]
         else:
             self.x = samples[: min(n_accepted, n_samples)]
+            pool_log_excess = pool_log_excess[: len(self.x)]
         self._record_truncation_diagnostics(n_clipped, log_cap)
 
         if self.adapt_latent_temperature and adapt_full_z:
@@ -970,6 +999,10 @@ class FlowProposal(BaseFlowProposal):
             logger.debug("Current acceptance %s", self.acceptance[-1])
 
         self.indices = self.rng.permutation(self.samples.size).tolist()
+        if excess_known and len(pool_log_excess) == self.samples.size:
+            self.pool_log_excess = pool_log_excess
+        else:
+            self.pool_log_excess = None
         self.population_acceptance = n_accepted / n_proposed
         lost = getattr(self, "_population_cap_lost_mass", None)
         if getattr(self, "population_weight_cap_mass", None) and lost:

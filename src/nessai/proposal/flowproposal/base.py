@@ -134,6 +134,8 @@ class BaseFlowProposal(RejectionProposal):
         self.populated = False
         self.populating = False  # Flag used for resuming during population
         self.indices = []
+        self.pool_log_excess = None
+        self.last_draw_log_excess = -np.inf
         self.training_count = 0
         self.populated_count = 0
         self.parameters = None
@@ -1396,6 +1398,13 @@ class BaseFlowProposal(RejectionProposal):
         # popping from right end is faster
         index = self.indices.pop()
         new_sample = self.samples[index]
+        # the drawn point's log acceptance probability before the weight cap
+        # (clip mode; above 0 where the cap under-proposes the prior), for
+        # the sampler's clip-compression term
+        excess = getattr(self, "pool_log_excess", None)
+        self.last_draw_log_excess = (
+            float(excess[index]) if excess is not None else -np.inf
+        )
         if not self.indices:
             self.populated = False
             logger.debug("Proposal pool is empty")
@@ -1520,6 +1529,7 @@ class BaseFlowProposal(RejectionProposal):
     def reset(self):
         """Reset the proposal"""
         self.indices = []
+        self.pool_log_excess = None
         self.samples = None
         self.x = None
         self.populated = False

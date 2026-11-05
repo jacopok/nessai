@@ -34,6 +34,44 @@ from ..utils import (
 from .base import BaseNestedSampler
 from .retrain import RetrainDecision
 
+#: floor on the clip-compression stretch of a step in -ln X
+CLIP_COMPRESSION_MIN_STRETCH = 0.5
+
+
+def clip_compression_term(log_excess, index, nlive):
+    """The clip-compression term of an inserted point: an unbiased estimate
+    of the extra compression ``b`` of an iteration.
+
+    A pool drawn under a weight cap ``c`` (the clip mode of the
+    log-proposal threshold truncation) follows ``p min(1, c / w)``, so
+    within the likelihood contour a new point under-represents the prior
+    where its weight ``w`` exceeds the cap. In ``u = X / X*`` (``X*`` the
+    dead point's prior volume) the step in ``-ln X`` then has mean
+    ``(1 + b) / n``, with ``b = int (1 - a)(1 + ln u) du / int a du`` and
+    ``a`` the share of the prior proposed. The inserted points are draws
+    from ``p a`` within the contour, so over them ``b`` is the mean of
+    ``(w / c - 1)_+ (1 + ln u)``: the excess ``w / c - 1`` is the drawn
+    point's acceptance probability before the cap, less one
+    (:attr:`~nessai.proposal.flowproposal.base.BaseFlowProposal.pool_log_excess`),
+    and ``u`` that of its insertion index ``k`` among the ``n - 1``
+    surviving live points, ``1 - (k + 1/2) / n``.
+    """
+    if not log_excess > 0:
+        return 0.0
+    u = 1.0 - (index + 0.5) / nlive
+    return float(np.expm1(log_excess) * (1.0 + np.log(u)))
+
+
+def clip_compression_stretches(terms, window):
+    """The stretch of each iteration's step in ``-ln X``: one plus the sum
+    of the previous ``window`` terms over ``window``, so each term is spread
+    over the ``window`` iterations after its own (and their sum is kept)."""
+    terms = np.asarray(terms, dtype=float)
+    csum = np.concatenate([[0.0], np.cumsum(terms)])
+    i = np.arange(len(terms))
+    past = csum[i] - csum[np.maximum(i - window, 0)]
+    return np.maximum(1.0 + past / window, CLIP_COMPRESSION_MIN_STRETCH)
+
 logger = logging.getLogger(__name__)
 
 
@@ -155,6 +193,19 @@ class NestedSampler(BaseNestedSampler):
     trace_parameters : Optional[list[str]]
         List of parameters to include in the trace plot. If None, all model
         parameters are included.
+    clip_compression_correction : bool
+        If true, correct the compression for the weight cap of the
+        log-proposal threshold truncation in clip mode: the step in
+        ``-ln X`` of each iteration is stretched by ``1 + b``, ``b`` the mean
+        of the previous ``clip_compression_window`` clip-compression terms
+        (:func:`clip_compression_term`). Without it the cap under-proposes
+        the low-likelihood edge of the contours, ``-ln X`` runs ahead of
+        ``i / nlive`` and the evidence is overestimated by about ``b`` times
+        the posterior's mean ``-ln X``. The terms are recorded (and the
+        corrected evidence logged) either way.
+    clip_compression_window : Optional[int]
+        Number of iterations each term is spread over; defaults to
+        ``nlive``.
     retrain_decision : bool or dict, optional
         If true (the default, or a dictionary of keyword arguments for
         :py:class:`nessai.samplers.retrain.RetrainDecision`), the flow is
@@ -228,6 +279,8 @@ class NestedSampler(BaseNestedSampler):
         retrain_decision=True,
         retrain_costs="gw",
         partition=None,
+        clip_compression_correction=False,
+        clip_compression_window=None,
         **kwargs,
     ):
         super().__init__(
@@ -269,6 +322,12 @@ class NestedSampler(BaseNestedSampler):
         )
 
         self.insertion_indices = []
+        self.clip_compression_correction = bool(clip_compression_correction)
+        self.clip_compression_window = int(clip_compression_window or nlive)
+        if self.clip_compression_window < 1:
+            raise ValueError("clip_compression_window must be at least 1")
+        self.clip_compression_terms = []
+        self._clip_compression_sum = 0.0
         self.rolling_p = []
         self.final_p_value = None
         self.final_ks_statistic = None
@@ -875,13 +934,63 @@ class NestedSampler(BaseNestedSampler):
         self.live_points[index - 1] = live_point
         return index - 1
 
+    def _clip_stretch(self):
+        """The stretch of this iteration's step in ``-ln X`` (1 unless
+        ``clip_compression_correction``)."""
+        if not getattr(self, "clip_compression_correction", False):
+            return 1.0
+        window = self.clip_compression_window
+        return max(
+            1.0 + self._clip_compression_sum / window,
+            CLIP_COMPRESSION_MIN_STRETCH,
+        )
+
+    def _record_clip_compression(self, index):
+        """Record the inserted point's clip-compression term."""
+        if not hasattr(self, "clip_compression_terms"):  # older resume files
+            self.clip_compression_correction = False
+            self.clip_compression_window = self.nlive
+            self.clip_compression_terms = []
+            self._clip_compression_sum = 0.0
+        term = clip_compression_term(
+            getattr(self.proposal, "last_draw_log_excess", -np.inf),
+            index,
+            self.nlive,
+        )
+        terms = self.clip_compression_terms
+        terms.append(term)
+        self._clip_compression_sum += term
+        if len(terms) > self.clip_compression_window:
+            self._clip_compression_sum -= terms[-self.clip_compression_window - 1]
+
+    def clip_compression_log_evidence(self, apply):
+        """The log-evidence of the nested samples with (``apply``) or
+        without the clip-compression correction, from the recorded terms,
+        by :func:`nessai.posterior.compute_weights`."""
+        from ..posterior import compute_weights
+
+        terms = getattr(self, "clip_compression_terms", [])
+        logL = np.asarray(self.state.logLs[1:], dtype=float)
+        n_dead = len(terms)
+        nlive = np.full(len(logL), float(self.nlive))
+        nlive[n_dead:] = np.arange(self.nlive, 0, -1, dtype=float)[
+            : len(logL) - n_dead
+        ]
+        if apply and n_dead:
+            nlive[:n_dead] /= clip_compression_stretches(
+                terms, self.clip_compression_window
+            )
+        return compute_weights(
+            logL, nlive, expectation=self.state.expectation
+        )[0]
+
     def consume_sample(self):
         """
         Replace a sample for single thread
         """
         worst = self.live_points[0].copy()
         self.logLmin = worst["logL"]
-        self.state.increment(worst["logL"])
+        self.state.increment(worst["logL"], stretch=self._clip_stretch())
         self.nested_samples.append(worst)
 
         self.condition = (
@@ -908,6 +1017,7 @@ class NestedSampler(BaseNestedSampler):
                 proposed["it"] = self.iteration
                 index = self.insert_live_point(proposed)
                 self.insertion_indices.append(index)
+                self._record_clip_compression(index)
                 self.accepted += 1
                 self.block_acceptance += 1 / count
                 self.acceptance_history.append(1 / count)
@@ -1429,6 +1539,7 @@ class NestedSampler(BaseNestedSampler):
         clone.populated = False
         clone.resume_populated = False
         clone.samples = None
+        clone.pool_log_excess = None
         clone.x = None
         clone.population_time = datetime.timedelta()
         partition_module.respawn_generators(clone, self.rng)
@@ -2562,10 +2673,33 @@ class NestedSampler(BaseNestedSampler):
         # Refine evidence estimate
         self.update_state(force=True)
         self.state.finalise()
+        self._log_clip_compression()
         if self.retrain_decision is not None:
             self.finalise_retrain_decision()
         # output the chain and evidence
         self.finalised = True
+
+    def _log_clip_compression(self):
+        """Log the mean clip-compression term and its effect on ln Z."""
+        terms = getattr(self, "clip_compression_terms", [])
+        if not terms or not np.any(terms):
+            return
+        try:
+            shift = self.clip_compression_log_evidence(
+                True
+            ) - self.clip_compression_log_evidence(False)
+        except Exception as e:  # diagnostics must not stop a run
+            logger.warning(f"Clip-compression evidence failed: {e}")
+            return
+        logger.info(
+            "Clip compression: mean term b = %.2e (%d of %d insertions over "
+            "the cap); ln Z %s by %.3f",
+            np.mean(terms),
+            int(np.count_nonzero(terms)),
+            len(terms),
+            "corrected" if self.clip_compression_correction else "would change",
+            shift,
+        )
 
     def finalise_retrain_decision(self):
         """Log and save the unit costs measured during the run."""
@@ -2690,6 +2824,12 @@ class NestedSampler(BaseNestedSampler):
         """Return a dictionary that contains results"""
         d = super().get_result_dictionary()
         d["insertion_indices"] = self.insertion_indices
+        d["clip_compression_terms"] = np.asarray(
+            getattr(self, "clip_compression_terms", []), dtype=float
+        )
+        d["clip_compression_correction"] = getattr(
+            self, "clip_compression_correction", False
+        )
         d["final_p_value"] = self.final_p_value
         d["final_ks_statistic"] = self.final_ks_statistic
         d["nested_samples"] = np.array(self.nested_samples)

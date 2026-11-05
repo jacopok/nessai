@@ -184,7 +184,7 @@ class _NSIntegralState(_BaseNSIntegralState):
         values = list(self.region_logw.values())
         return float(logsumexp(values)) if values else -np.inf
 
-    def increment(self, logL, nlive=None, region=None):
+    def increment(self, logL, nlive=None, region=None, stretch=1.0):
         """
         Increment the state of the evidence integrator
         Simply uses rectangle rule for initial estimate
@@ -192,7 +192,14 @@ class _NSIntegralState(_BaseNSIntegralState):
         In a partitioned run (:meth:`split`) ``region`` is the region the
         dead point belongs to: only its volume shrinks, by ``1 / nlive``
         with ``nlive`` that region's number of live points.
+
+        ``stretch`` multiplies the step in ``-ln X`` (the clip-compression
+        correction, :class:`~nessai.samplers.nestedsampler.NestedSampler`):
+        the step is that of ``nlive / stretch`` live points, which is what
+        :attr:`nlive` records.
         """
+        if not stretch > 0:
+            raise ValueError(f"stretch must be positive, got {stretch}")
         if logL <= self.logLs[-1]:
             logger.warning(
                 "NS integrator received non-monotonic logL."
@@ -204,6 +211,7 @@ class _NSIntegralState(_BaseNSIntegralState):
         if partitioned and region is None:
             raise RuntimeError("A partitioned run needs the region")
 
+        nlive = nlive / stretch if stretch != 1.0 else nlive
         self.nlive.append(nlive)
         if self.expectation == "logt":
             # <logt> approx -1 / N
