@@ -1125,9 +1125,21 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     def _preimages(self, x):
         """All group pre-images ``g_k^-1 . x`` in prime coords.
 
-        Returns ``(pre [K, B, d], conj_logdet [K, B])``.
+        Returns ``(pre [K, B, d], conj_logdet [K, B])``. A prime-space
+        action with a ``preimages(point_dict, K)`` method (the same rows,
+        each point decoded once) is given the ``B`` points instead of their
+        ``K`` copies.
         """
         k, b = self.group_size, x.shape[0]
+        fast = (getattr(self.prime_space_action, "preimages", None)
+                if self.uses_prime_space_action else None)
+        if fast is not None:
+            out = fast({name: x[:, i] for i, name in enumerate(self.param_names)}, k)
+            mapped, logdet = out if isinstance(out, tuple) else (out, None)
+            pre = torch.stack([mapped[name] for name in self.param_names], dim=-1)
+            if logdet is None:
+                logdet = x.new_zeros(k * b)
+            return pre.view(k, b, -1), torch.as_tensor(logdet).view(k, b)
         x_rep = x.unsqueeze(0).expand(k, b, -1).reshape(k * b, -1)
         modes = torch.arange(k, device=x.device).repeat_interleave(b)
         pre, logdet = self._apply_group_action(x_rep, modes, inverse=True)

@@ -457,6 +457,9 @@ class FlowModel:
 
         n = 0
         skipped = 0
+        # once per epoch, not per batch (each a walk over every module)
+        params = list(model.parameters())
+        foreach_norm = getattr(torch, "_foreach_norm", None)
         for data in train_data:
             if is_dataloader:
                 x = data[0].to(self.device)
@@ -464,7 +467,7 @@ class FlowModel:
                 x = data
             if noise_scale:
                 x = x + noise_scale * torch.randn_like(x)
-            for param in model.parameters():
+            for param in params:
                 param.grad = None
             if weighted:
                 weights = data[1].to(self.device)
@@ -479,17 +482,22 @@ class FlowModel:
             # a non-finite loss or gradient (one point at log_prob = -inf)
             # would make every weight NaN, and Adam's moments with them: the
             # optimiser then turns any later weights NaN at its first step
-            if not torch.isfinite(loss) or not all(
-                torch.isfinite(p.grad).all()
-                for p in model.parameters()
-                if p.grad is not None
-            ):
+            grads = [p.grad for p in params if p.grad is not None]
+            if foreach_norm is not None and grads:
+                # a few kernels over all the gradients, not two per tensor:
+                # times zero, a finite entry is 0 and inf or NaN is NaN (the
+                # norm of the gradients themselves could overflow)
+                zeros = torch._foreach_mul(grads, 0.0)
+                finite = bool(torch.isfinite(torch.stack(foreach_norm(zeros))).all())
+            else:
+                finite = all(torch.isfinite(g).all() for g in grads)
+            if not torch.isfinite(loss) or not finite:
                 skipped += 1
                 continue
             train_loss += loss.item()
             if self.training_config["clip_grad_norm"]:
                 clip_grad_norm_(
-                    model.parameters(),
+                    params,
                     self.training_config["clip_grad_norm"],
                 )
             self._optimiser.step()
