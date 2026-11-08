@@ -278,6 +278,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         circular_standardisation=False,
         curvature_shear=None,
         mode_shift=None,
+        curvature_shear_powers=None,
     ):
         super().__init__()
         self.base_flow = base_flow
@@ -418,14 +419,36 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         # ``s = t_s`` (``curvature_shear``, e.g. a mass ratio mirrored about
         # its boundary at ``t_s = 0``), before the standardisation: every
         # other non-circular, non-reflected coordinate is replaced by ``t_i -
-        # sum_p c_ip s**p`` over the even powers ``p`` in ``_SHEAR_POWERS``.
+        # sum_p c_ip s**p`` over the powers ``p`` (``curvature_shear_powers``,
+        # default the even ``_SHEAR_POWERS``).
         # Even in ``s``, it commutes with the mirror about that boundary and
         # unbends a ridge with its vertex there (a U in the mirrored training
         # data) into a straight band, which the standardisation then scales
         # to O(1); triangular with a unit diagonal, it has unit Jacobian.
+        # Odd powers also take out a ridge's slope and skew: in ``|s|`` when
+        # the points the shear is fitted to are mirrored about ``s = 0``
+        # (still even, so it commutes with the mirror), else in ``s`` (the
+        # boundary not inverted: the points span its rescaled range).
         # ``c`` is the least-squares fit to the live points, refreshed (and
-        # averaged) with the standardisation.
+        # averaged) with the standardisation; a change of the mirroring
+        # refits it.
         self.curvature_shear = curvature_shear
+        powers = list(
+            self._SHEAR_POWERS
+            if curvature_shear_powers is None
+            else curvature_shear_powers
+        )
+        if not powers or any(
+            not isinstance(p, (int, np.integer)) or p < 1 for p in powers
+        ):
+            raise ValueError(
+                "curvature_shear_powers must be positive integers; got "
+                f"{curvature_shear_powers}"
+            )
+        self._shear_powers = tuple(sorted({int(p) for p in powers}))
+        # a refit, not an average, at the next standardisation (coefficients
+        # loaded from a checkpoint with other powers)
+        self._shear_refit = False
         self._shear_idx = None
         self._shear_mask = None
         if curvature_shear is not None:
@@ -452,8 +475,16 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 [n not in excluded for n in self.param_names]
             )
         self.register_buffer(
-            "_shear_coef", torch.zeros(len(self._SHEAR_POWERS), num_features)
+            "_shear_coef", torch.zeros(len(self._shear_powers), num_features)
         )
+        # the powers the coefficients' rows belong to, in the checkpoint
+        self.register_buffer(
+            "_shear_exponents",
+            torch.tensor(self._shear_powers, dtype=torch.long),
+        )
+        # with an odd power: the fit's points were mirrored about s = 0 (the
+        # shear is then in |s|)
+        self.register_buffer("_shear_abs", torch.tensor(False))
 
         # Optional per-mode shift of the standardisation centre
         # (``mode_shift``, a list of parameters): the canonical points of
@@ -714,7 +745,13 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             self._canon_mean.copy_(old._canon_mean)
             self._canon_std.copy_(old._canon_std)
             self._canon_seen.copy_(old._canon_seen)
-            self._shear_coef.copy_(old._shear_coef)
+            self._shear_coef.copy_(
+                self._shear_coef_from(
+                    old._shear_coef, getattr(old, "_shear_exponents", None)
+                )
+            )
+            if hasattr(old, "_shear_abs"):
+                self._shear_abs.copy_(old._shear_abs)
             self._log_domain_mass.copy_(old._log_domain_mass)
             if (
                 self.base_reparam is not None
@@ -734,8 +771,34 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         self._last_factor_marginals = old._last_factor_marginals
         self._last_factor_counts = old._last_factor_counts
 
-    #: Powers of the curvature shear (see ``curvature_shear``).
+    #: Default powers of the curvature shear (see ``curvature_shear``, and
+    #: ``curvature_shear_powers``), and those of a checkpoint that does not
+    #: name its own.
     _SHEAR_POWERS = (2, 4)
+
+    def _shear_coef_from(self, coef, exponents=None):
+        """The curvature-shear coefficients ``coef`` (rows: the powers
+        ``exponents``, by default :data:`_SHEAR_POWERS` if the row count
+        matches) in this wrapper's powers: rows of powers it lacks are
+        dropped, powers it adds start at zero, and the next standardisation
+        refits them rather than averaging."""
+        if exponents is not None and len(exponents) == coef.shape[0]:
+            old = tuple(int(p) for p in exponents)
+        elif coef.shape[0] == len(self._SHEAR_POWERS):
+            old = tuple(self._SHEAR_POWERS)
+        else:
+            old = None
+        if old == self._shear_powers:
+            return coef
+        new = torch.zeros(
+            len(self._shear_powers), coef.shape[1],
+            dtype=coef.dtype, device=coef.device,
+        )
+        for i, p in enumerate(old or ()):
+            if p in self._shear_powers:
+                new[self._shear_powers.index(p)] = coef[i]
+        self._shear_refit = True
+        return new
 
     #: Buffer names from the removed per-branch canonicalisation scheme.
     #: Dropped from an incoming checkpoint so an old checkpoint can still be
@@ -769,7 +832,10 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 # per branch. No longer compatible; re-bootstrap instead.
                 del sd[name]
         for name, val in current.items():
-            sd.setdefault(name, val)
+            # the shear's powers: the checkpoint's, or none (its coefficients
+            # are mapped in :meth:`_load_from_state_dict`)
+            if name != "_shear_exponents":
+                sd.setdefault(name, val)
         return super().load_state_dict(sd, strict=strict, assign=assign)
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
@@ -788,6 +854,21 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 and old.shape != cur.shape
             ):
                 state_dict[key] = cur.detach().clone()
+        # The curvature shear's coefficients in this wrapper's powers (a
+        # checkpoint written with other powers, or before they were stored).
+        key = prefix + "_shear_coef"
+        if isinstance(state_dict.get(key), torch.Tensor):
+            exponents = state_dict.get(prefix + "_shear_exponents")
+            state_dict[key] = self._shear_coef_from(
+                state_dict[key],
+                exponents.tolist() if isinstance(exponents, torch.Tensor)
+                else None,
+            )
+        state_dict[prefix + "_shear_exponents"] = (
+            self._shear_exponents.detach().clone()
+        )
+        # a checkpoint before odd powers: the even shear's s, not |s|
+        state_dict.setdefault(prefix + "_shear_abs", torch.tensor(False))
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def _configure_reflection(self):
@@ -927,9 +1008,36 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         """``sum_p c_p s**p`` of the curvature shear (``None`` if off)."""
         if self._shear_idx is None:
             return None
-        s = t[:, self._shear_idx]
-        powers = torch.stack([s**p for p in self._SHEAR_POWERS], dim=1)
+        s = self._shear_variable(t)
+        powers = torch.stack([s**p for p in self.shear_powers], dim=1)
         return powers @ self._shear_coef.to(t.dtype)
+
+    @property
+    def shear_powers(self):
+        """The powers of the curvature shear."""
+        return getattr(self, "_shear_powers", self._SHEAR_POWERS)
+
+    def _shear_odd(self):
+        return any(p % 2 for p in self.shear_powers)
+
+    def _shear_variable(self, t):
+        """The curvature shear's ``s``, or ``|s|`` with an odd power if the
+        points it was fitted to were mirrored about ``s = 0`` (even in
+        ``s``: the shear commutes with the mirror)."""
+        s = t[:, self._shear_idx]
+        return s.abs() if self._shear_odd() and bool(self._shear_abs) else s
+
+    @staticmethod
+    def _mirrored(s, atol=1e-5):
+        """Whether ``s`` holds its mirror copies about zero (the boundary
+        inversion's duplicates)."""
+        pos = torch.sort(s[s > 0]).values
+        neg = torch.sort(-s[s < 0]).values
+        return bool(
+            len(pos) == len(neg)
+            and len(pos) > 10
+            and torch.allclose(pos, neg, atol=atol)
+        )
 
     def _shear(self, t):
         """The base frame ``t`` with the curvature shear applied."""
@@ -1370,15 +1478,22 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         across rounds as the standardisation is."""
         if self._shear_idx is None:
             return
-        s = t[:, self._shear_idx]
+        refit = getattr(self, "_shear_refit", False)
+        self._shear_refit = False
+        if self._shear_odd():
+            mirrored = self._mirrored(t[:, self._shear_idx])
+            # the other basis: averaging the old coefficients is meaningless
+            refit |= mirrored != bool(self._shear_abs)
+            self._shear_abs.fill_(mirrored)
+        s = self._shear_variable(t)
         design = torch.stack(
-            [torch.ones_like(s)] + [s**p for p in self._SHEAR_POWERS], dim=1
+            [torch.ones_like(s)] + [s**p for p in self.shear_powers], dim=1
         )
         coef = torch.linalg.lstsq(
             design.double(), t.double()
         ).solution[1:].to(t.dtype)
         coef = coef * self._shear_mask.to(coef.device, coef.dtype)
-        if seen:
+        if seen and not refit:
             beta = self._canon_ema
             self._shear_coef.mul_(1 - beta).add_(beta * coef)
         else:
@@ -2115,6 +2230,9 @@ class GroupMixtureFlowModel(FlowModel):
     circular_standardisation = False
     #: See :class:`DiscreteGroupMixtureFlowWrapper` ``curvature_shear``.
     curvature_shear = None
+    #: See :class:`DiscreteGroupMixtureFlowWrapper`
+    #: ``curvature_shear_powers`` (``None``: the default powers).
+    curvature_shear_powers = None
     #: See :class:`DiscreteGroupMixtureFlowWrapper` ``mode_shift``.
     mode_shift = None
 
@@ -2203,6 +2321,12 @@ class GroupMixtureFlowModel(FlowModel):
         )
         if not isinstance(curvature_shear, str):
             curvature_shear = None
+        curvature_shear_powers = config_clean.pop(
+            "curvature_shear_powers",
+            getattr(self, "curvature_shear_powers", None),
+        )
+        if not isinstance(curvature_shear_powers, (list, tuple)):
+            curvature_shear_powers = None
         mode_shift = config_clean.pop(
             "mode_shift", getattr(self, "mode_shift", None)
         )
@@ -2263,6 +2387,7 @@ class GroupMixtureFlowModel(FlowModel):
             circular_standardisation=bool(circular_standardisation),
             curvature_shear=curvature_shear,
             mode_shift=mode_shift,
+            curvature_shear_powers=curvature_shear_powers,
         )
 
 
@@ -2285,6 +2410,7 @@ def make_group_mixture_flow(
     circular_standardisation=False,
     curvature_shear=None,
     mode_shift=None,
+    curvature_shear_powers=None,
 ):
     """Factory constructing a ``GroupMixtureFlowModel`` bound to a specific group.
 
@@ -2404,6 +2530,12 @@ def make_group_mixture_flow(
         :class:`DiscreteGroupMixtureFlowWrapper`): it straightens a ridge that
         bends with its vertex at a boundary the parameter is mirrored about.
         Default: none.
+    curvature_shear_powers : list of int, optional
+        The powers of that polynomial; with an odd one, the polynomial is in
+        ``|s|`` (still even in ``s``), which also takes out the ridge's slope
+        and skew on either side of the boundary. Overridden by a
+        ``curvature_shear_powers`` key of the flow config. Default: ``[2,
+        4]``.
     mode_shift : list of str, optional
         Parameters in which each group element's canonical points are
         standardised about their own centre, ``mean + d_g`` (see
@@ -2445,6 +2577,11 @@ def make_group_mixture_flow(
         circular_standardisation
     )
     CustomGroupMixtureFlowModel.curvature_shear = curvature_shear
+    CustomGroupMixtureFlowModel.curvature_shear_powers = (
+        [int(p) for p in curvature_shear_powers]
+        if curvature_shear_powers is not None
+        else None
+    )
     CustomGroupMixtureFlowModel.mode_shift = (
         list(mode_shift) if mode_shift else None
     )
