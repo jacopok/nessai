@@ -993,10 +993,13 @@ class NestedSampler(BaseNestedSampler):
         self.state.increment(worst["logL"], stretch=self._clip_stretch())
         self.nested_samples.append(worst)
 
+        # the live points' prior volume from the evidence's own steps (each
+        # with its iteration's nlive: the same as iteration / nlive, a step
+        # later, unless nlive changed during the run)
         self.condition = (
             np.logaddexp(
                 self.state.logZ,
-                self.logLmax - self.iteration / float(self.nlive),
+                self.logLmax + self.state.logw,
             )
             - self.state.logZ
         )
