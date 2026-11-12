@@ -77,6 +77,21 @@ first pool costs more per iteration than the flow it replaced, the reset is
 discarded: the previous flow is restored and trained warm, and its lineage
 continues. The same check applies to resets chosen by ``allow_reset``.
 
+Guard on a training
+-------------------
+A training can leave the flow worse than it found it (few points in a part
+of the proposal, a change of what its parts cover). With ``training_guard``
+the sampler measures, before and after each training and on the same live
+points, the log prior mass of the region the pool is drawn from (no
+likelihood is evaluated: ``FlowProposal.log_support_mass``). The acceptance
+is the live points' prior volume over that mass, so its rise is the fall of
+the log-acceptance. A training that raises it by more than
+``guard_tolerance`` is discarded: the flow and the state of the proposal are
+restored, the running episode goes on, and the level the discarded flow
+would have had enters the prediction for a fresh flow, so that the next
+training waits until the kept flow has decayed to it. The training cost is
+paid either way and is recorded.
+
 Uncertainties
 -------------
 * The acceptance of the current flow is described by a Gaussian posterior on
@@ -502,6 +517,17 @@ class RetrainDecision:
         log) over its first pool.
     reset_tolerance : float
         See ``reset_rollback``.
+    training_guard : bool
+        Discard a training after which the pool is drawn from a larger
+        prior mass than before it (see the module's "Guard on a training"
+        section). Needs a proposal that can measure it; otherwise nothing
+        is done.
+    guard_tolerance : float
+        Rise of the log prior mass above which a training is discarded.
+    guard_pilot : int
+        Points per pilot pool of the measurement.
+    guard_rounds : int
+        Pilot pools per measurement (the last is measured).
     """
 
     # Prior on the slope: acceptance tracks the prior volume, k = 1 / nlive
@@ -547,6 +573,15 @@ class RetrainDecision:
     """Window (x nlive iterations) for the trend of the cost per iteration"""
     max_cost_growth = 3.0
     """Cap on the log growth of the cost per iteration over the horizon"""
+    # On for objects pickled before the option existed: a resumed run is
+    # guarded too
+    training_guard = True
+    guard_tolerance = 0.1
+    guard_pilot = 5000
+    guard_rounds = 3
+    guard_level_sd = 0.1
+    """Uncertainty of the level of a discarded flow"""
+    _rejected = ()
     rollback_next = False
     _attempt_next = None
     _drop_anchor = -np.inf
@@ -568,8 +603,17 @@ class RetrainDecision:
         reset_window=1.0,
         reset_rollback=True,
         reset_tolerance=0.0,
+        training_guard=True,
+        guard_tolerance=0.1,
+        guard_pilot=5000,
+        guard_rounds=3,
     ):
         self.nlive = nlive
+        self.training_guard = training_guard
+        self.guard_tolerance = guard_tolerance
+        self.guard_pilot = guard_pilot
+        self.guard_rounds = guard_rounds
+        self._rejected = []
         self.cost = RetrainCostModel(costs)
         self.history_length = history_length
         self.bin_size = bin_size or max(10, nlive // 20)
@@ -630,6 +674,55 @@ class RetrainDecision:
         self._attempt_next = None
         self.rollback_next = False
         self.episodes.append(ep)
+
+    def guard_rejects(self, log_mass_before, log_mass_after):
+        """Whether a training is to be discarded: the log prior mass the
+        pool is drawn from, before and after it (None: not measured)."""
+        if (
+            not self.training_guard
+            or log_mass_before is None
+            or log_mass_after is None
+        ):
+            return False
+        return bool(log_mass_after - log_mass_before > self.guard_tolerance)
+
+    def record_rejected_training(self, iteration, excess):
+        """Record a training discarded by the guard: the flow it produced
+        would have had a log-acceptance ``excess`` below that of the flow
+        that is kept. The running episode goes on."""
+        ep = self.current
+        self.reset_next = False
+        self.rollback_next = False
+        self._attempt_next = None
+        self.next_poolsize = None
+        if ep is None:
+            return
+        s = len(ep.counts)
+        level, var = np.nan, np.nan
+        if s:
+            mean, cov = self.current_fit()
+            x = np.array([1.0, s])
+            level = float(x @ mean) - float(excess)
+            var = float(max(x @ cov @ x, 0.0)) + self.guard_level_sd**2
+            if not isinstance(self._rejected, list):
+                self._rejected = []
+            self._rejected.append((iteration, level, var))
+        self._log(
+            iteration,
+            s,
+            False,
+            reason="guard",
+            excess=float(excess),
+            rejected_log_a=level,
+        )
+        logger.info(
+            "Training at it %d discarded: the pool would be drawn from a "
+            "prior mass %.2f larger in log (acceptance x%.2f); keeping the "
+            "previous flow",
+            iteration,
+            excess,
+            np.exp(-excess),
+        )
 
     def record_training_time(self, seconds, epochs, n_train):
         if epochs is not None:
@@ -724,6 +817,14 @@ class RetrainDecision:
             ]
             if rows:
                 break
+        if include_current and rows and self._rejected:
+            # trainings discarded by the guard: what a fresh flow would have
+            # been at those iterations
+            since = self.episodes[start].start if self.episodes else 0
+            rows = sorted(
+                rows + [r for r in self._rejected if r[0] > since],
+                key=lambda r: r[0],
+            )
         return rows
 
     def _predict_level(self, rows, at):

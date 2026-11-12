@@ -1937,32 +1937,40 @@ class NestedSampler(BaseNestedSampler):
         proposal = region.proposal
         decision = region.retrain_decision
         region.completed_training = False
-        self._region_flow_reset(region)
         training_data = region.live_points.copy()
         proposal.current_live_points = region.live_points
         if self.memory:
             extra = self._region_memory(region)
             if len(extra):
                 training_data = np.concatenate([training_data, extra])
-        reset = proposal.training_count == 0 or (
-            decision is not None and decision.reset_next
-        )
         st = datetime.datetime.now()
-        proposal.train(training_data)
+        kept, reset = self._guarded_train(
+            proposal,
+            decision,
+            training_data,
+            lambda: self._region_flow_reset(region),
+            region.live_points[0],
+            region.iterations,
+            region=region,
+        )
         dt = datetime.datetime.now() - st
         self.training_time += dt
-        self.history["training_iterations"].append(self.iteration)
-        region.training_iterations.append(region.iterations)
+        if kept:
+            self.history["training_iterations"].append(self.iteration)
+            region.training_iterations.append(region.iterations)
         if decision is not None:
             epochs = getattr(proposal, "last_training_epochs", None)
             n_train = len(training_data)
             decision.record_training_time(dt.total_seconds(), epochs, n_train)
-            decision.start_episode(region.iterations, reset, epochs, n_train)
-            region._retrain_snapshot = (
-                region.time,
-                region.likelihood_time,
-                region.likelihood_evaluations,
-            )
+            if kept:
+                decision.start_episode(
+                    region.iterations, reset, epochs, n_train
+                )
+                region._retrain_snapshot = (
+                    region.time,
+                    region.likelihood_time,
+                    region.likelihood_evaluations,
+                )
         region.block_iteration = 0
         region.block_acceptance = 0.0
         region.completed_training = True
@@ -2272,6 +2280,191 @@ class NestedSampler(BaseNestedSampler):
             realign()
         logger.debug("Restored the flow from before the reset")
 
+    #: Attributes of a proposal set by a training (besides the flow and the
+    #: reparameterisations), kept so a training can be discarded.
+    _training_state = (
+        "training_data",
+        "training_data_prime",
+        "training_count",
+        "last_training_history",
+        "last_training_epochs",
+        "latent_distortion_params",
+        "branch_weights_params",
+        "populated",
+    )
+
+    def _training_snapshot(self, proposal):
+        """Copy of what a training changes in a proposal: the flow, its
+        optimiser, the reparameterisations and :attr:`_training_state`, and
+        what the proposal's ``_shared_training_state`` returns (given back to
+        its ``_restore_shared_training_state``). With a mixture proposal the
+        secondary's are kept too."""
+        saved = []
+        for p in (proposal, getattr(proposal, "secondary", None)):
+            flow = getattr(p, "flow", None)
+            if flow is None or not hasattr(flow, "model"):
+                continue
+            # shared with the rest of the sampler: not to be copied
+            memo = {
+                id(o): o
+                for o in (getattr(p, "model", None), getattr(p, "rng", None))
+                if o is not None
+            }
+            objects = deepcopy(
+                (
+                    flow.model,
+                    getattr(flow, "_optimiser", None),
+                    getattr(p, "_reparameterisation", None),
+                ),
+                memo,
+            )
+            missing = object()
+            attrs = {
+                k: copy(getattr(p, k, missing)) for k in self._training_state
+            }
+            # objects whose deep copy is the object itself
+            shared = getattr(p, "_shared_training_state", None)
+            shared = shared() if callable(shared) else None
+            saved.append((p, flow, objects, attrs, missing, shared))
+        return saved
+
+    def _restore_training_snapshot(self, saved):
+        """Put back the state of :meth:`_training_snapshot` (which is used
+        up: take another to restore twice)."""
+        for p, flow, objects, attrs, missing, shared in saved:
+            model, optimiser, reparam = objects
+            if shared is not None:
+                p._restore_shared_training_state(shared)
+            flow.model = model
+            flow._optimiser = (
+                optimiser if optimiser is not None else flow.get_optimiser()
+            )
+            if reparam is not None:
+                p._reparameterisation = reparam
+            for k, v in attrs.items():
+                if v is missing:
+                    p.__dict__.pop(k, None)
+                else:
+                    setattr(p, k, v)
+            for name in (
+                "_refresh_group_coordinate_bridge",
+                "_realign_prime_space_action",
+            ):
+                refresh = getattr(p, name, None)
+                if callable(refresh):
+                    refresh()
+            # the weights on disk are those of the discarded training
+            weights_file = getattr(flow, "weights_file", None)
+            if weights_file is not None:
+                flow.save_weights(weights_file)
+
+    def _guard_log_mass(self, proposal, decision, worst_point, rounds=None):
+        """The guard's measure of a flow, see
+        :meth:`FlowProposal.log_support_mass` (None if not available)."""
+        try:
+            return proposal.log_support_mass(
+                worst_point,
+                n_samples=decision.guard_pilot,
+                rounds=decision.guard_rounds if rounds is None else rounds,
+            )
+        except Exception as e:
+            logger.warning("Training guard: pilot pool failed (%s)", e)
+            return None
+
+    def _guarded_train(
+        self,
+        proposal,
+        decision,
+        training_data,
+        flow_reset,
+        worst_point,
+        iteration,
+        region=None,
+    ):
+        """Train a proposal (``flow_reset`` first: the scheduled reset or
+        rollback of its flow), and discard the training if it widened the
+        region the pool is drawn from (``training_guard`` of
+        :class:`RetrainDecision`): the proposal is then as it was before.
+
+        A discarded training that came with a reset of the flow, or with a
+        change the flow reports (``structure_changed``: e.g. an expert of a
+        mixture reset, the border between experts moved) is repeated once
+        without those (``hold_structure``), from the flow as it was.
+
+        Returns
+        -------
+        kept : bool
+            Whether the proposal has a new training.
+        reset : bool
+            Whether that training started from a reset flow.
+        """
+        reset = proposal.training_count == 0 or (
+            decision is not None and decision.reset_next
+        )
+        guard = (
+            decision is not None
+            and getattr(decision, "training_guard", False)
+            and proposal.training_count > 0
+            and hasattr(proposal, "log_support_mass")
+        )
+        if guard and decision.rollback_next:
+            # the flow from before the reset comes back first: it is the
+            # one a training is compared with
+            flow_reset()
+            flow_reset = None
+        before = snapshot = None
+        if guard:
+            # one round: this flow's pool-driven state has settled
+            before = self._guard_log_mass(
+                proposal, decision, worst_point, rounds=1
+            )
+            if before is not None:
+                snapshot = self._training_snapshot(proposal)
+        if flow_reset is not None:
+            flow_reset()
+        proposal.train(training_data)
+        if snapshot is None:
+            return True, reset
+        after = self._guard_log_mass(proposal, decision, worst_point)
+        logger.debug(
+            "Training guard at it %d: log prior mass of the pool's region "
+            "%.2f -> %s",
+            iteration,
+            before,
+            after,
+        )
+        if not decision.guard_rejects(before, after):
+            return True, reset
+        model = getattr(getattr(proposal, "flow", None), "model", None)
+        structural = reset or bool(getattr(model, "structure_changed", False))
+        self._restore_training_snapshot(snapshot)
+        if region is None:
+            self._rollback_flow = None
+        else:
+            getattr(self, "_region_rollback", {}).pop(region.label, None)
+        if structural:
+            logger.info(
+                "Training at it %d (with a reset or a change of the flow's "
+                "structure) widened the pool's region by %.2f (log): "
+                "discarded, training again without the change",
+                iteration,
+                after - before,
+            )
+            snapshot = self._training_snapshot(proposal)
+            model = getattr(getattr(proposal, "flow", None), "model", None)
+            if hasattr(model, "hold_structure"):
+                model.hold_structure = True
+            proposal.train(training_data)
+            after = self._guard_log_mass(proposal, decision, worst_point)
+            if not decision.guard_rejects(before, after):
+                decision.reset_next = False
+                decision._attempt_next = None
+                return True, False
+            self._restore_training_snapshot(snapshot)
+        decision.record_rejected_training(iteration, after - before)
+        proposal.max_next_poolsize = None
+        return False, False
+
     def train_proposal(self, force=False):
         """
         Try to train the proposal. Proposal will not train if cooldown is not
@@ -2286,7 +2479,6 @@ class NestedSampler(BaseNestedSampler):
             logger.debug("Not training, still cooling down!")
         else:
             self.completed_training = False
-            self.check_flow_model_reset()
 
             training_data = self.live_points.copy()
             if hasattr(getattr(self, "_flow_proposal", None),
@@ -2297,25 +2489,30 @@ class NestedSampler(BaseNestedSampler):
                     [training_data, self.nested_samples[-self.memory :].copy()]
                 )
 
-            reset = self.proposal.training_count == 0 or (
-                self.retrain_decision is not None
-                and self.retrain_decision.reset_next
-            )
             st = datetime.datetime.now()
-            self.proposal.train(training_data)
+            kept, reset = self._guarded_train(
+                self.proposal,
+                self.retrain_decision,
+                training_data,
+                self.check_flow_model_reset,
+                self.live_points[0],
+                self.iteration,
+            )
             dt = datetime.datetime.now() - st
             self.training_time += dt
-            self.history["training_iterations"].append(self.iteration)
+            if kept:
+                self.history["training_iterations"].append(self.iteration)
             if self.retrain_decision is not None:
                 epochs = getattr(self.proposal, "last_training_epochs", None)
                 n_train = len(training_data)
                 self.retrain_decision.record_training_time(
                     dt.total_seconds(), epochs, n_train
                 )
-                self.retrain_decision.start_episode(
-                    self.iteration, reset, epochs, n_train
-                )
-                self._retrain_snapshot = self._retrain_time_snapshot()
+                if kept:
+                    self.retrain_decision.start_episode(
+                        self.iteration, reset, epochs, n_train
+                    )
+                    self._retrain_snapshot = self._retrain_time_snapshot()
 
             self.block_iteration = 0
             self.block_acceptance = 0.0

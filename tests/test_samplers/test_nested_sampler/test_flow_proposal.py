@@ -5,6 +5,7 @@ training itself.
 """
 
 import datetime
+from functools import partial
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -277,6 +278,9 @@ def test_train_proposal(sampler, wait):
     sampler.block_iteration = 10
     sampler.block_acceptance = 0.5
 
+    sampler.retrain_decision = None
+    sampler._guarded_train = partial(NestedSampler._guarded_train, sampler)
+
     NestedSampler.train_proposal(sampler, force=True)
 
     sampler.check_flow_model_reset.assert_called_once()
@@ -307,6 +311,9 @@ def test_train_proposal_memory(sampler, wait):
     sampler.checkpoint_on_training = True
     sampler.block_iteration = 10
     sampler.block_acceptance = 0.5
+
+    sampler.retrain_decision = None
+    sampler._guarded_train = partial(NestedSampler._guarded_train, sampler)
 
     NestedSampler.train_proposal(sampler, force=True)
 

@@ -789,8 +789,13 @@ class FlowProposal(BaseFlowProposal):
         plot=True,
         r=None,
         max_samples=1_000_000,
+        pilot=False,
     ) -> None:
-        """Populate a pool of samples using staged truncation."""
+        """Populate a pool of samples using staged truncation.
+
+        With ``pilot``, the pool is only drawn: no likelihood is evaluated
+        and nothing is counted (see :meth:`log_support_mass`).
+        """
         st = datetime.datetime.now()
         if not self.initialised:
             raise RuntimeError(
@@ -960,7 +965,7 @@ class FlowProposal(BaseFlowProposal):
             pool_log_excess = pool_log_excess[: len(self.x)]
         self._record_truncation_diagnostics(n_clipped, log_cap)
 
-        if self.adapt_latent_temperature and adapt_full_z:
+        if self.adapt_latent_temperature and adapt_full_z and not pilot:
             full_z = np.concatenate(adapt_full_z)
             r_full = np.sqrt(
                 np.sum(full_z[:, self.latent_real_mask] ** 2, axis=-1)
@@ -983,6 +988,9 @@ class FlowProposal(BaseFlowProposal):
             self._update_latent_temperature(r_full, log_w_full)
 
         self.samples = self.convert_to_samples(self.x, plot=plot)
+        if pilot:
+            self.population_acceptance = n_accepted / max(n_proposed, 1)
+            return
         if self._plot_pool and plot:
             self.plot_pool(self.samples)
 
@@ -1017,6 +1025,70 @@ class FlowProposal(BaseFlowProposal):
         self.populated_count += 1
         self.populated = True
         self._checked_population = False
+
+    #: State of the pool, kept across a pilot population
+    _pool_state = (
+        "x",
+        "samples",
+        "indices",
+        "populated",
+        "population_acceptance",
+        "pool_log_excess",
+        "population_clipped_share",
+        "_population_cap_lost_mass",
+    )
+
+    def log_support_mass(self, worst_point, n_samples=5000, rounds=3):
+        """Log prior mass of the region the pool is drawn from, without a
+        likelihood evaluation.
+
+        With a cap ``c`` on the weights ``w = p / q`` (a log-proposal
+        threshold relative to the prior, in clip mode), a flow draw enters
+        the pool with probability ``min(w, c) / c``, so the share of the
+        draws that do is ``M / c``, with ``M`` the integral of ``min(p, c
+        q)``: the prior mass of the capped support. The pool is spread over
+        that mass, so the acceptance of its points by the likelihood is the
+        live points' prior volume over ``M``: of two flows compared on the
+        same live points, the one with the larger ``M`` is accepted less
+        often, by their ratio.
+
+        ``rounds`` pilot pools of ``n_samples`` points are drawn (anything
+        updated from a pool, such as the draw weights of a mixture, settles
+        over the first ones) and the last is measured. The pool in use, if
+        any, is left as it was.
+
+        Returns
+        -------
+        float or None
+            ``ln M``; None when the truncation sets no cap on the weights
+            (or needs the likelihood), or no pilot point was drawn.
+        """
+        scheme = self._truncation_scheme
+        if scheme.requires_log_likelihood:
+            return None
+        missing = object()
+        state = {k: getattr(self, k, missing) for k in self._pool_state}
+        history = getattr(self, "population_truncation_history", None)
+        n_history = len(history) if history is not None else 0
+        try:
+            for _ in range(max(int(rounds), 1)):
+                self.populate(
+                    worst_point, n_samples=n_samples, plot=False, pilot=True
+                )
+            log_cap = scheme.log_weight_cap
+            acceptance = self.population_acceptance
+            n_drawn = len(self.x) if self.x is not None else 0
+        finally:
+            for k, v in state.items():
+                if v is missing:
+                    self.__dict__.pop(k, None)
+                else:
+                    setattr(self, k, v)
+            if history is not None:
+                del history[n_history:]
+        if not np.isfinite(log_cap) or not n_drawn or not acceptance:
+            return None
+        return float(np.log(acceptance) + log_cap)
 
     def _latent_truncation_radius(self) -> float:
         """Return the hard latent-space truncation radius, or ``inf``.
