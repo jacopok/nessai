@@ -2371,6 +2371,15 @@ class NestedSampler(BaseNestedSampler):
             logger.warning("Training guard: pilot pool failed (%s)", e)
             return None
 
+    @staticmethod
+    def _structure_holders(proposal):
+        """What may report ``structure_changed`` after a training and take
+        ``hold_structure`` before one: the proposal (e.g. a frame its
+        coordinates refer to) and its flow's model (e.g. a mixture's
+        experts)."""
+        model = getattr(getattr(proposal, "flow", None), "model", None)
+        return [o for o in (proposal, model) if o is not None]
+
     def _guarded_train(
         self,
         proposal,
@@ -2387,9 +2396,10 @@ class NestedSampler(BaseNestedSampler):
         :class:`RetrainDecision`): the proposal is then as it was before.
 
         A discarded training that came with a reset of the flow, or with a
-        change the flow reports (``structure_changed``: e.g. an expert of a
-        mixture reset, the border between experts moved) is repeated once
-        without those (``hold_structure``), from the flow as it was.
+        change the flow or the proposal reports (``structure_changed``: e.g.
+        an expert of a mixture reset, the border between experts moved, the
+        frame of the coordinates moved) is repeated once without those
+        (``hold_structure``), from the flow as it was.
 
         Returns
         -------
@@ -2435,8 +2445,10 @@ class NestedSampler(BaseNestedSampler):
         )
         if not decision.guard_rejects(before, after):
             return True, reset
-        model = getattr(getattr(proposal, "flow", None), "model", None)
-        structural = reset or bool(getattr(model, "structure_changed", False))
+        structural = reset or any(
+            getattr(o, "structure_changed", False)
+            for o in self._structure_holders(proposal)
+        )
         self._restore_training_snapshot(snapshot)
         if region is None:
             self._rollback_flow = None
@@ -2451,9 +2463,9 @@ class NestedSampler(BaseNestedSampler):
                 after - before,
             )
             snapshot = self._training_snapshot(proposal)
-            model = getattr(getattr(proposal, "flow", None), "model", None)
-            if hasattr(model, "hold_structure"):
-                model.hold_structure = True
+            for o in self._structure_holders(proposal):
+                if hasattr(o, "hold_structure"):
+                    o.hold_structure = True
             proposal.train(training_data)
             after = self._guard_log_mass(proposal, decision, worst_point)
             if not decision.guard_rejects(before, after):

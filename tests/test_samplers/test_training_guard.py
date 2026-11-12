@@ -172,6 +172,32 @@ def test_guarded_train_retries_without_the_structural_change(rng):
     assert not d._rejected
 
 
+class _FrameProposal(_Proposal):
+    """The structural change is the proposal's own (not its flow's)."""
+
+    structure_changed = False
+    hold_structure = False
+
+    def train(self, x):
+        self.held_frame = getattr(self, "held_frame", [])
+        self.held_frame.append(self.hold_structure)
+        moved = not self.hold_structure
+        self.hold_structure = False
+        super().train(x)
+        self.structure_changed = moved
+
+
+def test_guarded_train_retries_without_the_proposal_s_change(rng):
+    d = make_decision()
+    run_episodes(d, rng, [np.log(0.3)] * 3, 300)
+    p = _FrameProposal([0.7, -0.2])
+    assert _train(_sampler(), p, d) == (True, False)
+    assert p.held_frame == [False, True]
+    assert float(p.flow.model.weight[0, 0]) == pytest.approx(-0.2)
+    assert p.training_count == 2
+    assert not d._rejected
+
+
 def test_guarded_train_retries_a_reset_warm(rng):
     """A scheduled reset whose flow is worse is discarded at once, and the
     flow from before it is trained instead."""
