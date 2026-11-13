@@ -1303,6 +1303,23 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         std[idx] = rms
         return mean, std
 
+    @property
+    def passthrough_features(self):
+        """Base-frame dimensions the base flow passes through untransformed
+        (standard normal by construction: never standardised)."""
+        return list(getattr(self.base_flow, "passthrough_features", None) or [])
+
+    def _pin_passthrough(self, mean, std):
+        idx = self.passthrough_features
+        if not idx:
+            return mean, std
+        idx = torch.as_tensor(idx, dtype=torch.long, device=mean.device)
+        mean = mean.clone()
+        std = std.clone()
+        mean[idx] = 0.0
+        std[idx] = 1.0
+        return mean, std
+
     def _pin_circular(self, mean, std, data):
         # Circular dims are angles on [-pi, pi) for the circular base flow:
         # no standardisation, or the Möbius map's location (the mean
@@ -1368,6 +1385,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         std = c.std(dim=0).clamp_min(self._min_canon_std)
         mean, std = self._pin_reflect(mean, std, c)
         mean, std = self._pin_circular(mean, std, c)
+        mean, std = self._pin_passthrough(mean, std)
 
         if bool(self._canon_seen):
             beta = self._canon_ema
@@ -2834,6 +2852,10 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
     @property
     def circular_features(self):
         return self.experts[0].circular_features
+
+    @property
+    def passthrough_features(self):
+        return self.experts[0].passthrough_features
 
     def set_param_names(self, names):
         for e in self._all_experts():
