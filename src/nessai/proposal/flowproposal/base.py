@@ -120,8 +120,15 @@ class BaseFlowProposal(RejectionProposal):
         use_default_reparameterisations=None,
         reverse_reparameterisations=False,
         map_to_unit_hypercube=False,
+        passthrough_parameters=None,
     ):
         super().__init__(model, rng=rng)
+        #: parameters whose prime parameters pass through the flow
+        #: untransformed with a standard normal base (see
+        #: :func:`~nessai.flows.utils.configure_model`)
+        self.passthrough_parameters = (
+            list(passthrough_parameters) if passthrough_parameters else None
+        )
 
         self._x_dtype = None
         self._x_prime_dtype = None
@@ -381,14 +388,47 @@ class BaseFlowProposal(RejectionProposal):
         features = getattr(model, "circular_features", None)
         if features is None:
             circular = set(self.circular_prime_parameters)
-            return np.array([p not in circular for p in self.prime_parameters])
-        mask = np.ones(self.prime_dims, dtype=bool)
-        mask[list(features)] = False
+            mask = np.array(
+                [p not in circular for p in self.prime_parameters]
+            )
+        else:
+            mask = np.ones(self.prime_dims, dtype=bool)
+            mask[list(features)] = False
+        # pass-through features are standard normal by construction: no
+        # latent temperature, radius or distortion either
+        passthrough = set(self.passthrough_prime_parameters)
+        if passthrough:
+            mask &= np.array([p not in passthrough for p in self.prime_parameters])
         return mask
+
+    @property
+    def passthrough_prime_parameters(self):
+        """The prime parameters of ``passthrough_parameters`` (each a prime
+        parameter itself, or the parameter whose ``{name}_prime`` is)."""
+        names = getattr(self, "passthrough_parameters", None)
+        if not names or self.prime_parameters is None:
+            return []
+        out = []
+        for name in names:
+            if name in self.prime_parameters:
+                out.append(name)
+            elif f"{name}_prime" in self.prime_parameters:
+                out.append(f"{name}_prime")
+            else:
+                raise ValueError(
+                    f"Pass-through parameter {name} is not a prime parameter "
+                    f"(nor is {name}_prime): {self.prime_parameters}"
+                )
+        return out
 
     def update_flow_config(self):
         """Update the flow configuration dictionary."""
         self.flow_config["n_inputs"] = self.prime_dims
+        passthrough = self.passthrough_prime_parameters
+        if passthrough:
+            self.flow_config["passthrough_features"] = [
+                self.prime_parameters.index(p) for p in passthrough
+            ]
         circular = self.circular_prime_parameters
         if circular:
             ftype = str(self.flow_config.get("ftype") or "").lower()

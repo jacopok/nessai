@@ -211,8 +211,40 @@ def get_activation_function(name: str) -> Callable:
 def configure_model(config):
     """
     Setup the flow form a configuration dictionary.
+
+    ``passthrough_features`` (indices into the ``n_inputs`` features): the
+    flow of the config is built on the other features alone, and these pass
+    through it untransformed with a standard normal base
+    (:class:`~nessai.flows.passthrough.PassThroughFlow`);
+    ``circular_features`` are indices into all the features.
     """
     config = copy.deepcopy(config)
+    passthrough = config.pop("passthrough_features", None)
+    if passthrough:
+        from .passthrough import PassThroughFlow
+
+        n = config["n_inputs"]
+        passthrough = sorted(int(i) for i in passthrough)
+        if len(set(passthrough)) != len(passthrough) or not all(
+            0 <= i < n for i in passthrough
+        ):
+            raise ValueError(
+                f"passthrough_features {passthrough} must be distinct "
+                f"indices into the {n} inputs"
+            )
+        keep = [i for i in range(n) if i not in passthrough]
+        if not keep:
+            raise ValueError("passthrough_features leave no inputs to the flow")
+        circular = config.get("circular_features")
+        if circular is not None:
+            lost = sorted(set(int(i) for i in circular) & set(passthrough))
+            if lost:
+                raise ValueError(
+                    f"features {lost} are both circular and pass-through"
+                )
+            config["circular_features"] = [keep.index(int(i)) for i in circular]
+        config["n_inputs"] = len(keep)
+        return PassThroughFlow(configure_model(config), keep, n)
 
     if not isinstance(config["n_inputs"], int):
         raise TypeError("Number of inputs (n_inputs) must be an int")

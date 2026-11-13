@@ -14,6 +14,7 @@ from .base import Reparameterisation
 from .circular import Circular
 from .combined import CombinedReparameterisation
 from .discrete import Dequantise
+from .gaussian_block import GaussianBlock
 from .null import NullReparameterisation
 from .rescale import Rescale, RescaleToBounds, ScaleAndShift
 from .utils import (
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 default_reparameterisations = ReparameterisationDict()
 default_reparameterisations.add_reparameterisation("default", RescaleToBounds)
+default_reparameterisations.add_reparameterisation("gaussian-block", GaussianBlock)
 default_reparameterisations.add_reparameterisation(
     "rescaletobounds", RescaleToBounds
 )
@@ -210,6 +212,7 @@ __all__ = [
     "Circular",
     "CombinedReparameterisation",
     "Dequantise",
+    "GaussianBlock",
     "KnownReparameterisation",
     "NullReparameterisation",
     "Reparameterisation",
