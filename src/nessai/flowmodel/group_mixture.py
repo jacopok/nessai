@@ -4588,13 +4588,14 @@ class GroupFlowProposalMixin:
 
     @torch.no_grad()
     def _log_retrain_summary(self, model, n_samples=2000):
-        """The training round in brief, at INFO; the detail behind each
-        number is logged at DEBUG where it is computed.
+        """The training round in brief: a clustered mixture's number of
+        experts and their weights at INFO, the rest at DEBUG (the detail
+        behind each number is logged at DEBUG where it is computed).
 
-        A clustered mixture gets a header (``k``, the cluster weights and
-        the clustering's ``_retrain_note``, e.g. the diagonal split's gain);
-        then one line per expert: its training points and epochs, for each
-        generator of the group the entropy (bits) of the marginal of the
+        The DEBUG header adds the clustering's ``_retrain_note`` (e.g. the
+        diagonal split's gain); then one line per expert: its training
+        points and epochs, for each generator of the group the entropy
+        (bits) of the marginal of the
         element weights in use and of the expert's own fresh draws, the
         fraction of those draws outside the fundamental domain (discarded
         under truncation), and its ``base_reparam``'s ``_retrain_note``
@@ -4612,11 +4613,11 @@ class GroupFlowProposalMixin:
             head = f"Group mixture: {k} expert{'s' if k != 1 else ''}"
             if k > 1:
                 w = model.cluster_weights[:k].cpu().numpy()
-                head += f", weights {[round(float(v), 2) for v in w]}"
+                head += ", weights " + " / ".join(f"{v:.2f}" for v in w)
+            logger.info(head)
             note = getattr(model, "_retrain_note", None)
             if note:
-                head += f"; {note}"
-            logger.info(head)
+                logger.debug("%s; %s", head, note)
         sizes = getattr(model, "_last_cluster_sizes", None)
         history = getattr(self, "last_training_history", None)
         for j, (tag, e) in enumerate(parts):
@@ -4649,7 +4650,7 @@ class GroupFlowProposalMixin:
                            "_retrain_note", None)
             if note:
                 fields.append(note)
-            logger.info("%s: %s", tag, "; ".join(f for f in fields if f))
+            logger.debug("%s: %s", tag, "; ".join(f for f in fields if f))
             if leak is not None and leak > 0.1:
                 logger.warning(
                     "%s: %.2f of the base flow's draws (latent temperature 1)"

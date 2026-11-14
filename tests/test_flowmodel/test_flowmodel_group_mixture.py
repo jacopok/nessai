@@ -2659,7 +2659,9 @@ def test_generator_entropy_note_is_per_generator(factor_wrapper):
     )
 
 
-def test_retrain_summary_is_one_line_per_expert(caplog):
+def test_retrain_summary_is_one_line_at_info(caplog):
+    """INFO gets the number of experts and their weights; the clustering's
+    note and one line per expert go to DEBUG."""
     w = _k2(_clustered_wrapper(2), (0.7, 0.3))
     w._last_cluster_sizes = [30, 12]
     w._retrain_note = "split note"
@@ -2672,12 +2674,18 @@ def test_retrain_summary_is_one_line_per_expert(caplog):
         prop._log_retrain_summary(w, n_samples=200)
     # (the untrained toy flows may also leak, which warns separately)
     info = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
-    assert info[0] == "Group mixture: 2 experts, weights [0.7, 0.3]; split note"
-    assert info[1].startswith(
+    debug = [
+        r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG
+    ]
+    assert info == ["Group mixture: 2 experts, weights 0.70 / 0.30"]
+    assert debug[0] == (
+        "Group mixture: 2 experts, weights 0.70 / 0.30; split note"
+    )
+    assert debug[1].startswith(
         "  expert 0: 30 pts, 7 epochs (val loss 1.25); weights Z4 "
     )
-    assert info[2].startswith("  expert 1: 12 pts, frozen; weights Z4 ")
-    assert all("own draws" in m and "leakage" in m for m in info[1:3])
+    assert debug[2].startswith("  expert 1: 12 pts, frozen; weights Z4 ")
+    assert all("own draws" in m and "leakage" in m for m in debug[1:3])
     assert "own draws failed" not in caplog.text
 
 

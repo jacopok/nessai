@@ -716,11 +716,11 @@ class RetrainDecision:
             rejected_log_a=level,
         )
         logger.info(
-            "Training at it %d discarded: the pool would be drawn from a "
-            "prior mass %.2f larger in log (acceptance x%.2f); keeping the "
-            "previous flow",
+            "Flow trained at iteration %d discarded: it would cover %.2fx "
+            "the prior volume and lower the acceptance x%.2f; keeping the "
+            "previous one",
             iteration,
-            excess,
+            np.exp(excess),
             np.exp(-excess),
         )
 
@@ -1400,8 +1400,7 @@ class RetrainDecision:
         if "g" not in kwargs:
             if retrain:
                 logger.info(
-                    "Retraining at iteration %d (%d iterations since the "
-                    "last training): %s",
+                    "Retraining at iteration %d (%d since the last): %s",
                     iteration,
                     s,
                     kwargs.get("reason"),
@@ -1455,18 +1454,16 @@ class RetrainDecision:
         )
 
     def format_decision_short(self, d):
-        """The retrain decision in one short line (INFO); the inputs are in
-        :meth:`format_decision` (DEBUG)."""
+        """The retrain decision in one short line (INFO); the rule behind
+        it, its inputs and the next pool size are in :meth:`format_decision`
+        (DEBUG)."""
         action = "Retraining"
         if d.get("reset"):
             action = "Resetting and retraining"
-        pool = ""
-        if d.get("poolsize") is not None:
-            pool = f"; next pool {d['poolsize']}"
         return (
-            f"{action} at it {d['iteration']} ({d['since_training']} since "
-            f"last, {d['reason']} rule): acc {np.exp(d['log_a']):.3g} now vs "
-            f"{np.exp(d['fresh_log_a']):.3g} fresh{pool}"
+            f"{action} at iteration {d['iteration']} ({d['since_training']} "
+            f"since the last): acceptance {np.exp(d['log_a']):.3g}, "
+            f"{np.exp(d['fresh_log_a']):.3g} expected after"
         )
 
     def summary(self):

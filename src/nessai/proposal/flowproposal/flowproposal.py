@@ -1219,7 +1219,7 @@ class FlowProposal(BaseFlowProposal):
             if eff_mid > eff_current:
                 chosen = midpoint
 
-        logger.info(
+        logger.debug(
             "Latent-temperature validation: current=%.4f (eff=%.4f), "
             "candidate=%.4f (eff=%.4f) -> %.4f",
             current,

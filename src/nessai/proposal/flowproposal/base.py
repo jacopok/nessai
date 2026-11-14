@@ -1096,7 +1096,7 @@ class BaseFlowProposal(RejectionProposal):
             self.latent_distortion_history = []
         self.latent_distortion_history.append(info)
         if info.get("accepted"):
-            logger.info(
+            logger.debug(
                 "Latent distortion (%s): held-out threshold gain %.2f nats, "
                 "excluded %.3g; sigma %.2f-%.2f, |mu| <= %.2f (%.1f s)",
                 mode,
@@ -1108,7 +1108,7 @@ class BaseFlowProposal(RejectionProposal):
                 info["time"],
             )
         else:
-            logger.info(
+            logger.debug(
                 "Latent distortion (%s) not used: %s",
                 mode,
                 info.get("reason"),
@@ -1159,7 +1159,7 @@ class BaseFlowProposal(RejectionProposal):
             self.branch_weights_history = []
         self.branch_weights_history.append(info)
         if info.get("accepted"):
-            logger.info(
+            logger.debug(
                 "Branch weights: held-out threshold gain %.2f nats, excluded "
                 "%.3g; |log w / w_in_place| <= %.2f (%.1f s)",
                 info["heldout_gain"],
@@ -1168,7 +1168,7 @@ class BaseFlowProposal(RejectionProposal):
                 info["time"],
             )
         else:
-            logger.info("Branch weights not fitted: %s", info.get("reason"))
+            logger.debug("Branch weights not fitted: %s", info.get("reason"))
 
     def _post_train_diagnostics(self):
         """Hook called immediately after :meth:`FlowModel.train` completes.

@@ -32,6 +32,7 @@ from ..utils import (
     rolling_mean,
 )
 from .base import BaseNestedSampler
+from .progress import estimate_progress, format_progress
 from .retrain import RetrainDecision
 
 #: floor on the clip-compression stretch of a step in -ln X
@@ -334,6 +335,8 @@ class NestedSampler(BaseNestedSampler):
 
         self.resumed = False
         self.condition = np.inf
+        # the last whole -logX at which the progress was logged
+        self._progress_unit = 0
         self.logLmin = -np.inf
         self.logLmax = -np.inf
         self.nested_samples = []
@@ -2844,10 +2847,35 @@ class NestedSampler(BaseNestedSampler):
         ):
             self._plot_partition_diagnostic()
 
+        self._maybe_log_progress()
+
         if self.checkpointing:
             self.checkpoint(periodic=True)
 
         self.proposal.ns_acceptance = self.mean_block_acceptance
+
+    def _maybe_log_progress(self):
+        """Call :meth:`log_progress` when -logX passes a whole number."""
+        x = -self.state.logw
+        if not np.isfinite(x):
+            return
+        unit = int(np.floor(x))
+        last = getattr(self, "_progress_unit", None)
+        if last is None or unit < last:
+            # resumed from a run that predates the progress line
+            self._progress_unit = unit
+        elif unit > last:
+            self._progress_unit = unit
+            self.log_progress()
+
+    def log_progress(self):
+        """Log the current -logX, the -logX at which the run is expected
+        to stop and the sampling time to get there, as the product of its
+        factors (see :mod:`nessai.samplers.progress`)."""
+        try:
+            logger.info(format_progress(estimate_progress(self)))
+        except Exception:
+            logger.debug("Progress estimate failed", exc_info=True)
 
     def check_resume(self):
         """

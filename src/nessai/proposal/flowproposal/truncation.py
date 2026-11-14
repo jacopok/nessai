@@ -949,7 +949,7 @@ class LogLevelThresholdTruncation(BaseTruncationRule):
         if not tightened:
             return
         worst = sorted(tightened.items(), key=lambda kv: -kv[1][0] / kv[1][1])
-        logger.info(
+        logger.debug(
             "Level threshold %.3f: %d piece(s) tightened during the last flow, "
             "%d floor(s) at retrain (pool/live share at the last tightening, "
             "most over-covered first: %s)",

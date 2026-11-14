@@ -417,9 +417,10 @@ def test_retrain_logs_calculation(rng, caplog):
         assert key in full.getMessage()
     assert "reset gain" in full.getMessage()
     assert short.levelno == logging.INFO
-    assert f"etraining at it {it} (" in short.getMessage()
-    assert "rule): acc " in short.getMessage()
-    assert "fresh" in short.getMessage()
+    assert f"etraining at iteration {it} (" in short.getMessage()
+    assert "since the last): acceptance " in short.getMessage()
+    assert "expected after" in short.getMessage()
+    assert "rule" not in short.getMessage()
 
 
 def test_continue_not_logged_at_info(rng, caplog):
