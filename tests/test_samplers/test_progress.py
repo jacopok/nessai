@@ -13,14 +13,14 @@ from nessai.stopping_criteria import ESS, DifferenceLogEvidence
 
 
 def gaussian_run(dims=10, log_l_max=50.0, k=1e3, x_end=80.0, dx=1e-3):
-    """-logX, ln Z and ln Lmax along a run on a Gaussian peak in ``dims``
-    dimensions: ln L = ln Lmax - k X^(2/d)."""
+    """-logX, the threshold ln L, ln Lmax and ln Z along a run on a
+    Gaussian peak in ``dims`` dimensions: ln L = ln Lmax - k X^(2/d)."""
     x = np.arange(0.0, x_end, dx)
     log_l = log_l_max - k * np.exp(-2 * x / dims)
     # Z(x) = int_x^0 L dX, X = e^-x
     log_dz = log_l - x + np.log(-np.expm1(-dx))
     log_z = np.logaddexp.accumulate(log_dz)
-    return x, log_z, np.full_like(x, log_l_max)
+    return x, log_l, np.full_like(x, log_l_max), log_z
 
 
 def true_remaining(x, log_z, log_l_max, x0, tolerance):
@@ -30,34 +30,54 @@ def true_remaining(x, log_z, log_l_max, x0, tolerance):
     return stop - x0
 
 
+def cut(run, x0, every=100):
+    """The run's rows up to -logX ``x0``, one in ``every``."""
+    keep = (run[0] <= x0) & (np.arange(len(run[0])) % every == 0)
+    return tuple(a[keep] for a in run)
+
+
+@pytest.mark.parametrize("dims", [6, 10, 13])
 @pytest.mark.parametrize("x0", [10.0, 20.0, 30.0])
-def test_remaining_log_volume_gaussian(x0):
-    """On a Gaussian peak the extrapolation, before ``SCALE``, finds the stop
-    to within a grid step."""
-    x, log_z, log_l_max = gaussian_run()
-    keep = x <= x0
-    got = progress.remaining_log_volume(
-        x[keep][::100], log_z[keep][::100], log_l_max[keep][::100], 0.1
-    )
-    want = true_remaining(x, log_z, log_l_max[0], x0, 0.1)
-    assert got / progress.SCALE == pytest.approx(want, abs=2 * progress.STEP)
+def test_remaining_log_volume_gaussian(x0, dims):
+    """On a Gaussian peak the closed form finds the stop
+    and the fit the peak's dimension."""
+    run = gaussian_run(dims=dims)
+    got, dimension = progress.remaining_log_volume(*cut(run, x0), 0.1)
+    want = true_remaining(run[0], run[3], run[2][0], x0, 0.1)
+    assert dimension == pytest.approx(dims, rel=1e-6)
+    assert got == pytest.approx(want, abs=0.2)
+
+
+def test_remaining_log_volume_near_the_end():
+    """With the posterior bulk behind (Delta_0 < D/2) the incomplete gamma
+    and the evidence so far keep the stop right."""
+    run = gaussian_run()
+    want = true_remaining(run[0], run[3], run[2][0], 45.0, 0.1)
+    got, _ = progress.remaining_log_volume(*cut(run, 45.0), 0.1)
+    assert got == pytest.approx(want, abs=0.2)
 
 
 def test_remaining_log_volume_too_early():
-    x, log_z, log_l_max = gaussian_run()
-    keep = x < progress.FIT_SPAN - 0.5
-    assert np.isnan(
-        progress.remaining_log_volume(
-            x[keep], log_z[keep], log_l_max[keep], 0.1
-        )
+    run = gaussian_run()
+    got, dimension = progress.remaining_log_volume(
+        *cut(run, progress.FIT_SPAN - 0.5), 0.1
     )
+    assert np.isnan(got) and np.isnan(dimension)
+
+
+def test_remaining_log_volume_not_rising():
+    """A threshold that does not approach Lmax gives no estimate."""
+    x = np.linspace(0, 10, 101)
+    flat = np.full_like(x, -5.0)
+    got, _ = progress.remaining_log_volume(x, flat, flat + 3, flat, 0.1)
+    assert np.isnan(got)
 
 
 def make_sampler(x0, criterion=None, rate=(0.01, 0.005)):
     """A stand-in sampler at -logX = ``x0`` on a Gaussian run with nlive
     1000, acceptance ``rate[0]`` and ``rate[1]`` s per evaluation."""
     nlive = 1000
-    x, log_z, log_l_max = gaussian_run()
+    x, log_l, log_l_max, log_z = gaussian_run()
     keep = (x <= x0) & (np.arange(len(x)) % 100 == 0)
     its = np.round(x[keep] * nlive).astype(int)
     evals = its / rate[0]
@@ -67,6 +87,7 @@ def make_sampler(x0, criterion=None, rate=(0.01, 0.005)):
         history={
             "iterations": list(its),
             "logZ": list(log_z[keep]),
+            "min_log_likelihood": list(log_l[keep]),
             "max_log_likelihood": list(log_l_max[keep]),
             "sampling_time": list(evals * rate[1]),
             "likelihood_evaluations": list(evals),
@@ -108,6 +129,7 @@ def test_format_progress_with_estimate():
     p = progress.estimate_progress(make_sampler(20.0))
     line = progress.format_progress(p)
     assert line.startswith("Progress: -logX 20.0/~")
+    assert f"(D {p['dimension']:.1f}), ETA" in line
     assert f"ETA {progress.format_duration(p['seconds'])} = " in line
     assert "= 5 ms/eval x 100 eval/it x " in line
     assert line.endswith(" it")
@@ -188,25 +210,19 @@ def test_estimate_progress_falls_back_without_a_model():
     assert p["evaluations_per_iteration"] == pytest.approx(100)
 
 
-def test_remaining_log_volume_large_evidence_steps():
-    """Early on ln Z grows by thousands per step: no overflow."""
-    x, log_z, log_l_max = gaussian_run(log_l_max=1e5, k=1e5)
-    keep = x <= 10.0
-    r = progress.remaining_log_volume(
-        x[keep][::100], log_z[keep][::100], log_l_max[keep][::100], 0.1
-    )
-    assert np.isfinite(r)
-
-
 def test_remaining_log_volume_capped_dimension():
     """A local dimension above ``max_dimension`` is capped, which brings
     the end closer; a cap above it changes nothing."""
-    x, log_z, log_l_max = gaussian_run(dims=30)
-    keep = x <= 20.0
-    args = (x[keep][::100], log_z[keep][::100], log_l_max[keep][::100], 0.1)
-    free = progress.remaining_log_volume(*args)
-    assert progress.remaining_log_volume(*args, max_dimension=10) < free
-    assert progress.remaining_log_volume(*args, max_dimension=60) == free
+    args = (*cut(gaussian_run(dims=30), 20.0), 0.1)
+    free, dimension = progress.remaining_log_volume(*args)
+    capped, capped_dimension = progress.remaining_log_volume(
+        *args, max_dimension=10
+    )
+    assert capped < free and capped_dimension == 10
+    assert progress.remaining_log_volume(*args, max_dimension=60) == (
+        free,
+        dimension,
+    )
 
 
 def test_estimate_progress_caps_at_the_sampled_parameters():
