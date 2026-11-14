@@ -335,8 +335,6 @@ class NestedSampler(BaseNestedSampler):
 
         self.resumed = False
         self.condition = np.inf
-        # the last whole -logX at which the progress was logged
-        self._progress_unit = 0
         self.logLmin = -np.inf
         self.logLmax = -np.inf
         self.nested_samples = []
@@ -1977,6 +1975,7 @@ class NestedSampler(BaseNestedSampler):
         region.block_iteration = 0
         region.block_acceptance = 0.0
         region.completed_training = True
+        self.log_progress()
         if self.checkpoint_on_training and not self._splitting:
             # after the iteration: a checkpoint between the kill and its
             # replacement would count the dead point twice on resume
@@ -2532,6 +2531,7 @@ class NestedSampler(BaseNestedSampler):
             self.block_iteration = 0
             self.block_acceptance = 0.0
             self.completed_training = True
+            self.log_progress()
             if self.checkpoint_on_training:
                 # forced: a periodic checkpoint is throttled by
                 # checkpoint_interval, so the resume file would still lag
@@ -2847,26 +2847,10 @@ class NestedSampler(BaseNestedSampler):
         ):
             self._plot_partition_diagnostic()
 
-        self._maybe_log_progress()
-
         if self.checkpointing:
             self.checkpoint(periodic=True)
 
         self.proposal.ns_acceptance = self.mean_block_acceptance
-
-    def _maybe_log_progress(self):
-        """Call :meth:`log_progress` when -logX passes a whole number."""
-        x = -self.state.logw
-        if not np.isfinite(x):
-            return
-        unit = int(np.floor(x))
-        last = getattr(self, "_progress_unit", None)
-        if last is None or unit < last:
-            # resumed from a run that predates the progress line
-            self._progress_unit = unit
-        elif unit > last:
-            self._progress_unit = unit
-            self.log_progress()
 
     def log_progress(self):
         """Log the current -logX, the -logX at which the run is expected

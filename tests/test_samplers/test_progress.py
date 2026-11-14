@@ -107,7 +107,7 @@ def test_estimate_progress_no_history():
 def test_format_progress_with_estimate():
     p = progress.estimate_progress(make_sampler(20.0))
     line = progress.format_progress(p)
-    assert line.startswith("Progress: -logX 20/~")
+    assert line.startswith("Progress: -logX 20.0/~")
     assert f"ETA {progress.format_duration(p['seconds'])} = " in line
     assert "= 5 ms/eval x 100 eval/it x " in line
     assert line.endswith(" it")
@@ -116,7 +116,7 @@ def test_format_progress_with_estimate():
 @pytest.mark.parametrize(
     "x0, criterion, expected",
     [
-        (3.0, None, "no ETA (before -logX 4)"),
+        (3.0, None, "no ETA (before -logX 4.0)"),
         (20.0, ESS(), "no ETA (needs the dlogZ stop)"),
     ],
 )
@@ -126,7 +126,7 @@ def test_format_progress_without_estimate(x0, criterion, expected):
     )
     assert (
         line
-        == f"Progress: -logX {x0:.0f}, 5 ms/eval x 100 eval/it; {expected}"
+        == f"Progress: -logX {x0:.1f}, 5 ms/eval x 100 eval/it; {expected}"
     )
 
 
@@ -153,28 +153,13 @@ def test_format_duration(seconds, expected):
     assert progress.format_duration(seconds) == expected
 
 
-@pytest.mark.parametrize(
-    "last, x, logged",
-    [(3, 3.9, False), (3, 4.1, True), (None, 7.5, False), (9, 7.5, False)],
-)
-def test_maybe_log_progress(last, x, logged):
-    """The progress is logged when -logX passes a whole number; a resumed
-    run without the counter (``None``) or behind it starts counting."""
-    sampler = MagicMock(spec=NestedSampler)
-    sampler.state = SimpleNamespace(logw=-x)
-    sampler._progress_unit = last
-    NestedSampler._maybe_log_progress(sampler)
-    assert sampler.log_progress.called is logged
-    assert sampler._progress_unit == int(np.floor(x))
-
-
 def test_log_progress_logs_one_line(caplog):
     sampler = make_sampler(20.0)
     with caplog.at_level(logging.INFO, logger="nessai.samplers.nestedsampler"):
         NestedSampler.log_progress(sampler)
     lines = [r.getMessage() for r in caplog.records]
     assert len(lines) == 1
-    assert lines[0].startswith("Progress: -logX 20/~")
+    assert lines[0].startswith("Progress: -logX 20.0/~")
 
 
 def test_estimate_progress_uses_the_retrain_model():

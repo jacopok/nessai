@@ -286,6 +286,8 @@ def test_train_proposal(sampler, wait):
     sampler.check_flow_model_reset.assert_called_once()
     sampler.proposal.train.assert_called_once()
     sampler.checkpoint.assert_called_once_with(periodic=True, force=True)
+    # the progress line follows each training
+    sampler.log_progress.assert_called_once()
 
     assert sampler.history["training_iterations"] == [100]
     assert sampler.training_time.total_seconds() > 0

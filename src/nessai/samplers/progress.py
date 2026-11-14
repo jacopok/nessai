@@ -1,8 +1,8 @@
 """How far a nested sampling run has to go.
 
 :class:`~nessai.samplers.nestedsampler.NestedSampler` logs a progress line
-each time -logX (X the prior volume inside the live points) passes a whole
-number: the -logX at which the run is expected to stop and the time to get
+after each training of the flow: -logX (X the prior volume inside the live
+points), the -logX at which the run is expected to stop and the time to get
 there, as the product of its factors.  The assumptions are documented here,
 not in the log.
 
@@ -39,7 +39,7 @@ How long it takes
 
 A logged line reads e.g.::
 
-    Progress: -logX 37/~49, ETA 1 d 14 h = 6.9 ms/eval x 122 eval/it x 60k it
+    Progress: -logX 37.2/~49.3, ETA 1 d 14 h = 6.9 ms/eval x 122 eval/it x 60k it
 """
 
 import math
@@ -248,14 +248,14 @@ def format_progress(p):
         rate = "rate not measured yet"
     if np.isfinite(p["remaining"]):
         return (
-            f"Progress: -logX {x:.0f}/~{x + p['remaining']:.0f}, ETA "
+            f"Progress: -logX {x:.1f}/~{x + p['remaining']:.1f}, ETA "
             f"{format_duration(p['seconds'])} = {rate} x "
             f"{_count(p['iterations'])} it"
         )
     if not p["dlogz_stop"]:
         why = "needs the dlogZ stop"
     elif x < FIT_SPAN:
-        why = f"before -logX {FIT_SPAN:g}"
+        why = f"before -logX {FIT_SPAN:.1f}"
     else:
         why = "irregular logL rise"
-    return f"Progress: -logX {x:.0f}, {rate}; no ETA ({why})"
+    return f"Progress: -logX {x:.1f}, {rate}; no ETA ({why})"
