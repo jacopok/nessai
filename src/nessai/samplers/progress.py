@@ -19,11 +19,23 @@ Where the run stops
 
 How long it takes
     ETA = time/eval x eval/it x iterations left, as logged.  The first two
-    are measured over the last ``RATE_SPAN`` of -logX and assumed to stay:
-    time/eval is the elapsed sampling time (all workers in parallel,
-    training and pool drawing included) per likelihood evaluation, eval/it
-    is 1 / acceptance.  The iterations left are the -logX left times the
-    iterations per unit of -logX.
+    are the long run of the retrain cycle
+    (:meth:`~nessai.samplers.retrain.RetrainDecision.long_run_breakdown`):
+    eval/it is 1 / acceptance averaged over a cycle of the retrain model
+    (the fresh acceptance it predicts now, decaying at its fitted rate
+    until the next training), time/eval the measured wall-clock cost of an
+    evaluation (all workers in parallel), pool drawing and the training
+    spread over the cycle included.  Both are assumed to stay: a later drop
+    of the acceptance is not foreseen.  Without the model (before the flow
+    proposal, in a partitioned run, or before it has fitted a decay) both
+    are measured over the last ``RATE_SPAN`` of -logX instead.  The
+    iterations left are the -logX left times the iterations per unit of
+    -logX over that span.
+
+    A measurement over a short span is no substitute for the model: the
+    likelihood is evaluated a pool at a time, so a span shorter than a few
+    cycles holds a whole number of pools and of trainings, and its
+    eval/it and time/eval jump between reports.
 
 A logged line reads e.g.::
 
@@ -38,9 +50,10 @@ from ..stopping_criteria import DifferenceLogEvidence
 
 #: -logX span over which the rise of the likelihood threshold is fitted.
 FIT_SPAN = 4.0
-#: -logX span over which the acceptance and the time per evaluation are
-#: measured.
-RATE_SPAN = 1.0
+#: -logX span over which the iterations per unit of -logX are measured, and
+#: the acceptance and the time per evaluation when the retrain model does not
+#: provide them.
+RATE_SPAN = 4.0
 #: -logX grid of the fit and of the extrapolation.
 STEP = 0.25
 #: Factor on the extrapolated -logX still to go.  On 19 finished runs (BNS,
@@ -83,12 +96,12 @@ def remaining_log_volume(log_volume, log_z, log_l_max, tolerance):
     # ln of the share of the prior volume one grid step removes
     log_dx = np.log(-np.expm1(-STEP))
     # the threshold over each step from the evidence it added: Z grows by
-    # L * X * (1 - e^-STEP), so ln L = ln(Z_next - Z) - ln(X) - log_dx
+    # L * X * (1 - e^-STEP), so ln L = ln(Z_next - Z) - ln(X) - log_dx, with
+    # ln(Z_next - Z) = z + ln(expm1(dz)) = z + dz + ln(1 - e^-dz) (dz is in
+    # the thousands early on, where expm1 overflows)
+    dz_pos = np.maximum(dz, 1e-300)
     log_l = (
-        z_grid[1:]
-        + np.log(np.expm1(np.maximum(dz, 1e-300)))
-        - log_dx
-        + grid[:-1]
+        z_grid[1:] + dz_pos + np.log(-np.expm1(-dz_pos)) - log_dx + grid[:-1]
     )
     below_peak = log_l_max[-1] - log_l
     ok = (dz > 1e-4) & (below_peak > 0)
@@ -112,11 +125,13 @@ def estimate_progress(sampler):
     history.
 
     Returns a dictionary with ``log_volume`` (the current -logX),
-    ``dlogz_stop`` (whether the run stops on dlogZ), ``remaining`` (the -logX still to go, see :func:`remaining_log_volume`;
-    NaN if it cannot be estimated, and also if the stopping criterion is not
-    dlogZ), ``iterations``, ``acceptance``, ``seconds_per_evaluation`` (both
-    over the last ``RATE_SPAN`` of -logX) and ``seconds`` (the sampling time
-    left).  Quantities that cannot be measured yet are NaN.
+    ``dlogz_stop`` (whether the run stops on dlogZ), ``remaining`` (the
+    -logX still to go, see :func:`remaining_log_volume`; NaN if it cannot
+    be estimated, and also if the stopping criterion is not dlogZ),
+    ``iterations`` (left), ``evaluations_per_iteration``,
+    ``seconds_per_evaluation``, ``from_model`` (whether those two come from
+    the retrain model, see the module's docstring) and ``seconds`` (the
+    sampling time left).  Quantities that cannot be measured yet are NaN.
     """
     dlogz_stop = isinstance(sampler.stopping_criterion, DifferenceLogEvidence)
     out = {
@@ -124,8 +139,9 @@ def estimate_progress(sampler):
         "dlogz_stop": dlogz_stop,
         "remaining": np.nan,
         "iterations": np.nan,
-        "acceptance": np.nan,
+        "evaluations_per_iteration": np.nan,
         "seconds_per_evaluation": np.nan,
+        "from_model": False,
         "seconds": np.nan,
     }
     h = sampler.history or {}
@@ -157,17 +173,33 @@ def estimate_progress(sampler):
     j = min(int(np.searchsorted(x, x[-1] - RATE_SPAN)), n - 2)
     d_it, d_x = its[-1] - its[j], x[-1] - x[j]
     d_evals, d_t = evals[-1] - evals[j], t[-1] - t[j]
-    if d_evals > 0 and d_it > 0:
-        out["acceptance"] = d_it / d_evals
+    model = _model_rate(sampler)
+    if model is not None:
+        out["evaluations_per_iteration"] = model["evaluations_per_iteration"]
+        out["seconds_per_evaluation"] = model["seconds_per_evaluation"]
+        out["from_model"] = True
+    elif d_evals > 0 and d_it > 0:
+        out["evaluations_per_iteration"] = d_evals / d_it
         out["seconds_per_evaluation"] = d_t / d_evals
     if d_x > 0 and np.isfinite(out["remaining"]):
         out["iterations"] = out["remaining"] * d_it / d_x
         out["seconds"] = (
             out["iterations"]
-            / out["acceptance"]
+            * out["evaluations_per_iteration"]
             * out["seconds_per_evaluation"]
         )
     return out
+
+
+def _model_rate(sampler):
+    """The retrain model's long-run breakdown, or None without one (or in a
+    partitioned run, whose regions have their own)."""
+    if getattr(sampler, "regions", None) is not None:
+        return None
+    decision = getattr(sampler, "retrain_decision", None)
+    if decision is None:
+        return None
+    return decision.long_run_breakdown()
 
 
 def format_duration(seconds):
@@ -206,11 +238,11 @@ def format_progress(p):
     per likelihood evaluation, the evaluations per iteration (1 /
     acceptance) and the iterations left."""
     x = p["log_volume"]
-    acc = p["acceptance"]
-    if np.isfinite(acc):
+    epi = p["evaluations_per_iteration"]
+    if np.isfinite(epi):
         rate = (
             f"{format_duration(p['seconds_per_evaluation'])}/eval x "
-            f"{1 / acc:.3g} eval/it"
+            f"{epi:.3g} eval/it"
         )
     else:
         rate = "rate not measured yet"

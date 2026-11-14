@@ -144,6 +144,27 @@ def test_decide_depends_on_training_cost(rng, training):
     assert retrain is (training < 1e-3)
 
 
+def test_long_run_breakdown_matches_the_long_run_rate(rng):
+    """Without the lineage term and with the provided costs, evaluations
+    per iteration x seconds per evaluation is the renewal rate g*."""
+    d = make_decision(lineage_exponent=None)
+    run_episodes(d, rng, [np.log(0.3)] * 5, 500)
+    rate = d.long_run_rate()
+    # the unit costs as provided (the synthetic episodes measure none)
+    d.cost.measured = lambda key: None
+    b = d.long_run_breakdown()
+    assert b["cycle"] == pytest.approx(rate["tau"])
+    assert b["evaluations_per_iteration"] * b[
+        "seconds_per_evaluation"
+    ] == pytest.approx(rate["g"], rel=1e-6)
+    # a cycle averages more evaluations per iteration than a fresh flow
+    assert b["evaluations_per_iteration"] > 1 / rate["a"]
+
+
+def test_long_run_breakdown_without_history():
+    assert make_decision().long_run_breakdown() is None
+
+
 def test_long_run_rate(rng):
     d = make_decision()
     run_episodes(d, rng, [np.log(0.3)] * 5, 500)

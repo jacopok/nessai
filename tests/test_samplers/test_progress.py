@@ -79,7 +79,7 @@ def make_sampler(x0, criterion=None, rate=(0.01, 0.005)):
 def test_estimate_progress():
     p = progress.estimate_progress(make_sampler(20.0))
     assert p["log_volume"] == pytest.approx(20.0, abs=1e-2)
-    assert p["acceptance"] == pytest.approx(0.01)
+    assert p["evaluations_per_iteration"] == pytest.approx(100)
     assert p["seconds_per_evaluation"] == pytest.approx(0.005)
     assert p["iterations"] == pytest.approx(1000 * p["remaining"], rel=1e-2)
     assert p["seconds"] == pytest.approx(
@@ -92,14 +92,16 @@ def test_estimate_progress_other_criterion():
     assert not p["dlogz_stop"]
     assert np.isnan(p["remaining"])
     assert np.isnan(p["seconds"])
-    assert p["acceptance"] == pytest.approx(0.01)
+    assert p["evaluations_per_iteration"] == pytest.approx(100)
 
 
 def test_estimate_progress_no_history():
     s = make_sampler(20.0)
     s.history = None
     p = progress.estimate_progress(s)
-    assert np.isnan(p["remaining"]) and np.isnan(p["acceptance"])
+    assert np.isnan(p["remaining"]) and np.isnan(
+        p["evaluations_per_iteration"]
+    )
 
 
 def test_format_progress_with_estimate():
@@ -173,3 +175,39 @@ def test_log_progress_logs_one_line(caplog):
     lines = [r.getMessage() for r in caplog.records]
     assert len(lines) == 1
     assert lines[0].startswith("Progress: -logX 20/~")
+
+
+def test_estimate_progress_uses_the_retrain_model():
+    """With a retrain model the rate is its long-run cycle, not the
+    measured window."""
+    sampler = make_sampler(20.0)
+    sampler.retrain_decision = MagicMock()
+    sampler.retrain_decision.long_run_breakdown.return_value = {
+        "evaluations_per_iteration": 40.0,
+        "seconds_per_evaluation": 0.002,
+        "cycle": 3000.0,
+    }
+    p = progress.estimate_progress(sampler)
+    assert p["from_model"]
+    assert p["evaluations_per_iteration"] == 40.0
+    assert p["seconds_per_evaluation"] == 0.002
+    assert p["seconds"] == pytest.approx(p["iterations"] * 40.0 * 0.002)
+
+
+def test_estimate_progress_falls_back_without_a_model():
+    sampler = make_sampler(20.0)
+    sampler.retrain_decision = MagicMock()
+    sampler.retrain_decision.long_run_breakdown.return_value = None
+    p = progress.estimate_progress(sampler)
+    assert not p["from_model"]
+    assert p["evaluations_per_iteration"] == pytest.approx(100)
+
+
+def test_remaining_log_volume_large_evidence_steps():
+    """Early on ln Z grows by thousands per step: no overflow."""
+    x, log_z, log_l_max = gaussian_run(log_l_max=1e5, k=1e5)
+    keep = x <= 10.0
+    r = progress.remaining_log_volume(
+        x[keep][::100], log_z[keep][::100], log_l_max[keep][::100], 0.1
+    )
+    assert np.isfinite(r)

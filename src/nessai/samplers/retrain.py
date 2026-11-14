@@ -1095,6 +1095,50 @@ class RetrainDecision:
             best, gain = solve(hi)
         return best | dict(T_train=T, G=gain)
 
+    def long_run_breakdown(self):
+        """The long-run cost of the retrain cycle as likelihood evaluations
+        per iteration and seconds per evaluation, or None if the model has
+        no long-run rate yet (see :meth:`long_run_rate`).
+
+        The cycle is the model's: a fresh acceptance ``a`` decaying as
+        ``a exp(-k s)`` over ``tau`` iterations between trainings, so a
+        cycle averages ``expm1(k tau) / (k tau a)`` pool points per
+        iteration.  The seconds are the measured wall-clock unit costs
+        (the provided ones until a cost is measured): a pool point's
+        likelihood and population, and the training spread over the
+        cycle's evaluations.
+        """
+        rate = self.long_run_rate()
+        if rate is None:
+            return None
+        a, k, tau = rate["a"], rate["k"], rate["tau"]
+        if not (np.isfinite(tau) and tau > 0):
+            return None
+
+        def unit(key):
+            m = self.cost.measured(key)
+            return m if m is not None else self.cost[key]
+
+        like_per_point = getattr(self, "_like_per_point", 1.0)
+        dpp = self._draws_per_point()
+        if self.cost.per_draw and dpp is not None and unit("draw"):
+            population = unit("draw") * dpp
+        else:
+            population = unit("population")
+        like, train = unit("likelihood"), unit("training")
+        if None in (like, population, train):
+            return None
+        points = float(np.expm1(k * tau) / (k * tau * a))
+        evaluations = like_per_point * points
+        seconds = (like_per_point * like + population) * points + (
+            rate["T_train"] / self.cost["training"] * train / tau
+        )
+        return dict(
+            evaluations_per_iteration=evaluations,
+            seconds_per_evaluation=float(seconds / evaluations),
+            cycle=float(tau),
+        )
+
     def current_fit(self):
         """Posterior of (log A, slope) for the current flow."""
         ep = self.current
