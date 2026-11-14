@@ -14,8 +14,13 @@ Where the run stops
     the last ``FIT_SPAN`` of -logX; ln Lmax - ln L is fitted there as an
     exponential in -logX, which is exact for a Gaussian peak (in d
     dimensions ln Lmax - ln L grows as X^(2/d)), and extrapolated until dlogZ
-    is below the tolerance.  Real peaks are wider than Gaussian in the tails
-    the extrapolation covers, so it is lengthened by ``SCALE``.
+    is below the tolerance.  The fitted d (the local dimension
+    2 Delta / (-dlnL/dlnX)) is capped at the number of sampled parameters:
+    early on it is well above it, while a few parameters (chirp mass, time,
+    sky and its modes) are being localised, and the extrapolation would put
+    the end ~2x too far; over the posterior it settles below it.  On past
+    runs the extrapolation fell 10-20% short of the end, so it is lengthened
+    by ``SCALE``.
 
 How long it takes
     ETA = time/eval x eval/it x iterations left, as logged.  The first two
@@ -64,7 +69,9 @@ SCALE = 1.2
 HORIZON = 200.0
 
 
-def remaining_log_volume(log_volume, log_z, log_l_max, tolerance):
+def remaining_log_volume(
+    log_volume, log_z, log_l_max, tolerance, max_dimension=None
+):
     """The -logX still to go before dlogZ is below ``tolerance``.
 
     Parameters
@@ -77,6 +84,10 @@ def remaining_log_volume(log_volume, log_z, log_l_max, tolerance):
         The largest ln L found by those iterations.
     tolerance : float
         The dlogZ at which the run stops.
+    max_dimension : float, optional
+        Upper bound on the dimension of the extrapolated peak (the number of
+        sampled parameters): the fitted local dimension -2 / slope is capped
+        at it, through the current fitted ln Lmax - ln L.
 
     Returns
     -------
@@ -108,6 +119,12 @@ def remaining_log_volume(log_volume, log_z, log_l_max, tolerance):
     if ok.sum() < 3:
         return np.nan
     slope, intercept = np.polyfit(grid[1:][ok], np.log(below_peak[ok]), 1)
+    if max_dimension and slope > -2 / max_dimension:
+        # early on the fit sees the localisation of a few parameters (and
+        # of the sky modes) and a local dimension well above the peak's
+        log_below_now = intercept + slope * x[-1]
+        slope = -2 / max_dimension
+        intercept = log_below_now - slope * x[-1]
     z, xx = log_z[-1], x[-1]
     while xx < x[-1] + HORIZON:
         log_l_step = log_l_max[-1] - np.exp(
@@ -166,8 +183,13 @@ def estimate_progress(sampler):
         return out
 
     if dlogz_stop:
+        names = getattr(getattr(sampler, "model", None), "names", None)
         out["remaining"] = remaining_log_volume(
-            x, log_z, log_l_max, sampler.tolerance
+            x,
+            log_z,
+            log_l_max,
+            sampler.tolerance,
+            max_dimension=len(names) if names else None,
         )
 
     j = min(int(np.searchsorted(x, x[-1] - RATE_SPAN)), n - 2)

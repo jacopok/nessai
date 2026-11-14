@@ -196,3 +196,22 @@ def test_remaining_log_volume_large_evidence_steps():
         x[keep][::100], log_z[keep][::100], log_l_max[keep][::100], 0.1
     )
     assert np.isfinite(r)
+
+
+def test_remaining_log_volume_capped_dimension():
+    """A local dimension above ``max_dimension`` is capped, which brings
+    the end closer; a cap above it changes nothing."""
+    x, log_z, log_l_max = gaussian_run(dims=30)
+    keep = x <= 20.0
+    args = (x[keep][::100], log_z[keep][::100], log_l_max[keep][::100], 0.1)
+    free = progress.remaining_log_volume(*args)
+    assert progress.remaining_log_volume(*args, max_dimension=10) < free
+    assert progress.remaining_log_volume(*args, max_dimension=60) == free
+
+
+def test_estimate_progress_caps_at_the_sampled_parameters():
+    sampler = make_sampler(20.0)
+    sampler.model = SimpleNamespace(names=["a", "b"])
+    capped = progress.estimate_progress(sampler)["remaining"]
+    sampler.model = SimpleNamespace(names=None)
+    assert capped < progress.estimate_progress(sampler)["remaining"]
