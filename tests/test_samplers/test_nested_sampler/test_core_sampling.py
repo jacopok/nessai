@@ -4,6 +4,7 @@ Test the main sampling functions
 """
 
 import logging
+from functools import partial
 from unittest.mock import MagicMock, call
 
 import numpy as np
@@ -43,6 +44,10 @@ def sampler(sampler):
     sampler.rejected = 0
     sampler.block_acceptance = 0.0
     sampler.acceptance_history = []
+    sampler._replacing_log_l = None
+    sampler._resumed_mid_replacement = partial(
+        NestedSampler._resumed_mid_replacement, sampler
+    )
     sampler.info_enabled = True
     sampler.debug_enabled = True
     sampler.log_on_iteration = True
@@ -157,6 +162,58 @@ def test_consume_sample(sampler, live_points):
     assert sampler.acceptance_history == [1.0]
     assert sampler.mean_block_acceptance == 1.0
     assert sampler.insertion_indices == [0]
+
+
+def _replacement(sampler, live_points, log_l=0.5):
+    """``sampler`` set to draw one replacement with ``log_l``, recording
+    the pending dead point's ln L while it is drawn."""
+    sampler.live_points = live_points
+    new_sample = np.squeeze(parameters_to_live_point((log_l,), ["x"]))
+    new_sample["logL"] = log_l
+    pending = []
+
+    def yield_sample(worst):
+        pending.append(sampler._replacing_log_l)
+        yield 1, new_sample
+
+    sampler.yield_sample = yield_sample
+    sampler.insert_live_point = MagicMock(return_value=0)
+    sampler.check_state = MagicMock()
+    return pending
+
+
+def test_consume_sample_marks_the_pending_dead_point(sampler, live_points):
+    """While the replacement is drawn the dead point is marked as counted,
+    and the mark is cleared once it is replaced."""
+    pending = _replacement(sampler, live_points)
+    NestedSampler.consume_sample(sampler)
+    assert pending == [0.0]
+    assert sampler._replacing_log_l is None
+
+
+def test_consume_sample_resumed_mid_replacement(sampler, live_points):
+    """Resumed from a checkpoint written while the replacement was drawn,
+    the dead point is not counted again."""
+    _replacement(sampler, live_points)
+    sampler._replacing_log_l = 0.0
+    sampler.iteration = 7
+    NestedSampler.consume_sample(sampler)
+    sampler.state.increment.assert_not_called()
+    assert sampler.nested_samples == []
+    assert sampler.iteration == 7
+    sampler.insert_live_point.assert_called_once()
+    assert sampler._replacing_log_l is None
+
+
+def test_consume_sample_pending_point_gone(sampler, live_points):
+    """A pending ln L that is no longer the worst live point's (the live
+    points changed since, e.g. by a migration) does not skip the count."""
+    _replacement(sampler, live_points)
+    sampler._replacing_log_l = -1.0
+    NestedSampler.consume_sample(sampler)
+    sampler.state.increment.assert_called_once()
+    assert_structured_arrays_equal(sampler.nested_samples, [live_points[0]])
+    assert sampler.iteration == 1
 
 
 def test_consume_sample_reject(sampler, live_points):

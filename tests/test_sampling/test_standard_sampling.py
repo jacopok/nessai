@@ -817,3 +817,54 @@ def test_sampling_with_checkpoint_callback(integration_model, tmp_path):
     fs.ns.max_iteration = 200
     fs.run()
     assert fs.ns.iteration == 200
+
+
+class _Killed(Exception):
+    pass
+
+
+@pytest.mark.slow_integration_test
+def test_resume_mid_replacement_counts_the_dead_point_once(
+    integration_model, tmp_path, caplog
+):
+    """A run killed after a checkpoint written while a dead point's
+    replacement was drawn (as by the walltime's checkpoint-and-exit)
+    counts that point once on resume: the nested samples and the evidence
+    have it once, and the clip-compression evidence (one term per
+    insertion) lines up."""
+    kwargs = {
+        "output": tmp_path,
+        "nlive": 50,
+        "plot": False,
+        "stopping": 1.0,
+        "seed": 1234,
+        "maximum_uninformed": np.inf,
+        "checkpointing": True,
+    }
+    fs = FlowSampler(integration_model, **kwargs)
+    ns = fs.ns
+    draw = ns.yield_sample
+
+    def yield_sample(worst):
+        if ns.iteration == 30:
+            del ns.yield_sample  # not picklable
+            ns.checkpoint(periodic=True, force=True)
+            raise _Killed
+        return draw(worst)
+
+    ns.yield_sample = yield_sample
+    with pytest.raises(_Killed):
+        fs.run(save=False, plot=False)
+
+    fs = FlowSampler(IntegrationTestModel(), resume=True, **kwargs)
+    assert fs.ns._replacing_log_l is not None
+    with caplog.at_level(logging.WARNING, logger="nessai"):
+        fs.run(save=False, plot=False)
+    assert "non-monotonic" not in caplog.text
+    assert "Clip-compression evidence failed" not in caplog.text
+    log_l = np.asarray(fs.ns.state.logLs[1:])
+    assert np.all(np.diff(log_l) > 0)
+    assert len(fs.ns.nested_samples) == len(log_l)
+    assert fs.ns.clip_compression_log_evidence(False) == pytest.approx(
+        fs.ns.state.logZ, abs=1e-6
+    )

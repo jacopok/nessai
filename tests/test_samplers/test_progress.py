@@ -205,9 +205,47 @@ def test_estimate_progress_falls_back_without_a_model():
     sampler = make_sampler(20.0)
     sampler.retrain_decision = MagicMock()
     sampler.retrain_decision.long_run_breakdown.return_value = None
+    sampler.retrain_decision.episodes = []
     p = progress.estimate_progress(sampler)
     assert not p["from_model"]
     assert p["evaluations_per_iteration"] == pytest.approx(100)
+
+
+def _model_without_rate(sampler, first_training):
+    sampler.retrain_decision = MagicMock()
+    sampler.retrain_decision.long_run_breakdown.return_value = None
+    sampler.retrain_decision.episodes = [SimpleNamespace(start=first_training)]
+
+
+def test_measured_rate_since_the_models_first_training():
+    """Without a long run, the rate is measured only since the model's
+    first training: the evaluations of an earlier proposal are left out."""
+    sampler = make_sampler(20.0)
+    h = sampler.history
+    its = np.asarray(h["iterations"])
+    # 10x the evaluations per iteration before iteration 18000
+    before = its < 18000
+    evals = np.where(
+        before, its * 1000.0, 18000 * 1000.0 + (its - 18000) * 100.0
+    )
+    h["likelihood_evaluations"] = list(evals)
+    h["sampling_time"] = list(evals * 0.005)
+    _model_without_rate(sampler, 18000)
+    p = progress.estimate_progress(sampler)
+    assert p["evaluations_per_iteration"] == pytest.approx(100)
+    assert p["seconds_per_evaluation"] == pytest.approx(0.005)
+
+
+def test_no_rate_right_after_the_history_is_dropped():
+    """Just after the model's history is dropped (the training at a
+    migrated resume) there is no rate to measure yet: the end, no ETA."""
+    sampler = make_sampler(20.0)
+    _model_without_rate(sampler, sampler.history["iterations"][-1])
+    p = progress.estimate_progress(sampler)
+    assert np.isnan(p["evaluations_per_iteration"]) and np.isnan(p["seconds"])
+    line = progress.format_progress(p)
+    assert line.startswith("Progress: -logX 20.0/~")
+    assert line.endswith(" it; no ETA (rate not measured yet)")
 
 
 def test_remaining_log_volume_capped_dimension():

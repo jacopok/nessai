@@ -161,6 +161,23 @@ def test_long_run_breakdown_matches_the_long_run_rate(rng):
     assert b["evaluations_per_iteration"] > 1 / rate["a"]
 
 
+def test_forget_acceptance(rng):
+    """Dropping the acceptance history (a changed proposal) leaves no long
+    run until new trainings are recorded, and keeps the measured costs."""
+    d = make_decision(lineage_exponent=None)
+    run_episodes(d, rng, [np.log(0.3)] * 5, 500)
+    assert d.long_run_rate() is not None
+    cost = d.cost
+    d.cost.totals["likelihood"], d.cost.units["likelihood"] = 2.0, 1000.0
+    d.forget_acceptance()
+    assert d.episodes == [] and d.current is None
+    assert d.long_run_rate() is None and d.long_run_breakdown() is None
+    assert d.cost is cost and d.cost.totals["likelihood"] == 2.0
+    # the new proposal's acceptance, not an average with the old one's
+    run_episodes(d, rng, [np.log(0.03)] * 5, 500)
+    assert d.long_run_rate()["a"] == pytest.approx(0.03, rel=0.2)
+
+
 def test_long_run_breakdown_without_history():
     assert make_decision().long_run_breakdown() is None
 

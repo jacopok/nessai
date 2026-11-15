@@ -970,13 +970,23 @@ class NestedSampler(BaseNestedSampler):
         by :func:`nessai.posterior.compute_weights`."""
         from ..posterior import compute_weights
 
-        terms = getattr(self, "clip_compression_terms", [])
         logL = np.asarray(self.state.logLs[1:], dtype=float)
-        n_dead = len(terms)
+        # once finalise has consumed the live points, the last nlive steps
+        # are theirs, with nlive, nlive - 1, ..., 1 of them left
+        n_final = min(self.nlive, len(logL)) if self.live_points is None else 0
+        n_dead = len(logL) - n_final
         nlive = np.full(len(logL), float(self.nlive))
-        nlive[n_dead:] = np.arange(self.nlive, 0, -1, dtype=float)[
-            : len(logL) - n_dead
-        ]
+        nlive[n_dead:] = np.arange(self.nlive, 0, -1, dtype=float)[:n_final]
+        # one term per insertion, aligned at the end: the dead points of a
+        # resume file older than the terms have none, and those counted
+        # twice by an older resume none of their own
+        recorded = getattr(self, "clip_compression_terms", [])
+        recorded = np.asarray(
+            recorded[max(len(recorded) - n_dead, 0) :], dtype=float
+        )
+        terms = np.zeros(n_dead)
+        if len(recorded):
+            terms[n_dead - len(recorded) :] = recorded
         if apply and n_dead:
             nlive[:n_dead] /= clip_compression_stretches(
                 terms, self.clip_compression_window
@@ -985,30 +995,54 @@ class NestedSampler(BaseNestedSampler):
             logL, nlive, expectation=self.state.expectation
         )[0]
 
+    #: ln L of the dead point whose replacement is being drawn: it is
+    #: already in the evidence and the nested samples (None between
+    #: iterations)
+    _replacing_log_l = None
+
+    def _resumed_mid_replacement(self, log_l):
+        """Whether the dead point with ``log_l`` is the one whose
+        replacement was being drawn when the resume file was written.
+
+        Drawing the replacement (the pool, a training) takes most of an
+        iteration, and a checkpoint can be written in it: periodically, after
+        a training, or on a signal. The dead point is then already counted,
+        and counting it again on resume would add a step of ``1 / nlive`` to
+        -ln X and the point twice to the nested samples. The test is on ln L,
+        so that live points changed since (a migration) count anew.
+        """
+        pending = self._replacing_log_l
+        return pending is not None and float(log_l) == pending
+
     def consume_sample(self):
         """
         Replace a sample for single thread
         """
         worst = self.live_points[0].copy()
         self.logLmin = worst["logL"]
-        self.state.increment(worst["logL"], stretch=self._clip_stretch())
-        self.nested_samples.append(worst)
+        if not self._resumed_mid_replacement(worst["logL"]):
+            self.state.increment(worst["logL"], stretch=self._clip_stretch())
+            self.nested_samples.append(worst)
 
-        # the live points' prior volume from the evidence's own steps (each
-        # with its iteration's nlive: the same as iteration / nlive, a step
-        # later, unless nlive changed during the run)
-        self.condition = (
-            np.logaddexp(
-                self.state.logZ,
-                self.logLmax + self.state.logw,
+            # the live points' prior volume from the evidence's own steps
+            # (each with its iteration's nlive: the same as iteration /
+            # nlive, a step later, unless nlive changed during the run)
+            self.condition = (
+                np.logaddexp(
+                    self.state.logZ,
+                    self.logLmax + self.state.logw,
+                )
+                - self.state.logZ
             )
-            - self.state.logZ
-        )
+            self.iteration += 1
+            self.block_iteration += 1
+            self._replacing_log_l = float(worst["logL"])
+        elif not self.block_iteration:
+            # a training on resume restarted the block
+            self.block_iteration = 1
 
         # Replace the points we just consumed with the next acceptable ones
         # Make sure we are mixing the chains
-        self.iteration += 1
-        self.block_iteration += 1
         count = 0
 
         while True:
@@ -1020,6 +1054,7 @@ class NestedSampler(BaseNestedSampler):
                 # replace worst point with new one
                 proposed["it"] = self.iteration
                 index = self.insert_live_point(proposed)
+                self._replacing_log_l = None
                 self.insertion_indices.append(index)
                 self._record_clip_compression(index)
                 self.accepted += 1
@@ -1704,15 +1739,21 @@ class NestedSampler(BaseNestedSampler):
         self.proposal = region.proposal
         worst = region.live_points[0].copy()
         self.logLmin = float(worst["logL"])
-        self.state.increment(
-            self.logLmin, nlive=region.nlive, region=region.label
-        )
-        self.nested_samples.append(worst)
-        self.nested_regions.append(region.label)
-        self.iteration += 1
-        self.block_iteration += 1
-        region.iterations += 1
-        region.block_iteration += 1
+        if not self._resumed_mid_replacement(self.logLmin):
+            self.state.increment(
+                self.logLmin, nlive=region.nlive, region=region.label
+            )
+            self.nested_samples.append(worst)
+            self.nested_regions.append(region.label)
+            self.iteration += 1
+            self.block_iteration += 1
+            region.iterations += 1
+            region.block_iteration += 1
+            self._replacing_log_l = self.logLmin
+        else:
+            # a training on resume restarted the blocks
+            self.block_iteration = max(self.block_iteration, 1)
+            region.block_iteration = max(region.block_iteration, 1)
 
         before = self._region_clock()
         count, proposed = self._replace_in_region(region, worst)
@@ -1723,6 +1764,7 @@ class NestedSampler(BaseNestedSampler):
         index = np.searchsorted(live["logL"], proposed["logL"])
         live[: index - 1] = live[1:index]
         live[index - 1] = proposed
+        self._replacing_log_l = None
         region.insertion_indices.append(index - 1)
         self.accepted += 1
         region.block_acceptance += 1 / count

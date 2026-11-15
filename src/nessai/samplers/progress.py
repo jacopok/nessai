@@ -45,7 +45,10 @@ How long it takes
     spread over the cycle included.  Both are assumed to stay: a later drop
     of the acceptance is not foreseen.  Without the model (before the flow
     proposal, in a partitioned run, or before it has fitted a decay) both
-    are measured over the last ``RATE_SPAN`` of -logX instead.  The
+    are measured over the last ``RATE_SPAN`` of -logX instead, but not from
+    before the model's first training: after its history is dropped for a
+    changed proposal (a migrated checkpoint), there is no ETA until the new
+    proposal has run for a while.  The
     iterations left are the -logX left times the iterations per unit of
     -logX over that span.
 
@@ -206,14 +209,19 @@ def estimate_progress(sampler):
 
     j = min(int(np.searchsorted(x, x[-1] - RATE_SPAN)), n - 2)
     d_it, d_x = its[-1] - its[j], x[-1] - x[j]
-    d_evals, d_t = evals[-1] - evals[j], t[-1] - t[j]
+    # the measured rate only since the retrain model's first training: with
+    # the model's history dropped (a changed proposal), the old proposal's
+    # evaluations are not this one's
+    k = max(j, int(np.searchsorted(its, _model_start(sampler))))
+    d_evals, d_t = evals[-1] - evals[k], t[-1] - t[k]
+    d_it_rate = its[-1] - its[k]
     model = _model_rate(sampler)
     if model is not None:
         out["evaluations_per_iteration"] = model["evaluations_per_iteration"]
         out["seconds_per_evaluation"] = model["seconds_per_evaluation"]
         out["from_model"] = True
-    elif d_evals > 0 and d_it > 0:
-        out["evaluations_per_iteration"] = d_evals / d_it
+    elif k < n - 1 and d_evals > 0 and d_it_rate > 0:
+        out["evaluations_per_iteration"] = d_evals / d_it_rate
         out["seconds_per_evaluation"] = d_t / d_evals
     if d_x > 0 and np.isfinite(out["remaining"]):
         out["iterations"] = out["remaining"] * d_it / d_x
@@ -225,15 +233,27 @@ def estimate_progress(sampler):
     return out
 
 
-def _model_rate(sampler):
-    """The retrain model's long-run breakdown, or None without one (or in a
+def _decision(sampler):
+    """The sampler's retrain model, or None without one (or in a
     partitioned run, whose regions have their own)."""
     if getattr(sampler, "regions", None) is not None:
         return None
-    decision = getattr(sampler, "retrain_decision", None)
-    if decision is None:
-        return None
-    return decision.long_run_breakdown()
+    return getattr(sampler, "retrain_decision", None)
+
+
+def _model_rate(sampler):
+    """The retrain model's long-run breakdown, or None without one."""
+    decision = _decision(sampler)
+    return None if decision is None else decision.long_run_breakdown()
+
+
+def _model_start(sampler):
+    """The iteration of the retrain model's first recorded training (-inf
+    without a model or a training)."""
+    episodes = getattr(_decision(sampler), "episodes", None)
+    if not isinstance(episodes, list) or not episodes:
+        return -np.inf
+    return episodes[0].start
 
 
 def format_duration(seconds):
@@ -281,10 +301,14 @@ def format_progress(p):
     else:
         rate = "rate not measured yet"
     if np.isfinite(p["remaining"]):
-        return (
+        end = (
             f"Progress: -logX {x:.1f}/~{x + p['remaining']:.1f} "
-            f"(D {p['dimension']:.1f}), ETA "
-            f"{format_duration(p['seconds'])} = {rate} x "
+            f"(D {p['dimension']:.1f})"
+        )
+        if not np.isfinite(epi):
+            return f"{end}, {_count(p['iterations'])} it; no ETA ({rate})"
+        return (
+            f"{end}, ETA {format_duration(p['seconds'])} = {rate} x "
             f"{_count(p['iterations'])} it"
         )
     if not p["dlogz_stop"]:

@@ -1,5 +1,7 @@
 """Tests for the clip-compression term and correction."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from scipy.integrate import quad
@@ -7,6 +9,7 @@ from scipy.integrate import quad
 from nessai.evidence import _NSIntegralState
 from nessai.samplers.nestedsampler import (
     CLIP_COMPRESSION_MIN_STRETCH,
+    NestedSampler,
     clip_compression_stretches,
     clip_compression_term,
 )
@@ -99,3 +102,56 @@ def test_mean_term_is_the_compression_bias(edge):
     err = terms.std() / np.sqrt(terms.size)
     assert (b > 0) == edge
     assert terms.mean() == pytest.approx(b, abs=4 * err + 1e-4)
+
+
+def _finished_run(n_dead, n_terms, nlive=20, term=0.0):
+    """A stand-in finished sampler: ``n_dead`` dead points then the nlive
+    live points in the integrator, ``n_terms`` recorded terms."""
+    state = _NSIntegralState(nlive)
+    log_l = np.linspace(-50, 0, n_dead + nlive)
+    for i, value in enumerate(log_l):
+        state.increment(value, nlive=nlive - max(i - n_dead, 0))
+    state.finalise()
+    return SimpleNamespace(
+        state=state,
+        nlive=nlive,
+        live_points=None,
+        clip_compression_terms=[term] * n_terms,
+        clip_compression_window=nlive,
+    )
+
+
+@pytest.mark.parametrize("missing", [0, 1, 8, 200])
+def test_clip_compression_log_evidence_aligns_the_terms(missing):
+    """Dead points without a term of their own (counted twice by an older
+    resume, or from a resume file older than the terms) do not stop the
+    diagnostic: without the correction it is the run's ln Z."""
+    ns = _finished_run(200, 200 - missing)
+    log_z = NestedSampler.clip_compression_log_evidence(ns, False)
+    assert log_z == pytest.approx(ns.state.logZ, abs=1e-9)
+    assert np.isfinite(NestedSampler.clip_compression_log_evidence(ns, True))
+
+
+def test_clip_compression_log_evidence_before_finalise():
+    """Mid-run (live points not yet consumed) every step is a dead one."""
+    ns = _finished_run(200, 220)
+    ns.live_points = np.zeros(20)
+    log_z = NestedSampler.clip_compression_log_evidence(ns, False)
+    assert np.isfinite(log_z)
+
+
+def test_clip_compression_log_evidence_applies_the_terms_aligned():
+    """Missing terms are the earliest dead points': the recorded ones
+    stretch the last dead points' steps."""
+    from nessai.posterior import compute_weights
+
+    ns = _finished_run(200, 192, term=0.3)
+    log_l = np.asarray(ns.state.logLs[1:])
+    terms = np.r_[np.zeros(8), np.full(192, 0.3)]
+    nlive = np.r_[
+        20 / clip_compression_stretches(terms, 20), np.arange(20, 0, -1)
+    ]
+    want = compute_weights(log_l, nlive, expectation=ns.state.expectation)[0]
+    got = NestedSampler.clip_compression_log_evidence(ns, True)
+    assert got == pytest.approx(want, abs=1e-12)
+    assert got != pytest.approx(ns.state.logZ, abs=1e-3)

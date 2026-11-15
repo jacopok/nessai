@@ -656,6 +656,22 @@ class RetrainDecision:
         """Whether the decision may reset the flow."""
         return bool(self.allow_reset) or self.reset_on_drop is not None
 
+    def forget_acceptance(self):
+        """Drop the acceptance history, keeping the measured unit costs: for
+        a proposal that has changed (e.g. a migrated checkpoint), whose
+        acceptance the old trainings no longer predict. The decision starts
+        over as at the first training of the flow."""
+        self.episodes = []
+        self.log = []
+        self._last = None
+        self._rejected = []
+        self.reset_next = False
+        self.rollback_next = False
+        self._attempt_next = None
+        self._drop_anchor = -np.inf
+        self._horizon = None
+        self.next_poolsize = None
+
     def start_episode(self, iteration, reset, epochs, n_train):
         """Record a training of the flow."""
         if self.current is not None:
