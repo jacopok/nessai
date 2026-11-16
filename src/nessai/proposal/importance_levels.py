@@ -542,7 +542,14 @@ class LevelFlowProposal(Proposal):
         samples = empty_structured_array(len(x), dtype=self.dtype)
         for name in self.model.names:
             samples[name] = u[name]
-        return samples[self.model.in_unit_hypercube(samples)]
+        samples = samples[self.model.in_unit_hypercube(samples)]
+        # Drop the draws whose round trip lands where a marginal prior's
+        # density vanishes (e.g. a Sine prior at 0, an aligned-spin prior at
+        # +-chi_max): there ln q in the hypercube is -inf - -inf, undefined.
+        # The set has measure ~1e-16, so no level's normalisation changes.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_j = self._physical(samples)[1]
+        return samples[np.isfinite(log_j)]
 
     def _draw_level(self, k, n):
         """``n`` unit-hypercube samples from level ``k`` (truncated to the

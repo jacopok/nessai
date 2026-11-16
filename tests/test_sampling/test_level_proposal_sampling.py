@@ -141,6 +141,25 @@ def test_level_proposal_densities_are_normalised(tmp_path):
     assert model.in_unit_hypercube(pts).all()
 
 
+class VanishingEdgeGaussian(UniformGaussian):
+    """A prior whose hypercube Jacobian is -inf near the lower bound of x0,
+    like a Sine prior at 0: draws landing there must be dropped, not given
+    an undefined density."""
+
+    def log_unit_hypercube_jacobian(self, x):
+        log_j = super().log_unit_hypercube_jacobian(x)
+        return np.where(x["x0"] < self.lo + 0.05, -np.inf, log_j)
+
+
+@pytest.mark.slow_integration_test
+def test_level_proposal_drops_vanishing_prior_density(tmp_path):
+    model = VanishingEdgeGaussian([-9.5, 3.0])
+    fs = _run(tmp_path, model, {"x0": "z-score", "x1": "z-score"})
+    pts, log_q = fs.ns.proposal.draw(5000)
+    assert np.isfinite(pts["logQ"]).all() and not np.isnan(log_q).any()
+    assert (model.from_unit_hypercube(pts)["x0"] >= model.lo + 0.05).all()
+
+
 class _Interrupt(Exception):
     pass
 
