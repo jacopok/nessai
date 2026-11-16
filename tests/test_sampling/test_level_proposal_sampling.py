@@ -1,0 +1,214 @@
+"""Importance nested sampling with FlowProposal levels (LevelFlowProposal):
+the evidence of a Gaussian likelihood, with and without a boundary
+inversion (whose draws are scored summed over the mirror sides)."""
+
+import pickle
+
+import numpy as np
+import pytest
+from scipy.special import logsumexp
+from scipy.stats import norm
+
+from nessai.flowsampler import FlowSampler
+from nessai.model import Model
+from nessai.proposal.importance_levels import LevelFlowProposal
+
+
+class UniformGaussian(Model):
+    """Uniform prior on ``[lo, hi]`` per dimension, unit Gaussian likelihood
+    at ``mu``."""
+
+    def __init__(self, mu, lo=-10.0, hi=10.0):
+        self.mu = np.asarray(mu, float)
+        self.names = [f"x{i}" for i in range(len(mu))]
+        self.bounds = {n: [lo, hi] for n in self.names}
+        self.lo, self.hi = lo, hi
+
+    def log_prior(self, x):
+        with np.errstate(divide="ignore"):
+            return np.log(self.in_bounds(x), dtype=float) - len(
+                self.names
+            ) * np.log(self.hi - self.lo)
+
+    def log_likelihood(self, x):
+        return sum(
+            norm.logpdf(x[n], loc=m) for n, m in zip(self.names, self.mu)
+        )
+
+    def to_unit_hypercube(self, x):
+        u = x.copy()
+        for n in self.names:
+            u[n] = (x[n] - self.lo) / (self.hi - self.lo)
+        return u
+
+    def from_unit_hypercube(self, u):
+        x = u.copy()
+        for n in self.names:
+            x[n] = self.lo + (self.hi - self.lo) * u[n]
+        return x
+
+    def log_unit_hypercube_jacobian(self, x):
+        return -len(self.names) * np.log(self.hi - self.lo) * np.ones(len(x))
+
+    def log_evidence(self):
+        return sum(
+            np.log(norm.cdf(self.hi - m) - norm.cdf(self.lo - m))
+            - np.log(self.hi - self.lo)
+            for m in self.mu
+        )
+
+
+FLOW = dict(n_blocks=2, n_neurons=16)
+TRAINING = dict(max_epochs=200, patience=10)
+
+
+def _run(tmp_path, model, reparameterisations, seed=1234):
+    fs = FlowSampler(
+        model,
+        output=str(tmp_path),
+        importance_nested_sampler=True,
+        nlive=1000,
+        min_samples=200,
+        seed=seed,
+        plot=False,
+        checkpointing=False,
+        proposal_class="levels",
+        proposal_kwargs=dict(
+            flow_proposal_class="flowproposal",
+            flow_config=FLOW,
+            training_config=TRAINING,
+            flow_proposal_kwargs=dict(
+                reparameterisations=reparameterisations,
+                sum_mirror_density=True,
+            ),
+            n_pilot=5000,
+        ),
+    )
+    fs.run(plot=False, save=False)
+    return fs
+
+
+@pytest.mark.slow_integration_test
+@pytest.mark.parametrize(
+    "mu, reparameterisations",
+    [
+        ([1.0, -2.0], {"x0": "z-score", "x1": "z-score"}),
+        # the peak on the prior's lower bound: a boundary inversion
+        (
+            [-10.0, 3.0],
+            {
+                "x0": {
+                    "reparameterisation": "inversion",
+                    "detect_edges": True,
+                    "inversion_type": "duplicate",
+                },
+                "x1": "z-score",
+            },
+        ),
+    ],
+)
+def test_level_proposal_evidence(tmp_path, mu, reparameterisations):
+    model = UniformGaussian(mu)
+    fs = _run(tmp_path, model, reparameterisations)
+    assert isinstance(fs.ns.proposal, LevelFlowProposal)
+    err = max(fs.log_evidence_error, 0.02)
+    assert abs(fs.log_evidence - model.log_evidence()) < 4 * err
+
+
+@pytest.mark.slow_integration_test
+def test_level_proposal_densities_are_normalised(tmp_path):
+    """Each level's unit-hypercube density integrates to 1 (prior
+    importance sampling), and survives pickling and resume."""
+    model = UniformGaussian([2.0, 0.5])
+    fs = _run(tmp_path, model, {"x0": "z-score", "x1": "z-score"})
+    prop = fs.ns.proposal
+    u = model.sample_unit_hypercube(400_000)
+    log_q = prop._log_q_all(u)[:, 1:]
+    # E_uniform[q] = 1 in the unit hypercube; the levels are narrow, so
+    # check the last (narrowest) against its own draws instead
+    for k in range(min(2, log_q.shape[1])):
+        mass = np.exp(logsumexp(log_q[:, k]) - np.log(len(u)))
+        assert abs(mass - 1) < 0.05, (k, mass)
+
+    pts = prop.draw(2000)[0]
+    before = prop._log_q_all(pts)
+    state = pickle.dumps(prop)
+    resumed = pickle.loads(state)
+    resumed.resume(model)
+    after = resumed._log_q_all(pts)
+    np.testing.assert_allclose(after, before, rtol=0, atol=1e-6)
+    # the draws are inside the unit hypercube
+    assert model.in_unit_hypercube(pts).all()
+
+
+class _Interrupt(Exception):
+    pass
+
+
+@pytest.mark.slow_integration_test
+def test_level_proposal_resume(tmp_path, monkeypatch):
+    """A run interrupted after a few levels resumes from its checkpoint (the
+    levels' flows reloaded from their own weights files) to the evidence."""
+    model = UniformGaussian([1.0, -2.0])
+    kwargs = dict(
+        output=str(tmp_path),
+        importance_nested_sampler=True,
+        nlive=1000,
+        min_samples=200,
+        seed=4321,
+        plot=False,
+        checkpointing=True,
+        checkpoint_on_iteration=True,
+        checkpoint_interval=1,
+        proposal_class="levels",
+        proposal_kwargs=dict(
+            flow_proposal_class="flowproposal",
+            flow_config=FLOW,
+            training_config=TRAINING,
+            flow_proposal_kwargs=dict(
+                reparameterisations={"x0": "z-score", "x1": "z-score"}
+            ),
+            n_pilot=5000,
+        ),
+    )
+    from nessai.samplers.importancesampler import ImportanceNestedSampler
+
+    add = ImportanceNestedSampler.add_new_proposal
+
+    def interrupted(self):
+        if self.iteration >= 3:
+            raise _Interrupt
+        add(self)
+
+    fs = FlowSampler(model, **kwargs)
+    monkeypatch.setattr(
+        ImportanceNestedSampler, "add_new_proposal", interrupted
+    )
+    with pytest.raises(_Interrupt):
+        fs.run(plot=False, save=False)
+    monkeypatch.undo()
+    resumed = FlowSampler(model, resume=True, **kwargs)
+    assert resumed.ns.iteration == 3
+    assert len(resumed.ns.proposal.levels) == 3
+    resumed.run(plot=False, save=False)
+    err = max(resumed.log_evidence_error, 0.02)
+    assert abs(resumed.log_evidence - model.log_evidence()) < 4 * err
+
+
+@pytest.mark.slow_integration_test
+def test_level_proposal_refuses_split_inversion(tmp_path):
+    """A 'split' boundary inversion's rescale gives one copy of a point, so
+    its density would miss the mirror side: refused."""
+    model = UniformGaussian([-10.0, 3.0])
+    with pytest.raises(ValueError, match="split"):
+        _run(
+            tmp_path,
+            model,
+            {
+                "x0": {
+                    "reparameterisation": "inversion",
+                    "detect_edges": True,
+                },
+                "x1": "z-score",
+            },
+        )

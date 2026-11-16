@@ -325,6 +325,15 @@ class ImportanceNestedSampler(BaseNestedSampler):
     save_log_q : bool
         Boolean that determines if the log_q array is saved when checkpointing.
         If False, this can help reduce the disk usage.
+    proposal_class : Optional[Union[str, type]]
+        The proposal class: ``None`` or ``"flows"`` for
+        :class:`~nessai.proposal.importance.ImportanceFlowProposal`,
+        ``"levels"`` for
+        :class:`~nessai.proposal.importance_levels.LevelFlowProposal`, or a
+        class taking the model and the output directory.
+    proposal_kwargs : Optional[dict]
+        Keyword arguments of the proposal class, on top of the sampler's
+        own proposal keyword arguments.
     """
 
     def __init__(
@@ -374,9 +383,13 @@ class ImportanceNestedSampler(BaseNestedSampler):
         close_pool: bool = False,
         strict_threshold: bool = False,
         draw_iid_live: bool = True,
+        proposal_class: Optional[Union[str, type]] = None,
+        proposal_kwargs: Optional[dict] = None,
         **kwargs: Any,
     ):
         self.add_fields()
+        self.proposal_class = proposal_class
+        self.proposal_kwargs = dict(proposal_kwargs or {})
 
         super().__init__(
             model,
@@ -684,7 +697,19 @@ class ImportanceNestedSampler(BaseNestedSampler):
     def get_proposal(self, subdir: str = "levels", **kwargs):
         """Configure the proposal."""
         output = os.path.join(self.output, subdir, "")
-        proposal = ImportanceFlowProposal(self.model, output, **kwargs)
+        ProposalClass = getattr(self, "proposal_class", None)
+        if ProposalClass in (None, "flows"):
+            ProposalClass = ImportanceFlowProposal
+        elif ProposalClass == "levels":
+            from ..proposal.importance_levels import LevelFlowProposal
+
+            ProposalClass = LevelFlowProposal
+        elif isinstance(ProposalClass, str):
+            raise ValueError(f"Unknown proposal class: {ProposalClass}")
+        kwargs.update(getattr(self, "proposal_kwargs", None) or {})
+        if ProposalClass is not ImportanceFlowProposal:
+            kwargs.setdefault("rng", self.rng)
+        proposal = ProposalClass(self.model, output, **kwargs)
         return proposal
 
     def update_output(self, output: str) -> None:
@@ -1429,12 +1454,24 @@ class ImportanceNestedSampler(BaseNestedSampler):
         self.dlogL = self.logL - self.logL_pre
         self.gradient = self.dlogL / self.dlogX
 
+    def log_prior_volume(self) -> float:
+        """ln X above the current likelihood threshold: the importance
+        weights of all the samples above it over the number of samples."""
+        samples = self.training_samples.samples
+        if samples is None or not len(samples):
+            return 0.0
+        above = samples["logL"] >= self.log_likelihood_threshold
+        if not above.any():
+            return -np.inf
+        return float(logsumexp(samples["logW"][above]) - np.log(samples.size))
+
     def log_state(self):
         """Log the state of the sampler"""
         logger.info(
             f"Update {self.iteration} - "
-            f"log Z: {self.log_evidence_error:.3f} +/- "
+            f"log Z: {self.log_evidence:.3f} +/- "
             f"{self.log_evidence_error:.3f} "
+            f"log X: {self.log_prior_volume():.2f} "
             f"ESS: {self.state.ess:.1f} "
             f"logL min: {self.live_points_unit['logL'].min():.3f} "
             f"logL median: {np.nanmedian(self.live_points_unit['logL']):.3f} "
