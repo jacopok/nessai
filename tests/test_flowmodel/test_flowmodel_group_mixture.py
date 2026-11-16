@@ -2980,3 +2980,45 @@ def test_clustered_keep_expert_of_moves_the_region_expert_to_slot_zero():
     for k, v in w.experts[0].state_dict().items():
         assert torch.equal(v, expected[k])
     assert w.keep_expert_of(side) is None  # k = 1 already
+
+
+def test_heavy_kernel_in_base_frame_is_exact(wrapper):
+    """A heavy-sample kernel blended into the base density: the mixture
+    stays normalised, covers every group image of its centre, and its draws
+    follow its density."""
+    from nessai.flowmodel.heavy_kernel import HeavyKernel
+    from nessai.proposal.importance_levels import LevelFlowProposal
+
+    torch.manual_seed(3)
+    centre = torch.tensor([[2.3, 0.5]])
+    with torch.no_grad():
+        u0 = LevelFlowProposal._base_frame(wrapper, centre).numpy()
+        wrapper.heavy_kernel = HeavyKernel(
+            u0, [0.05 * np.eye(2)], nu=4.0, fraction=0.3
+        )
+        wrapper.measure_domain_mass(400_000)
+        # normalisation: uniform reference over x in [0, 4), y in [-8, 8]
+        n = 400_000
+        ref = torch.stack(
+            [torch.rand(n) * 4.0, torch.rand(n) * 16.0 - 8.0], dim=1
+        )
+        q = torch.exp(wrapper.log_prob(ref))
+        assert abs(float(q.mean()) * 64.0 - 1.0) < 0.03
+        # the kernel's mass at every image of the centre (x - 2.3 integer)
+        near = ((ref[:, 0] - 0.3) % 1.0 < 0.1) & (
+            (ref[:, 1] - 0.5).abs() < 0.3
+        )
+        mass_near = float(q[near].sum()) * 64.0 / n
+        z = torch.randn(200_000, 2)
+        x, log_j = wrapper.inverse(z)
+        x = x[torch.isfinite(log_j)]
+        frac = (
+            ((x[:, 0] - 0.3) % 1.0 < 0.1) & ((x[:, 1] - 0.5).abs() < 0.3)
+        ).float().mean()
+        assert abs(float(frac) - mass_near) < 0.02 + 0.05 * mass_near
+        # the images other than the centre's own get the kernel too
+        lp_with = wrapper.log_prob(torch.tensor([[0.3, 0.5], [3.3, 0.5]]))
+        wrapper.heavy_kernel = None
+        wrapper.measure_domain_mass(400_000)
+        lp_without = wrapper.log_prob(torch.tensor([[0.3, 0.5], [3.3, 0.5]]))
+        assert (lp_with > lp_without + 0.5).all()

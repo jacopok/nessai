@@ -1809,6 +1809,40 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             lp = lp - self._log_domain_mass
         return lp
 
+    @torch.no_grad()
+    def measure_domain_mass(self, n=200_000):
+        """Set ``log Z`` (the base mass inside the domain) from ``n`` fresh
+        base draws, e.g. after a heavy-sample kernel changed the base
+        density; returns it."""
+        if not self._truncate or (
+            self.in_fundamental_domain is None
+            and not self.uses_prime_space_action
+        ):
+            return float(self._log_domain_mass)
+        kept = drawn = failed = 0
+        chunk = 20_000
+        while drawn < n:
+            m = min(chunk, n - drawn)
+            try:
+                u = self._base_flow_sample(m)
+            except AssertionError:
+                # a spline inverse's float round-off on a rare extreme
+                # latent: redraw the chunk (a few in a run at most)
+                failed += 1
+                if failed > 10:
+                    raise
+                continue
+            modes = Categorical(probs=self.proposal_weights).sample((m,))
+            t = self._fold_symmetry(
+                self._fold_reflect(self._destandardise(u, modes))
+            )
+            canon, _ = self._base_to_canon(t)
+            kept += int(self._in_domain(canon).sum())
+            drawn += m
+        self._log_domain_mass.fill_(math.log(max(kept / n, 1.0 / (n + 1.0))))
+        self._domain_mass_seen = True
+        return float(self._log_domain_mass)
+
     def _update_domain_mass(self, n_kept, n_drawn):
         """EMA-update ``log Z`` from a rejection-loop acceptance rate."""
         if n_drawn == 0:
@@ -1859,20 +1893,38 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             return z
         return self._latent_mu + torch.exp(self._latent_log_sigma) * z
 
+    #: a :class:`~nessai.flowmodel.heavy_kernel.HeavyKernel` blended into
+    #: the base density, ``(1 - f) q0 + f K`` in the standardised frame
+    #: (set by i-nessai levels; None: the base flow alone)
+    heavy_kernel = None
+
     def _base_flow_sample(self, n, context=None):
-        """``base_flow.sample`` with the latent distortion applied."""
+        """``base_flow.sample`` with the latent distortion applied (and the
+        heavy-sample kernel's share of the draws)."""
         if self._latent_mu is None:
-            return self.base_flow.sample(n, context=context)
-        z = torch.as_tensor(
-            np.asarray(self.base_flow.sample_latent_distribution(n)),
-            dtype=self._latent_mu.dtype,
-            device=self._latent_mu.device,
-        )
-        u, _ = self.base_flow.inverse(self._distort_latent(z), context=context)
+            u = self.base_flow.sample(n, context=context)
+        else:
+            z = torch.as_tensor(
+                np.asarray(self.base_flow.sample_latent_distribution(n)),
+                dtype=self._latent_mu.dtype,
+                device=self._latent_mu.device,
+            )
+            u, _ = self.base_flow.inverse(
+                self._distort_latent(z), context=context
+            )
+        if self.heavy_kernel is not None:
+            u = self.heavy_kernel.replace_rows(u)
         return u
 
     def _base_flow_log_prob(self, u, context=None):
-        """``base_flow.log_prob`` with the latent distortion applied."""
+        """``base_flow.log_prob`` with the latent distortion applied (and
+        the heavy-sample kernel blended in)."""
+        lp = self._undistorted_or_distorted_log_prob(u, context=context)
+        if self.heavy_kernel is not None:
+            lp = self.heavy_kernel.mix_log_prob(u, lp)
+        return lp
+
+    def _undistorted_or_distorted_log_prob(self, u, context=None):
         if self._latent_mu is None:
             return self.base_flow.log_prob(u, context=context)
         if context is not None:
@@ -2130,6 +2182,10 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         )
 
         u, _ = self.base_flow.inverse(self._distort_latent(z), context=context)
+        if self.heavy_kernel is not None:
+            # the kernel's share of the draws (their latent is unused: the
+            # returned log_j gives log q(x) whatever z was)
+            u = self.heavy_kernel.replace_rows(u)
         t = self._fold_symmetry(
             self._fold_reflect(self._destandardise(u, modes))
         )

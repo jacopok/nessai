@@ -632,15 +632,15 @@ class _INSIntegralState(_BaseNSIntegralState):
             the evidence.
         """
         n = self._n
-        Z_hat = np.exp(self.logZ, dtype=np.longdouble)
-        Z = np.exp(self._weights, dtype=np.longdouble)
-        # Standard error sqrt(Var[Z] / n)
-        u = np.sqrt(np.sum((Z - Z_hat) ** 2) / (n * (n - 1)))
+        # Standard error sqrt(Var[Z] / n), relative to Z: computed on the
+        # weights divided by Z so that it cannot overflow at large ln L
+        r = np.exp(np.asarray(self._weights, dtype=float) - self.logZ)
+        u_rel = np.sqrt(np.sum((r - 1) ** 2) / (n * (n - 1)))
         if log_evidence:
             # sigma[ln Z] = |sigma[Z] / Z|
-            return float(np.abs(u / Z_hat))
+            return float(u_rel)
         else:
-            return u
+            return u_rel * np.exp(self.logZ, dtype=np.longdouble)
 
 
 def log_evidence_from_ins_samples(samples: np.ndarray) -> float:

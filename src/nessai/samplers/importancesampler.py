@@ -1110,6 +1110,8 @@ class ImportanceNestedSampler(BaseNestedSampler):
         )
 
         if self.replace_all:
+            if getattr(self.proposal, "mixture_block", None) is not None:
+                raise ValueError("replace_all needs the full mixture")
             weights = -np.exp(self.current_training_log_q[:, -1])
         elif self.weighted_kl:
             log_w = self.current_training_samples["logW"].copy()
@@ -1118,10 +1120,19 @@ class ImportanceNestedSampler(BaseNestedSampler):
         else:
             weights = None
 
+        extra = {}
+        if getattr(self.proposal, "kernel_threshold", None) is not None:
+            # every sample and the threshold, for LevelFlowProposal's
+            # heavy-sample kernels (which look past the training set)
+            extra = dict(
+                all_samples=self.training_samples.samples,
+                log_likelihood_threshold=self.log_likelihood_threshold,
+            )
         self.proposal.train(
             self.current_training_samples,
             plot=self.plot_training_data,
             weights=weights,
+            **extra,
         )
         self.training_time += datetime.datetime.now() - st
 
@@ -1191,6 +1202,15 @@ class ImportanceNestedSampler(BaseNestedSampler):
             return (
                 samples["logL"] < self.log_likelihood_threshold
             ).sum() / samples.size
+
+    def _log_meta(self, log_q, weights):
+        """ln Q from the components' ln q and the mixture weights (the
+        proposal's partial mixture, when it has one)."""
+        if getattr(self.proposal, "mixture_block", None) is not None:
+            return self.proposal.compute_meta_proposal_from_log_q(
+                log_q, weights=weights
+            )
+        return logsumexp(log_q, b=weights, axis=1)
 
     def add_and_update_points(self, n: int):
         """Add new points to the current set of live points.
@@ -1352,7 +1372,7 @@ class ImportanceNestedSampler(BaseNestedSampler):
             batch_log_q = log_q[idx_keep]
             assert batch_samples.size == orig_n_total
 
-            log_Q = logsumexp(batch_log_q, b=norm_weight, axis=1)
+            log_Q = self._log_meta(batch_log_q, norm_weight)
             # Weights are normalised because the total number of samples is the
             # same.
             batch_samples["logQ"] = log_Q
@@ -1851,7 +1871,7 @@ class ImportanceNestedSampler(BaseNestedSampler):
 
             samples = np.concatenate([samples, it_samples])
 
-            log_Q = logsumexp(log_q, b=weights, axis=1)
+            log_Q = self._log_meta(log_q, weights)
 
             if np.isposinf(log_Q).any():
                 logger.warning("Log meta proposal contains +inf")

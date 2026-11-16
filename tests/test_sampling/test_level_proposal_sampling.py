@@ -62,7 +62,7 @@ FLOW = dict(n_blocks=2, n_neurons=16)
 TRAINING = dict(max_epochs=200, patience=10)
 
 
-def _run(tmp_path, model, reparameterisations, seed=1234):
+def _run(tmp_path, model, reparameterisations, seed=1234, **extra):
     fs = FlowSampler(
         model,
         output=str(tmp_path),
@@ -82,6 +82,7 @@ def _run(tmp_path, model, reparameterisations, seed=1234):
                 sum_mirror_density=True,
             ),
             n_pilot=5000,
+            **extra,
         ),
     )
     fs.run(plot=False, save=False)
@@ -231,3 +232,125 @@ def test_level_proposal_refuses_split_inversion(tmp_path):
                 "x1": "z-score",
             },
         )
+
+
+@pytest.mark.slow_integration_test
+@pytest.mark.parametrize("block, eps", [(2, 0.0), (3, 0.0), (2, 0.05)])
+def test_level_proposal_partial_mixture(tmp_path, block, eps):
+    """With the partial deterministic mixture (blocks of ``block``
+    components) each sample is scored under its own block only, and the
+    evidence is still unbiased."""
+    model = UniformGaussian([1.0, -2.0, 0.5])
+    fs = _run(
+        tmp_path,
+        model,
+        {n: "z-score" for n in model.names},
+        mixture_block=block,
+        defensive_fraction=eps,
+    )
+    prop = fs.ns.proposal
+    assert prop.mixture_block == block
+    assert len(prop.levels) > block
+    log_q = fs.ns.training_samples.log_q
+    col = fs.ns.training_samples.samples["it"].astype(int) + 1
+    scored = ~np.isnan(log_q)
+    assert (
+        scored == ((np.arange(log_q.shape[1]) // block) == (col // block)[:, None])
+    ).all()
+    err = max(fs.log_evidence_error, 0.02)
+    assert abs(fs.log_evidence - model.log_evidence()) < 4 * err
+
+
+@pytest.mark.slow_integration_test
+def test_level_proposal_defensive_density_normalised(tmp_path):
+    """A defensive level, (1 - eps) q_k + eps prior, integrates to 1 and
+    draws a fraction eps from the prior."""
+    model = UniformGaussian([2.0, 0.5])
+    fs = _run(
+        tmp_path,
+        model,
+        {"x0": "z-score", "x1": "z-score"},
+        defensive_fraction=0.1,
+    )
+    prop = fs.ns.proposal
+    u = model.sample_unit_hypercube(400_000)
+    log_q = prop._log_q_all(u)[:, 1]
+    mass = np.exp(logsumexp(log_q) - np.log(len(u)))
+    assert abs(mass - 1) < 0.05, mass
+    assert (log_q >= np.log(0.1) - 1e-12).all()
+    pts = prop._draw_level(len(prop.levels) - 1, 20000)
+    x = model.from_unit_hypercube(pts)
+    # the last level is narrow about the peak: draws far from it are the
+    # prior's (|x - mu| > 6 has negligible flow mass)
+    far = (np.abs(x["x0"] - 2.0) > 6) | (np.abs(x["x1"] - 0.5) > 6)
+    expected = 0.1 * (1 - (12 / 20) ** 2)
+    assert abs(far.mean() - expected) < 0.01, (far.mean(), expected)
+
+
+@pytest.mark.slow_integration_test
+@pytest.mark.parametrize(
+    "reparameterisations",
+    [
+        {"x0": "z-score", "x1": "z-score"},
+        {
+            "x0": {
+                "reparameterisation": "inversion",
+                "detect_edges": True,
+                "inversion_type": "duplicate",
+            },
+            "x1": "z-score",
+        },
+    ],
+)
+def test_level_proposal_prime_box(tmp_path, reparameterisations):
+    """With a tight prime-space box (2 sigma) each level is its flow
+    truncated to the box: still normalised, draws inside it, and the
+    evidence unbiased."""
+    mu = [2.0, 0.5] if "z-score" == reparameterisations["x0"] else [-10.0, 3.0]
+    model = UniformGaussian(mu)
+    fs = _run(tmp_path, model, reparameterisations, box_sigma=2.0)
+    prop = fs.ns.proposal
+    assert len(prop.prime_boxes) == len(prop.levels)
+    assert all(b is not None for b in prop.prime_boxes)
+    u = model.sample_unit_hypercube(400_000)
+    log_q = prop._log_q_all(u)[:, 1]
+    mass = np.exp(logsumexp(log_q) - np.log(len(u)))
+    assert abs(mass - 1) < 0.05, mass
+    err = max(fs.log_evidence_error, 0.02)
+    assert abs(fs.log_evidence - model.log_evidence()) < 4 * err
+
+
+@pytest.mark.slow_integration_test
+def test_level_proposal_heavy_kernels(tmp_path):
+    """With heavy-sample kernels forced on (a tiny threshold) the levels
+    blend a Student-t mixture into their flows: still normalised, the draws
+    inside the hypercube, and the evidence unbiased."""
+    model = UniformGaussian([2.0, 0.5])
+    fs = _run(
+        tmp_path,
+        model,
+        {"x0": "z-score", "x1": "z-score"},
+        kernel_threshold=1e-6,
+        kernel_fraction=0.3,
+    )
+    prop = fs.ns.proposal
+    assert len(prop.kernels) == len(prop.levels)
+    assert sum(k is not None for k in prop.kernels) >= len(prop.levels) - 1
+    u = model.sample_unit_hypercube(400_000)
+    log_q = prop._log_q_all(u)[:, 1:]
+    for k in range(min(2, log_q.shape[1])):
+        mass = np.exp(logsumexp(log_q[:, k]) - np.log(len(u)))
+        assert abs(mass - 1) < 0.05, (k, mass)
+    # a plain flow carries the kernel in its prime space
+    k = next(i for i, kern in enumerate(prop.kernels) if kern is not None)
+    assert prop.kernels[k]["parts"][0][0] is None
+    assert type(prop.levels[k].flow.model).__name__ == "KernelMixFlow"
+    # a warm copy for the next level starts without it
+    nxt = prop.levels[k + 1] if k + 1 < len(prop.levels) else None
+    if nxt is not None and prop.kernels[k + 1] is None:
+        assert type(nxt.flow.model).__name__ != "KernelMixFlow"
+    pts = prop.draw(5000)[0]
+    assert model.in_unit_hypercube(pts).all()
+    assert np.isfinite(pts["logQ"]).all()
+    err = max(fs.log_evidence_error, 0.02)
+    assert abs(fs.log_evidence - model.log_evidence()) < 4 * err

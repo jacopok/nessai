@@ -139,11 +139,13 @@ def test_adjust_final_samples(ins, proposal, model, samples, log_q):
     proposal.draw = MagicMock(side_effect=draw)
     proposal.draw_from_prior = MagicMock(side_effect=draw_from_prior)
     proposal.n_requested = {"-1": 10, "1": 10}
+    proposal.mixture_block = None
 
     ins.samples_unit = samples
     ins.log_q = log_q
     ins.proposal = proposal
     ins.model = model
+    ins._log_meta = lambda lq, w: INS._log_meta(ins, lq, w)
 
     INS.adjust_final_samples(ins)
 
