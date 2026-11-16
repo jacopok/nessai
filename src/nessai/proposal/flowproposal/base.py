@@ -1079,7 +1079,13 @@ class BaseFlowProposal(RejectionProposal):
             st = datetime.datetime.now()
             live = getattr(self, "current_live_points", None)
             x = live if live is not None and len(live) else self.training_data
-            mu, ls, fit_info = fit_and_check(self, x, quantile, **kwargs)
+            # weighted samples of the target (nessai.proposal.importance_levels)
+            sw = getattr(self, "training_sample_weights", None)
+            if sw is not None and len(sw) != len(x):
+                sw = None
+            mu, ls, fit_info = fit_and_check(
+                self, x, quantile, sample_weights=sw, **kwargs
+            )
             info.update(fit_info)
             info["time"] = (datetime.datetime.now() - st).total_seconds()
             if mu is not None:

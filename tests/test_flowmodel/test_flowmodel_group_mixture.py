@@ -183,6 +183,25 @@ def test_update_mixture_weights_matches_assigned_fractions(wrapper, rng):
     assert wrapper.weights.sum() == pytest.approx(1.0)
 
 
+def test_update_mixture_weights_with_sample_weights(wrapper, rng):
+    """Weighted points count by their weights (importance nested sampling:
+    an element drawn less often, with heavier samples, keeps its share)."""
+    counts = [10, 30, 20, 40]
+    x = torch.cat([points_in_element(k, n, rng) for k, n in enumerate(counts)])
+    # each element's points weigh 1 / count: equal weighted shares
+    w = np.concatenate([np.full(n, 1.0 / n) for n in counts])
+    wrapper.update_mixture_weights(x, smoothing=0.0, sample_weights=w)
+    assert torch.allclose(
+        wrapper.weights, torch.full((GROUP_SIZE,), 0.25), atol=1e-6
+    )
+    # uniform weights: the plain fractions
+    wrapper.update_mixture_weights(
+        x, smoothing=0.0, sample_weights=np.ones(len(x))
+    )
+    expected = torch.tensor(counts, dtype=torch.float32) / sum(counts)
+    assert torch.allclose(wrapper.weights, expected, atol=1e-6)
+
+
 def test_update_mixture_weights_drops_persistently_empty_element(wrapper, rng):
     x = torch.cat([points_in_element(k, 10, rng) for k in range(3)])
     for _ in range(wrapper._weight_empty_patience):
@@ -1502,6 +1521,27 @@ def test_clustered_inverse_carries_expert_domain_rejection():
     clustered_reject = (~torch.isfinite(log_j)).float().mean()
     # within Monte-Carlo noise of the per-expert rate, not ~0
     assert abs(clustered_reject - expert_reject) < 0.06
+
+
+def test_clustered_shares_with_sample_weights():
+    """The experts' shares are the clusters' weighted shares with sample
+    weights: a blob drawn 60% of the time with weights 1/0.6 (and the other
+    40% with 1/0.4) gets half."""
+    w = _clustered_wrapper(3)
+    rng = np.random.default_rng(0)
+    n = 800
+    x = rng.uniform(0, 1, n)
+    upper = rng.random(n) < 0.6
+    y = np.where(upper, rng.normal(3, 0.4, n), rng.normal(-3, 0.4, n))
+    data = torch.tensor(np.stack([x, y], 1), dtype=torch.float32)
+    sw = np.where(upper, 1 / 0.6, 1 / 0.4)
+    w.update_mixture_weights(data, sample_weights=sw)
+    assert int(w._n_active.item()) == 2
+    wts = w.cluster_weights[:2].detach().numpy()
+    expected = sw[upper].sum() / sw.sum()
+    assert np.allclose(np.sort(wts), np.sort([expected, 1 - expected]),
+                       atol=1e-4)
+    assert w._cluster_sample_weights is None
 
 
 def test_clustered_clusters_bimodal_folded_data():

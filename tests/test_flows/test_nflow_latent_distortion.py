@@ -70,3 +70,20 @@ def test_state_dict_keys_unchanged(flow, distortion):
     keys = set(flow.state_dict())
     flow.set_latent_distortion(*distortion)
     assert set(flow.state_dict()) == keys
+
+
+def test_weighted_quantile():
+    """Uniform weights give the plain quantile (to one sample); weights
+    move it towards the heavy points."""
+    from nessai.proposal.flowproposal.latent_distortion import (
+        weighted_quantile,
+    )
+
+    rng = np.random.default_rng(0)
+    v = rng.normal(size=10_000)
+    assert abs(
+        weighted_quantile(v, 0.2, np.ones_like(v)) - np.quantile(v, 0.2)
+    ) < 0.01
+    assert weighted_quantile(v, 0.2) == np.quantile(v, 0.2)
+    w = np.where(v > 1, 100.0, 1.0)
+    assert weighted_quantile(v, 0.2, w) > 1

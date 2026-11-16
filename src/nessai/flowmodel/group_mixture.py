@@ -1518,8 +1518,14 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             self._shear_coef.copy_(coef)
 
     @torch.no_grad()
-    def update_mixture_weights(self, x, context=None, smoothing=1.0):
+    def update_mixture_weights(self, x, context=None, smoothing=1.0,
+                               sample_weights=None):
         """EM M-step: set the mixture weights from the assigned-point counts.
+
+        With ``sample_weights`` (one per row of ``x``) the counts are the
+        weighted counts, scaled to the number of points: samples that are
+        not draws of the target (importance nested sampling) count by their
+        importance weights.
 
         Each point is assigned to the single group element whose inverse
         action maps it into the fundamental domain. Without a group
@@ -1541,11 +1547,18 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         self._pool_n.zero_()
         assigned, _, claimed = self._assign_branch(x)
         a = assigned[claimed]
+        w = None
+        if sample_weights is not None:
+            w = torch.as_tensor(
+                np.asarray(sample_weights, dtype=float), device=a.device
+            )[claimed].to(self.weights)
+            total = w.sum()
+            w = w * (w.numel() / total) if bool(total > 0) else None
 
         if self.mode_factor_sizes is None:
-            counts = torch.bincount(a, minlength=self.group_size).to(
-                self.weights
-            )
+            counts = torch.bincount(
+                a, weights=w, minlength=self.group_size
+            ).to(self.weights)
             self._empty_rounds = torch.where(
                 counts == 0,
                 self._empty_rounds + 1,
@@ -1568,7 +1581,7 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             off = self._factor_offsets[f]
             fac_of_mode = self._mode_factor_index[:, f]
             fcounts = torch.bincount(
-                fac_of_mode[a], minlength=size
+                fac_of_mode[a], weights=w, minlength=size
             ).to(self.weights)
             er = self._factor_empty_rounds[off : off + size]
             er = torch.where(fcounts == 0, er + 1, torch.zeros_like(er))
@@ -3653,7 +3666,17 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             self._centroids[:k].copy_(
                 torch.as_tensor(centroids, dtype=self._centroids.dtype)
             )
-            counts = np.bincount(labels, minlength=self.n_experts).astype(float)
+            # the experts' shares: weighted counts with sample weights
+            # (importance nested sampling: see update_mixture_weights)
+            sw = getattr(self, "_cluster_sample_weights", None)
+            if sw is not None and len(sw) == len(labels):
+                counts = np.bincount(
+                    labels, weights=sw, minlength=self.n_experts
+                ).astype(float)
+            else:
+                counts = np.bincount(
+                    labels, minlength=self.n_experts
+                ).astype(float)
             w = torch.zeros(
                 self.n_experts, device=dev, dtype=self.cluster_weights.dtype
             )
@@ -3678,7 +3701,10 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
                     labels[:n_u], minlength=self.n_experts
                 ).astype(float)
             else:
-                counts_unique = counts
+                # the number of points an expert trains on, unweighted
+                counts_unique = np.bincount(
+                    labels, minlength=self.n_experts
+                ).astype(float)
             self._update_frozen(counts_unique[:k])
 
         lab_t = torch.as_tensor(labels, device=x.device, dtype=torch.long)
@@ -3916,9 +3942,23 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         return super().load_state_dict(sd, strict=strict, assign=assign)
 
     @torch.no_grad()
-    def update_mixture_weights(self, x, context=None, smoothing=1.0):
-        labels = self._cluster(x)
+    def update_mixture_weights(self, x, context=None, smoothing=1.0,
+                               sample_weights=None):
+        self._cluster_sample_weights = (
+            None if sample_weights is None
+            else np.asarray(sample_weights, dtype=float)
+        )
+        try:
+            labels = self._cluster(x)
+        finally:
+            self._cluster_sample_weights = None
         pending = bool(self._pending_split_train.item())
+        sw = lab = None
+        if sample_weights is not None:
+            sw = np.asarray(sample_weights, dtype=float)
+            lab = np.asarray(
+                labels.cpu() if torch.is_tensor(labels) else labels
+            )
         for j in range(self._n_active_experts()):
             # while a split is pending, expert 0 keeps tracking the *full*
             # data (populate() still runs on it alone, so it must stay the
@@ -3927,15 +3967,18 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             # frame.
             if self.is_frozen(j):
                 continue
-            xj = x if (pending and j == 0) else x[labels == j]
+            full = pending and j == 0
+            xj = x if full else x[labels == j]
             if xj.shape[0]:
                 self.experts[j].update_mixture_weights(
-                    xj, context=context, smoothing=smoothing
+                    xj, context=context, smoothing=smoothing,
+                    sample_weights=(None if sw is None
+                                    else sw if full else sw[lab == j]),
                 )
         if self._bg_expert is not None and x.shape[0]:
             # the background expert always tracks the full data
             self._bg_expert.update_mixture_weights(
-                x, context=context, smoothing=smoothing
+                x, context=context, smoothing=smoothing, sample_weights=sw
             )
 
     @torch.no_grad()
@@ -4440,8 +4483,22 @@ class GroupFlowProposalMixin:
         has_unique = hasattr(model, "n_unique_rows")
         if has_unique:
             model.n_unique_rows = len(x)
+        # importance weights of the training points, if any (set by
+        # nessai.proposal.importance_levels), over the mirror copies too
+        sample_weights = getattr(self, "training_sample_weights", None)
+        if sample_weights is not None:
+            sample_weights = np.asarray(sample_weights, dtype=float)
+            if len(x_prime) % len(sample_weights):
+                raise RuntimeError(
+                    f"{len(sample_weights)} sample weights for "
+                    f"{len(x_prime)} training rows"
+                )
+            sample_weights = np.tile(
+                sample_weights, len(x_prime) // len(sample_weights)
+            )
         try:
-            model.update_mixture_weights(x_prime)
+            model.update_mixture_weights(x_prime,
+                                         sample_weights=sample_weights)
             model.update_base_standardisation(x_prime)
         finally:
             if has_unique:

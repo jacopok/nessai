@@ -50,6 +50,13 @@ logger = logging.getLogger(__name__)
 
 #: points scored per call of a level's density
 _CHUNK = 20_000
+
+
+def _ess(weights):
+    """Kish effective sample size."""
+    return float(weights.sum() ** 2 / (weights**2).sum())
+
+
 #: a prime point maps back to the physical point it came from within this
 #: fraction of each parameter's prior range (else it is another point's copy)
 _ROUND_TRIP = 1e-6
@@ -84,6 +91,14 @@ class LevelFlowProposal(Proposal):
     weighted_training : bool
         Train on the samples' importance weights (``logW``) when the sampler
         gives none.
+    training_ess_fraction : float, optional
+        Temper the training weights to ``w ** alpha``, with the largest
+        ``alpha`` in ``[0, 1]`` that keeps their effective sample size at
+        this fraction of the samples (none: ``alpha = 1``). The meta-proposal's
+        densities, and so the importance weights of the samples, are exact
+        whatever a level is trained on; a level trained on a few heavy
+        samples is narrow and misses the tails those came from, which makes
+        the next training set heavier still.
     """
 
     def __init__(
@@ -98,6 +113,7 @@ class LevelFlowProposal(Proposal):
         reset_flow: int = 0,
         n_pilot: int = 20_000,
         weighted_training: bool = True,
+        training_ess_fraction: Optional[float] = None,
         **kwargs,
     ) -> None:
         super().__init__(model, rng=rng)
@@ -114,6 +130,7 @@ class LevelFlowProposal(Proposal):
         self.reset_flow = int(reset_flow)
         self.n_pilot = int(n_pilot)
         self.weighted_training = weighted_training
+        self.training_ess_fraction = training_ess_fraction
         self.level_count = -1
         self._weights = {-1: 1.0}
         self.dtype = get_dtype(self.model.names)
@@ -256,10 +273,13 @@ class LevelFlowProposal(Proposal):
         if weights is None and self.weighted_training:
             log_w = samples["logW"] - logsumexp(samples["logW"])
             weights = np.exp(log_w)
+        alpha = 1.0
         if weights is not None:
             weights = np.asarray(weights, dtype=float)
             if not np.all(np.isfinite(weights)):
                 raise ValueError("Training weights are not finite")
+            ess_full = _ess(weights)
+            weights, alpha = self._temper(weights)
             weights = weights / weights.mean()
         st = datetime.datetime.now()
         self._fit(prop, x, weights)
@@ -269,33 +289,52 @@ class LevelFlowProposal(Proposal):
         log_mass, n_support = self._log_support_mass(prop)
         self.levels.append(prop)
         self.log_mass.append(log_mass)
-        ess = (
-            len(x)
-            if weights is None
-            else weights.sum() ** 2 / (weights**2).sum()
-        )
+        ess = len(x) if weights is None else _ess(weights)
+        if weights is None:
+            ess_full = ess
         self.level_history.append(
             dict(
                 level=self.level_count,
                 cold=bool(cold),
                 n_train=len(x),
                 ess_train=float(ess),
+                ess_weights=float(ess_full),
+                alpha=float(alpha),
                 log_mass=float(log_mass),
                 train_seconds=train_time.total_seconds(),
             )
         )
+        tempered = f", tempered {alpha:.2f}: {ess:.0f}" if alpha < 1 else ""
         logger.info(
             f"Level {self.level_count}: {'cold' if cold else 'warm'}, "
-            f"{len(x)} samples (ESS {ess:.0f}), trained in "
+            f"{len(x)} samples (ESS {ess_full:.0f}{tempered}), trained in "
             f"{train_time.total_seconds():.0f} s, support mass "
             f"{np.exp(log_mass):.4f} ({n_support} of {self.n_pilot})"
         )
+
+    def _temper(self, weights):
+        """``weights ** alpha`` with the largest ``alpha`` in ``[0, 1]``
+        keeping their ESS at ``training_ess_fraction`` of their number."""
+        target = self.training_ess_fraction
+        if not target or _ess(weights) >= target * len(weights):
+            return weights, 1.0
+        log_w = np.log(np.maximum(weights, np.finfo(float).tiny))
+        log_w -= log_w.max()
+        lo, hi = 0.0, 1.0
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            if _ess(np.exp(mid * log_w)) >= target * len(weights):
+                lo = mid
+            else:
+                hi = mid
+        return np.exp(lo * log_w), lo
 
     @staticmethod
     def _fit(prop, x, weights):
         """Train ``prop`` on ``x`` with per-sample ``weights`` (repeated over
         a boundary inversion's mirror copies, which the rescale appends in
-        blocks of ``len(x)`` rows)."""
+        blocks of ``len(x)`` rows): the flow's loss, and the group mixtures'
+        element weights."""
         flow = prop.flow
         own = "train" in flow.__dict__
         train = flow.train
@@ -307,6 +346,9 @@ class LevelFlowProposal(Proposal):
 
         flow.train = weighted_train
         prop.current_live_points = x
+        # the group mixtures' element weights count the points by these
+        # (nessai.flowmodel.group_mixture.GroupFlowProposalMixin.check_state)
+        prop.training_sample_weights = weights
         try:
             prop.train(x, plot=False)
         finally:
@@ -315,6 +357,7 @@ class LevelFlowProposal(Proposal):
             else:
                 del flow.__dict__["train"]
             prop.current_live_points = None
+            prop.training_sample_weights = None
 
     @staticmethod
     def _clear(prop):

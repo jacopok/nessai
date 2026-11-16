@@ -191,23 +191,47 @@ def _theta0(shape, real, mode):
     return torch.tensor(th, dtype=torch.float64, requires_grad=True)
 
 
+def weighted_quantile(values, q, weights=None):
+    """The ``q`` quantile of ``values``, of their ``weights``' mass if
+    given (the lowest value whose cumulative weight reaches ``q``)."""
+    values = np.asarray(values, dtype=float)
+    if weights is None:
+        return float(np.quantile(values, q))
+    order = np.argsort(values)
+    cum = np.cumsum(np.asarray(weights, dtype=float)[order])
+    i = int(np.searchsorted(cum, q * cum[-1]))
+    return float(values[order][min(i, len(values) - 1)])
+
+
 def fit(lp, z, log_p, real, mode="expert", tail=0.02, reg=0.3, steps=400,
-        lr=0.05):
+        lr=0.05, weights=None):
     """Maximise the mean of the lowest ``tail`` fraction of the levels
-    ``log q' - log p``. Returns ``(mu, log_sigma)`` ``[E, D]`` arrays."""
+    ``log q' - log p``; with ``weights`` (weighted samples of the target,
+    importance sampling) minimise ``ln E_target[p / q']`` instead, the
+    inverse of the effective sample size per draw. Returns ``(mu,
+    log_sigma)`` ``[E, D]`` arrays."""
     lp_t, z_t = torch.as_tensor(lp), torch.as_tensor(z)
     lpr, real_t = torch.as_tensor(log_p), torch.as_tensor(real)
     shape = (z.shape[-2], z.shape[-1])
     m = max(10, int(round(tail * lp.shape[1])))
     m = min(m, lp.shape[1])
+    w_t = None
+    if weights is not None:
+        w_t = torch.as_tensor(np.asarray(weights, dtype=float))
+        w_t = w_t / w_t.sum()
     theta = _theta0(shape, real, mode)
     opt = torch.optim.Adam([theta], lr=lr)
     for _ in range(steps):
         opt.zero_grad()
         mu, ls = _unpack(theta, shape, real, mode)
         lev = log_q_distorted(lp_t, z_t, mu, ls, real_t) - lpr
-        low = torch.topk(lev, m, largest=False).values
-        loss = -low.mean() + reg * (mu**2 + ls**2).sum()
+        if w_t is None:
+            low_mean = torch.topk(lev, m, largest=False).values.mean()
+        else:
+            # weighted samples (importance sampling): minimise
+            # ln E_target[p / q'], the inverse of the ESS per draw
+            low_mean = -torch.logsumexp(-lev + torch.log(w_t), 0)
+        loss = -low_mean + reg * (mu**2 + ls**2).sum()
         loss.backward()
         opt.step()
     with torch.no_grad():
@@ -215,8 +239,12 @@ def fit(lp, z, log_p, real, mode="expert", tail=0.02, reg=0.3, steps=400,
     return mu.numpy(), ls.numpy()
 
 
-def fit_and_check(proposal, x, quantile, **kwargs):
+def fit_and_check(proposal, x, quantile, sample_weights=None, **kwargs):
     """Fit the distortion to the live points ``x`` and run the checks.
+
+    ``sample_weights``: the points are weighted samples of the target
+    (importance nested sampling): the tail, the quantiles and the excluded
+    fractions are of their weight.
 
     Returns ``(mu, log_sigma, info)``; ``mu`` is ``None`` when a check
     fails (the identity is then kept). ``info`` holds the held-out gain and
@@ -249,8 +277,21 @@ def fit_and_check(proposal, x, quantile, **kwargs):
                         real)
     )
     lp, z, log_p = lp[:, ok], z[:, ok], log_p[ok]
+    sw = None
+    if sample_weights is not None:
+        sw = np.asarray(sample_weights, dtype=float)[ok]
     n = lp.shape[1]
     zero = np.zeros(z.shape[-2:])
+
+    def wq(values, idx):
+        return weighted_quantile(values, quantile,
+                                 None if sw is None else sw[idx])
+
+    def excluded(values, threshold, idx):
+        below = values < threshold
+        if sw is None:
+            return float(np.mean(below))
+        return float(np.sum(sw[idx][below]) / np.sum(sw[idx]))
 
     def levels(mu, ls, idx=slice(None)):
         return (
@@ -261,17 +302,32 @@ def fit_and_check(proposal, x, quantile, **kwargs):
     rng = np.random.default_rng(opts["seed"])
     perm = rng.permutation(n)
     a, b = perm[: n // 2], perm[n // 2:]
-    mu_a, ls_a = fit(lp[:, a], z[:, a], log_p[a], real, **fit_kw)
+    mu_a, ls_a = fit(lp[:, a], z[:, a], log_p[a], real,
+                     weights=None if sw is None else sw[a], **fit_kw)
     lev_b = levels(mu_a, ls_a, b)
-    gain = float(
-        np.quantile(lev_b, quantile)
-        - np.quantile(levels(zero, zero, b), quantile)
-    )
-    t_a = np.quantile(levels(mu_a, ls_a, a), quantile)
-    outside = float(np.mean(lev_b < t_a))
-    outside_id = float(np.mean(
-        levels(zero, zero, b) < np.quantile(levels(zero, zero, a), quantile)
-    ))
+    if sw is not None:
+        # importance sampling: no cap, so the gate is the held-out
+        # efficiency, ln E_target[p / q'] (lower: a higher ESS per draw)
+        def log_cost(lev):
+            return float(
+                logsumexp(-lev, b=sw[b]) - np.log(np.sum(sw[b]))
+            )
+
+        gain = log_cost(levels(zero, zero, b)) - log_cost(lev_b)
+        info.update(heldout_gain=gain, heldout_excluded=0.0,
+                    heldout_excess=0.0, gate="importance")
+        if not gain > opts["min_gain"]:
+            info["reason"] = (
+                f"held-out ln E[p/q] gain {gain:.3g} <= {opts['min_gain']}"
+            )
+            return None, None, info
+        return _final_fit(proposal, x, ok, lp, z, log_p, real, sw, fit_kw,
+                          opts, levels, wq, zero, rng, info)
+    gain = wq(lev_b, b) - wq(levels(zero, zero, b), b)
+    t_a = wq(levels(mu_a, ls_a, a), a)
+    outside = excluded(lev_b, t_a, b)
+    outside_id = excluded(levels(zero, zero, b),
+                          wq(levels(zero, zero, a), a), b)
     excess = outside - outside_id
     info.update(heldout_gain=gain, heldout_excluded=outside,
                 heldout_excess=excess)
@@ -286,11 +342,17 @@ def fit_and_check(proposal, x, quantile, **kwargs):
         )
         return None, None, info
 
-    mu, ls = fit(lp, z, log_p, real, **fit_kw)
-    info["gain"] = float(
-        np.quantile(levels(mu, ls), quantile)
-        - np.quantile(levels(zero, zero), quantile)
-    )
+    return _final_fit(proposal, x, ok, lp, z, log_p, real, sw, fit_kw, opts,
+                      levels, wq, zero, rng, info)
+
+
+def _final_fit(proposal, x, ok, lp, z, log_p, real, sw, fit_kw, opts, levels,
+               wq, zero, rng, info):
+    """The fit on all the points, and the exactness check."""
+    n = lp.shape[1]
+    mu, ls = fit(lp, z, log_p, real, weights=sw, **fit_kw)
+    every = slice(None)
+    info["gain"] = wq(levels(mu, ls), every) - wq(levels(zero, zero), every)
 
     # exactness: the flow's own distorted density against the formula
     model = proposal.flow.model
