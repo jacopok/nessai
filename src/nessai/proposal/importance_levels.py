@@ -52,6 +52,8 @@ logger = logging.getLogger(__name__)
 
 #: points scored per call of a level's density
 _CHUNK = 20_000
+#: the fewest pilot draws inside a level's prime box for the box to be kept
+_MIN_BOX_SUPPORT = 100
 
 
 def _ess(weights):
@@ -359,7 +361,17 @@ class LevelFlowProposal(Proposal):
         )
         self._attach_kernel(prop, kernel)
         box = self._prime_box(prop, x, weights)
-        log_mass, n_support = self._log_support_mass(prop, box)
+        log_mass, n_support = self._log_support_mass(prop, box, strict=box is None)
+        if box is not None and n_support < _MIN_BOX_SUPPORT:
+            # a box from a handful of effective training samples (or a reset
+            # expert's broad flow) can hold almost none of the level's draws:
+            # its mass would be a noisy estimate from a few draws, or none
+            logger.warning(
+                f"Level {self.level_count}: {n_support} of {self.n_pilot} "
+                f"draws inside the box: the level without it"
+            )
+            box = None
+            log_mass, n_support = self._log_support_mass(prop, box)
         self.levels.append(prop)
         self.prime_boxes = list(self.prime_boxes)
         while len(self.prime_boxes) < len(self.levels) - 1:
@@ -732,14 +744,17 @@ class LevelFlowProposal(Proposal):
         x["logP"] = self.model.batch_evaluate_log_prior(x)
         return x[np.isfinite(x["logP"])]
 
-    def _log_support_mass(self, prop, box=None):
+    def _log_support_mass(self, prop, box=None, strict=True):
         """ln of the level's draws' share inside the prior support (and the
-        box)."""
+        box), and their number; with ``strict``, none is an error, else the
+        share is -inf."""
         kept, made = 0, 0
         while made < self.n_pilot:
             m = min(_CHUNK, self.n_pilot - made)
             kept += len(self._draw_physical(prop, m, box))
             made += m
+        if not kept and not strict:
+            return -np.inf, 0
         if not kept:
             raise RuntimeError(
                 f"Level {self.level_count}: no draw inside the prior support"

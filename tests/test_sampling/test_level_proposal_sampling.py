@@ -320,6 +320,18 @@ def test_level_proposal_prime_box(tmp_path, reparameterisations):
     assert abs(fs.log_evidence - model.log_evidence()) < 4 * err
 
 
+def test_level_proposal_prime_box_fallback(tmp_path):
+    """A box holding (almost) none of a level's draws is dropped for that
+    level, which stays normalised, instead of failing the run."""
+    model = UniformGaussian([2.0, 0.5])
+    fs = _run(tmp_path, model, {"x0": "z-score", "x1": "z-score"}, box_sigma=1e-9)
+    prop = fs.ns.proposal
+    assert len(prop.prime_boxes) == len(prop.levels)
+    assert all(b is None for b in prop.prime_boxes)
+    err = max(fs.log_evidence_error, 0.02)
+    assert abs(fs.log_evidence - model.log_evidence()) < 4 * err
+
+
 @pytest.mark.slow_integration_test
 def test_level_proposal_heavy_kernels(tmp_path):
     """With heavy-sample kernels forced on (a tiny threshold) the levels
