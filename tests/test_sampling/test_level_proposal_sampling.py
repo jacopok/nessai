@@ -366,3 +366,135 @@ def test_level_proposal_heavy_kernels(tmp_path):
     assert np.isfinite(pts["logQ"]).all()
     err = max(fs.log_evidence_error, 0.02)
     assert abs(fs.log_evidence - model.log_evidence()) < 4 * err
+
+
+@pytest.mark.parametrize("target", [600, 1500])
+def test_level_proposal_min_training_ess(tmp_path, target, caplog):
+    """With a minimum training ESS the latest level is topped up until the
+    samples above the next threshold have it; the extra draws count with
+    their level and the evidence stays unbiased."""
+    import logging
+
+    from nessai.utils.stats import effective_sample_size
+
+    caplog.set_level(logging.INFO)
+    model = UniformGaussian([1.0, -2.0])
+    fs = FlowSampler(
+        model,
+        output=str(tmp_path),
+        importance_nested_sampler=True,
+        nlive=1000,
+        min_samples=200,
+        seed=1234,
+        plot=False,
+        checkpointing=False,
+        strict_threshold=True,
+        min_training_ess=target,
+        proposal_class="levels",
+        proposal_kwargs=dict(
+            flow_proposal_class="flowproposal",
+            flow_config=FLOW,
+            training_config=TRAINING,
+            flow_proposal_kwargs=dict(
+                reparameterisations={"x0": "z-score", "x1": "z-score"},
+                sum_mirror_density=True,
+            ),
+            n_pilot=5000,
+        ),
+    )
+    fs.run(plot=False, save=False)
+    assert fs.ns.history.get("top_ups")
+    assert "extra batch" in caplog.text
+    assert "batch limit" not in caplog.text
+    assert sum(fs.ns.sample_counts.values()) == len(fs.ns.samples_unit)
+    err = max(fs.log_evidence_error, 0.02)
+    assert abs(fs.log_evidence - model.log_evidence()) < 4 * err
+
+
+@pytest.mark.parametrize("beta", [1.0, 0.5])
+def test_level_proposal_training_subsample(tmp_path, beta, caplog):
+    """Large training sets are subsampled (keep p ~ w**beta, weights w / p);
+    the evidence is unaffected."""
+    import logging
+
+    caplog.set_level(logging.INFO)
+    model = UniformGaussian([1.0, -2.0])
+    fs = FlowSampler(
+        model,
+        output=str(tmp_path),
+        importance_nested_sampler=True,
+        nlive=1000,
+        min_samples=200,
+        seed=1234,
+        plot=False,
+        checkpointing=False,
+        strict_threshold=True,
+        min_training_ess=600,
+        training_max_samples=800,
+        training_accept_power=beta,
+        proposal_class="levels",
+        proposal_kwargs=dict(
+            flow_proposal_class="flowproposal",
+            flow_config=FLOW,
+            training_config=TRAINING,
+            flow_proposal_kwargs=dict(
+                reparameterisations={"x0": "z-score", "x1": "z-score"},
+                sum_mirror_density=True,
+            ),
+            n_pilot=5000,
+        ),
+    )
+    fs.run(plot=False, save=False)
+    assert "Training set subsampled" in caplog.text
+    # the top-ups target the expected ESS after subsampling
+    import re
+
+    for m in re.finditer(r"ESS (\d+) -> expected (\d+)", caplog.text):
+        assert int(m.group(2)) >= 600 or "extra batch" not in caplog.text
+    err = max(fs.log_evidence_error, 0.02)
+    assert abs(fs.log_evidence - model.log_evidence()) < 4 * err
+
+
+@pytest.mark.parametrize(
+    "seed, score", [(1234, "weight"), (4321, "capped")]
+)
+def test_level_proposal_thinned_levels(tmp_path, seed, score, caplog):
+    """A level thinned after each batch (kept with p ~ s, counted 1/p)
+    keeps the evidence unbiased; the level counts stay the draws."""
+    import logging
+
+    caplog.set_level(logging.INFO)
+    model = UniformGaussian([1.0, -2.0])
+    fs = FlowSampler(
+        model,
+        output=str(tmp_path),
+        importance_nested_sampler=True,
+        nlive=1000,
+        min_samples=200,
+        seed=seed,
+        plot=False,
+        checkpointing=False,
+        strict_threshold=True,
+        min_training_ess=600,
+        min_training_ess_max_batches=50,
+        level_max_samples=1500,
+        level_thin_score=score,
+        proposal_class="levels",
+        proposal_kwargs=dict(
+            flow_proposal_class="flowproposal",
+            flow_config=FLOW,
+            training_config=TRAINING,
+            flow_proposal_kwargs=dict(
+                reparameterisations={"x0": "z-score", "x1": "z-score"},
+                sum_mirror_density=True,
+            ),
+            n_pilot=5000,
+        ),
+    )
+    fs.run(plot=False, save=False)
+    assert "keeps" in caplog.text
+    assert fs.ns.training_samples.thinned
+    assert len(fs.ns.samples_unit) < sum(fs.ns.sample_counts.values())
+    err = max(fs.log_evidence_error, 0.02)
+    assert abs(fs.log_evidence - model.log_evidence()) < 4 * err
+

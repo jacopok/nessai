@@ -67,6 +67,7 @@ with D the dimension the end was extrapolated with.
 import math
 
 import numpy as np
+from scipy.optimize import brentq
 from scipy.special import gammainc, gammaln
 
 from ..stopping_criteria import DifferenceLogEvidence
@@ -318,3 +319,171 @@ def format_progress(p):
     else:
         why = "logL not rising"
     return f"Progress: -logX {x:.1f}, {rate}; no ETA ({why})"
+
+
+def _fit_dimension(x, log_l, log_l_max, max_dimension=None):
+    """D from the linear fit of ln(ln Lmax - ln L) against -logX over the
+    last ``FIT_SPAN`` (see the module's docstring); NaN without one."""
+    if len(x) < 2 or x[-1] - x[0] < FIT_SPAN:
+        return np.nan
+    window = x >= x[-1] - FIT_SPAN
+    delta = log_l_max[-1] - log_l[window]
+    ok = delta > 0
+    if ok.sum() < 3:
+        return np.nan
+    slope = np.polyfit(x[window][ok], np.log(delta[ok]), 1)[0]
+    if slope >= 0:
+        return np.nan
+    dimension = -2 / slope
+    if max_dimension:
+        dimension = min(dimension, max_dimension)
+    return dimension
+
+
+def remaining_log_volume_ratio(
+    log_volume,
+    log_l,
+    log_l_max,
+    log_ratio,
+    n_samples,
+    tolerance=0.0,
+    max_dimension=None,
+):
+    """The -logX still to go before i-nessai's ``log_evidence_ratio`` falls
+    to ``tolerance``, and the dimension it is extrapolated with.
+
+    The ratio is ln(mean weight of the live points / mean weight of all
+    the samples) = ln(Z_above / Z) + ln(N / n_live): the share of the
+    evidence above the threshold, against the share of the samples there.
+    For the Gaussian peak of the module's docstring the share above the
+    threshold at x is P(D/2, Delta(x)) / P(D/2, Delta_0) times today's,
+    Delta(x) = Delta_0 exp(-2 (x - x_0) / D); the live points stay as many
+    and N grows by its measured rate per unit of -logX. The ratio then
+    falls as
+
+        r(x) = r_0 + ln P(D/2, Delta(x)) - ln P(D/2, Delta_0)
+               + ln(N(x) / N_0),
+
+    solved for r(x) = tolerance. On 21 finished i-nessai runs (BNS, D
+    capped at 15) the predicted over the actual -logX left had a median
+    1.14x (16-84%: 1.00-1.26x) before -logX 15, 1.07x (0.88-1.32x) at
+    15-25, 0.93x at 25-40 and 0.81x after (D settles low, as in nessai).
+
+    Returns ``(remaining, dimension)``: NaN if -logX has not advanced by
+    ``FIT_SPAN`` or ln Lmax - ln L does not fall.
+    """
+    x, log_l, log_l_max, log_ratio, n = (
+        np.asarray(a, dtype=float)
+        for a in (log_volume, log_l, log_l_max, log_ratio, n_samples)
+    )
+    dimension = _fit_dimension(x, log_l, log_l_max, max_dimension)
+    if not np.isfinite(dimension):
+        return np.nan, np.nan
+    r_0, x_0 = log_ratio[-1], x[-1]
+    if r_0 <= tolerance:
+        return 0.0, dimension
+    delta_0 = log_l_max[-1] - log_l[-1]
+    if delta_0 <= 0:
+        return 0.0, dimension
+    a = dimension / 2
+    j = int(np.searchsorted(x, x_0 - RATE_SPAN))
+    j = min(j, len(x) - 2)
+    growth = (n[-1] - n[j]) / (x_0 - x[j]) if x_0 > x[j] else 0.0
+    log_p0 = np.log(gammainc(a, delta_0))
+
+    def r(x_end):
+        dx = x_end - x_0
+        with np.errstate(divide="ignore"):
+            log_p = np.log(gammainc(a, delta_0 * np.exp(-dx / a)))
+        return (
+            r_0 + log_p - log_p0 + np.log1p(growth * dx / n[-1]) - tolerance
+        )
+
+    hi = x_0 + 1.0
+    while r(hi) > 0:
+        if hi - x_0 > 1e3:
+            return np.nan, dimension
+        hi = x_0 + 2 * (hi - x_0)
+    return brentq(r, x_0, hi) - x_0, dimension
+
+
+def estimate_importance_progress(sampler):
+    """:func:`estimate_progress` for the importance nested sampler: the
+    -logX left (:func:`remaining_log_volume_ratio`, with the
+    ``log_evidence_ratio`` stop only) and the levels and sampling time to
+    get there, at the rates (levels and seconds per unit of -logX) of the
+    last ``RATE_SPAN``. A level's cost grows with the number of levels (the
+    samples are re-scored under each one), so the ETA is a lower bound
+    that firms up towards the end."""
+    h = sampler.history or {}
+    crit = getattr(sampler, "combined_criterion", None)
+    names = list(getattr(crit, "names", []) or [])
+    out = {
+        "log_volume": np.nan,
+        "ratio_stop": "log_evidence_ratio" in names,
+        "remaining": np.nan,
+        "dimension": np.nan,
+        "levels": np.nan,
+        "seconds_per_level": np.nan,
+        "seconds": np.nan,
+    }
+    keys = ("log_prior_volume", "logL_threshold", "max_log_likelihood",
+            "sampling_time", "n_samples")
+    if any(not h.get(k) for k in keys):
+        return out
+    ratio = h.get("stopping_criteria", {}).get("log_evidence_ratio") or []
+    n = min([len(h[k]) for k in keys] + ([len(ratio)] if ratio else []))
+    if n < 2:
+        out["log_volume"] = float(-h["log_prior_volume"][-1])
+        return out
+    x, log_l, log_l_max, t, n_s = (
+        np.asarray(h[k][-n:], dtype=float) for k in keys
+    )
+    x = -x
+    out["log_volume"] = float(x[-1])
+    if out["ratio_stop"] and ratio:
+        tol = crit.tolerances.get("log_evidence_ratio", 0.0)
+        model_names = getattr(getattr(sampler, "model", None), "names", None)
+        out["remaining"], out["dimension"] = remaining_log_volume_ratio(
+            x,
+            log_l,
+            log_l_max,
+            np.asarray(ratio[-n:], dtype=float),
+            n_s,
+            tolerance=tol,
+            max_dimension=len(model_names) if model_names else None,
+        )
+    j = min(int(np.searchsorted(x, x[-1] - RATE_SPAN)), n - 2)
+    d_x, d_lev, d_t = x[-1] - x[j], n - 1 - j, t[-1] - t[j]
+    if d_lev > 0:
+        out["seconds_per_level"] = d_t / d_lev
+    if d_x > 0 and np.isfinite(out["remaining"]):
+        out["levels"] = out["remaining"] * d_lev / d_x
+        out["seconds"] = out["remaining"] * d_t / d_x
+    return out
+
+
+def format_importance_progress(p):
+    """The progress line the importance nested sampler logs, e.g.
+    ``Progress: -logX 37.2/~49.3 (D 9.2), ETA >= 1.5 h = 174 s/level x
+    31 levels``."""
+    x = p["log_volume"]
+    if np.isfinite(p["remaining"]):
+        end = (
+            f"Progress: -logX {x:.1f}/~{x + p['remaining']:.1f} "
+            f"(D {p['dimension']:.1f})"
+        )
+        if not np.isfinite(p["seconds"]):
+            return f"{end}; no ETA (rate not measured yet)"
+        return (
+            f"{end}, ETA >= {format_duration(p['seconds'])} = "
+            f"{p['seconds_per_level']:.0f} s/level x "
+            f"{p['levels']:.0f} levels"
+        )
+    if not p["ratio_stop"]:
+        why = "needs the log_evidence_ratio stop"
+    elif not np.isfinite(x) or x < FIT_SPAN:
+        why = f"before -logX {FIT_SPAN:.1f}"
+    else:
+        why = "logL not rising"
+    return f"Progress: -logX {x:.1f}; no ETA ({why})"

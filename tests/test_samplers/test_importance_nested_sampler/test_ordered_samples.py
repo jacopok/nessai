@@ -251,15 +251,20 @@ def test_update_evidence(ordered_samples, live_points, nested_samples):
     ordered_samples.state = create_autospec(_INSIntegralState)
     ordered_samples.live_points = live_points
     ordered_samples.nested_samples = nested_samples
+    ordered_samples.thinned = False
     OrderedSamples.update_evidence(ordered_samples)
     ordered_samples.state.update_evidence.assert_called_once_with(
         nested_samples=nested_samples,
         live_points=live_points,
+        log_r_ns=None,
+        log_r_lp=None,
+        log_n_draws=None,
     )
 
 
 def test_finalise(ordered_samples, samples):
     ordered_samples.samples = samples
+    ordered_samples.thinned = False
     ordered_samples.live_points_indices = np.arange(4)
 
     def add_to_ns(indices):
@@ -270,7 +275,9 @@ def test_finalise(ordered_samples, samples):
 
     OrderedSamples.finalise(ordered_samples)
 
-    ordered_samples.state.update_evidence.assert_called_once_with(samples)
+    ordered_samples.state.update_evidence.assert_called_once_with(
+        samples, log_r_ns=None
+    )
     assert ordered_samples.live_points is None
     assert ordered_samples.live_points_indices is None
 

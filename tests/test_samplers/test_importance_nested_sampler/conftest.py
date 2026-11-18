@@ -22,6 +22,10 @@ def iid(request):
 def ins(rng):
     obj = create_autospec(ImportanceNestedSampler)
     obj.model = create_autospec(Model)
+    obj.threshold_step_scale = 1.0
+    obj.min_training_ess = None
+    obj.training_max_samples = None
+    obj.training_accept_power = 1.0
     obj.training_samples = create_autospec(OrderedSamples)
     obj.training_samples.state = create_autospec(_INSIntegralState)
     obj.iid_samples = None

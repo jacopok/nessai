@@ -168,3 +168,44 @@ def test_update_log_likelihood_threshold(ins, iid):
         ins.iid_samples.update_log_likelihood_threshold.assert_called_once_with(  # noqa
             threshold
         )
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.5, 0.25])
+def test_scale_threshold_step(ins, scale):
+    """The weighted fraction kept above the threshold becomes K**scale."""
+    from scipy.special import logsumexp
+
+    rng = np.random.default_rng(3)
+    samples = np.zeros(4000, dtype=[("logL", "f8"), ("logW", "f8")])
+    samples["logL"] = np.sort(rng.normal(size=samples.size))
+    samples["logW"] = rng.normal(size=samples.size)
+    ins.threshold_step_scale = scale
+    n = 1500
+    m = INS._scale_threshold_step(ins, samples, n)
+    log_w = samples["logW"] - logsumexp(samples["logW"])
+    assert m <= n
+    np.testing.assert_allclose(
+        logsumexp(log_w[m:]), scale * logsumexp(log_w[n:]), atol=2e-3
+    )
+
+
+
+
+@pytest.mark.parametrize("beta", [1.0, 0.5])
+def test_training_keep_log_prob(ins, beta):
+    from nessai.samplers.importancesampler import (
+        ImportanceNestedSampler as INS,
+    )
+
+    ins.training_accept_power = beta
+    log_w = np.random.default_rng(1).normal(0, 3, 10000)
+    log_p = INS._training_keep_log_prob(ins, log_w, 1000)
+    assert np.all(log_p <= 0)
+    np.testing.assert_allclose(np.exp(log_p).sum(), 1000, rtol=1e-6)
+    assert log_p[np.argmax(log_w)] == 0
+    if beta < 1:
+        light = log_w < np.median(log_w)
+        p1 = INS._training_keep_log_prob(
+            type("S", (), {"training_accept_power": 1.0})(), log_w, 1000
+        )
+        assert np.exp(log_p[light]).sum() > np.exp(p1[light]).sum()

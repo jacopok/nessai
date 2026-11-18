@@ -32,8 +32,23 @@ from ..utils.stats import (
 )
 from ..utils.structures import get_inverse_indices, get_subset_arrays
 from .base import BaseNestedSampler
+from .progress import (
+    estimate_importance_progress,
+    format_importance_progress,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _keep_log_prob(log_w: np.ndarray, n: int, beta: float) -> np.ndarray:
+    """log p_i = min(0, beta (log w_i - log c)), with log c such that
+    sum(p_i) = n (bisection: the sum falls as c grows)."""
+    lo, hi = log_w.min() - 50 / beta, log_w.max() + 50 / beta
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        s = np.exp(np.minimum(0, beta * (log_w - mid))).sum()
+        lo, hi = (mid, hi) if s > n else (lo, mid)
+    return np.minimum(0, beta * (log_w - hi))
 
 
 class OrderedSamples:
@@ -67,6 +82,51 @@ class OrderedSamples:
         self.state = _INSIntegralState()
         self.log_likelihood_threshold = None
         self.save_log_q = save_log_q
+        # log 1/p of each sample, p its survival probability under thinning
+        self.log_r = None
+
+    @property
+    def thinned(self) -> bool:
+        log_r = getattr(self, "log_r", None)
+        return log_r is not None and bool(np.any(log_r != 0))
+
+    @property
+    def log_n_draws(self) -> Optional[float]:
+        """log of the number of draws the store holds or held (exact), or
+        None when nothing was thinned."""
+        if not self.thinned:
+            return None
+        return float(np.log(self.samples.size + self.n_dropped))
+
+    def _log_r(self, indices=None):
+        """log 1/p of the samples (all, or those at ``indices``), or None
+        when nothing was thinned."""
+        if not self.thinned:
+            return None
+        return self.log_r if indices is None else self.log_r[indices]
+
+    def thin(self, log_p: np.ndarray, keep: np.ndarray) -> None:
+        """Drop the samples not in ``keep``; the kept ones stand for 1/p
+        draws: their prior weight (logU, and so logW) and their count
+        (log_r) gain -log p."""
+        if getattr(self, "log_r", None) is None:
+            self.log_r = np.zeros(self.samples.size)
+        new_index = np.cumsum(keep) - 1
+        self.n_dropped = getattr(self, "n_dropped", 0) + int((~keep).sum())
+
+        def remap(indices):
+            if indices is None:
+                return None
+            indices = indices[keep[indices]]
+            return new_index[indices]
+
+        self.live_points_indices = remap(self.live_points_indices)
+        self.nested_samples_indices = remap(self.nested_samples_indices)
+        self.samples = self.samples[keep]
+        self.log_q = self.log_q[keep]
+        self.log_r = self.log_r[keep] - log_p[keep]
+        self.samples["logU"] -= log_p[keep]
+        self.samples["logW"] -= log_p[keep]
 
     @property
     def live_points(self) -> np.ndarray:
@@ -123,6 +183,7 @@ class OrderedSamples:
     ) -> None:
         self.samples, self.log_q = self.sort_samples(samples, log_q)
         self.live_points_indices = np.arange(self.samples.size, dtype=int)
+        self.log_r = np.zeros(self.samples.size)
 
     def add_samples(self, samples: np.ndarray, log_q: np.ndarray) -> None:
         """Add samples the existing samples"""
@@ -131,6 +192,8 @@ class OrderedSamples:
         indices = np.searchsorted(self.samples["logL"], samples["logL"])
         self.samples = np.insert(self.samples, indices, samples)
         self.log_q = np.insert(self.log_q, indices, log_q, axis=0)
+        if getattr(self, "log_r", None) is not None:
+            self.log_r = np.insert(self.log_r, indices, 0.0)
 
         if self.strict_threshold:
             n = np.argmax(
@@ -203,16 +266,33 @@ class OrderedSamples:
 
     def update_evidence(self) -> None:
         """Update the evidence estimate given the current samples"""
+        thinned = self.thinned
         self.state.update_evidence(
             nested_samples=self.nested_samples,
             live_points=self.live_points,
+            log_r_ns=(
+                self.log_r[self.nested_samples_indices] if thinned else None
+            ),
+            log_r_lp=(
+                self.log_r[self.live_points_indices]
+                if thinned and self.live_points_indices is not None
+                else None
+            ),
+            log_n_draws=self.log_n_draws if thinned else None,
         )
 
     def finalise(self) -> None:
         """Finalise the samples by consuming all of the live points"""
         self.add_to_nested_samples(self.live_points_indices)
         self.live_points = None
-        self.state.update_evidence(self.samples)
+        if self.thinned:
+            self.state.update_evidence(
+                self.samples,
+                log_r_ns=self._log_r(),
+                log_n_draws=self.log_n_draws,
+            )
+        else:
+            self.state.update_evidence(self.samples, log_r_ns=None)
 
     def compute_importance(self, importance_ratio: float = 0.5):
         """Compute the importance
@@ -262,7 +342,8 @@ class OrderedSamples:
             threshold = self.log_likelihood_threshold
         above_threshold = self.samples["logL"] >= threshold
         log_z_above = log_evidence_from_ins_samples(
-            self.samples[above_threshold]
+            self.samples[above_threshold],
+            log_r=self._log_r(above_threshold),
         )
         return log_z_above - self.state.log_evidence
 
@@ -304,6 +385,43 @@ class ImportanceNestedSampler(BaseNestedSampler):
         the number will depend on the level method chosen. Note that this will
         override the choice of live points. The number of points draw is set
         by the live points.
+    min_training_ess
+        If set, once the next threshold is chosen (as without it), the
+        latest level draws more batches of ``nlive`` until the samples
+        above that threshold, the next level's training set, have at least
+        this effective sample size (Kish, of their importance weights), at
+        most ``min_training_ess_max_batches`` batches per threshold. The
+        extra draws count with their level in the meta-proposal.
+    min_training_ess_max_batches
+        See ``min_training_ess``.
+    training_max_samples
+        If set, a training set larger than this is subsampled: sample i is
+        kept with probability p_i = min(1, (w_i / c) ** training_accept_power),
+        c set so that sum(p_i) equals this, and the survivors' weights
+        become w_i / p_i, so the subsample stands for the same target in
+        expectation. Only the training set is subsampled: every sample stays
+        in the evidence and posterior.
+    training_accept_power
+        The power beta in ``training_max_samples``: 1 maximises the expected
+        ESS for the size; lower values keep more of the light samples.
+    level_max_samples
+        If set, after each batch drawn from the latest level (its first
+        draws and every top-up), that level's samples are thinned back to
+        this many in expectation: sample i is kept with p_i = min(1, s_i/c)
+        and from then on stands for 1/p_i draws in the evidence, the
+        posterior and the stopping criterion (Horvitz-Thompson), so the
+        estimates stay unbiased; a sample thinned again multiplies its
+        1/p. Earlier levels are never touched. The level counts in the
+        meta-proposal remain the numbers drawn, and the evidence divides by
+        the exact number of draws.
+    level_thin_score
+        s_i in ``level_max_samples``: "weight" (w_i) or "capped"
+        (w_i min(L_i, L*), which also drops the samples below the
+        threshold L* by their posterior weight).
+    threshold_step_scale
+        Fraction in (0, 1] of the threshold method's step in ln X taken at
+        each level: the weighted fraction of the samples kept above the new
+        threshold is ``K**threshold_step_scale``, ``K`` the method's.
     min_samples
         Minimum number of samples that are used for training the next
         normalising flow.
@@ -383,6 +501,13 @@ class ImportanceNestedSampler(BaseNestedSampler):
         close_pool: bool = False,
         strict_threshold: bool = False,
         draw_iid_live: bool = True,
+        threshold_step_scale: float = 1.0,
+        min_training_ess: Optional[float] = None,
+        min_training_ess_max_batches: int = 10,
+        training_max_samples: Optional[int] = None,
+        training_accept_power: float = 1.0,
+        level_max_samples: Optional[int] = None,
+        level_thin_score: str = "weight",
         proposal_class: Optional[Union[str, type]] = None,
         proposal_kwargs: Optional[dict] = None,
         **kwargs: Any,
@@ -443,6 +568,25 @@ class ImportanceNestedSampler(BaseNestedSampler):
             {} if threshold_kwargs is None else threshold_kwargs
         )
         self.strict_threshold = strict_threshold
+        if not 0 < threshold_step_scale <= 1:
+            raise ValueError("`threshold_step_scale` must be in (0, 1]")
+        self.threshold_step_scale = float(threshold_step_scale)
+        self.min_training_ess = (
+            None if min_training_ess is None else float(min_training_ess)
+        )
+        self.min_training_ess_max_batches = int(min_training_ess_max_batches)
+        if not 0 < training_accept_power <= 1:
+            raise ValueError("training_accept_power must be in (0, 1]")
+        self.training_max_samples = (
+            None if training_max_samples is None else int(training_max_samples)
+        )
+        self.training_accept_power = float(training_accept_power)
+        self.level_max_samples = (
+            None if level_max_samples is None else int(level_max_samples)
+        )
+        if level_thin_score not in ("weight", "capped"):
+            raise ValueError("level_thin_score must be 'weight' or 'capped'")
+        self.level_thin_score = level_thin_score
         self.logX = 0.0
         self.log_likelihood_threshold = -np.inf
         self.logL_pre = -np.inf
@@ -843,6 +987,9 @@ class ImportanceNestedSampler(BaseNestedSampler):
                     pool_entropy=[],
                     samples_entropy=[],
                     proposal_entropy=[],
+                    sampling_time=[],
+                    n_samples=[],
+                    log_prior_volume=[],
                     stopping_criteria={k: [] for k in self.stopping_criteria},
                 )
             )
@@ -871,6 +1018,17 @@ class ImportanceNestedSampler(BaseNestedSampler):
         self.history["live_points_ess"].append(self.live_points_ess)
         self.history["likelihood_evaluations"].append(
             self.model.likelihood_evaluations
+        )
+        # (missing from the history of a checkpoint from before them)
+        self.history.setdefault("sampling_time", []).append(
+            self.current_sampling_time.total_seconds()
+        )
+        self.history.setdefault("n_samples", []).append(
+            sum(self.sample_counts.values())
+        )
+        # ln X as logged (logX above is the live points' unnormalised sum)
+        self.history.setdefault("log_prior_volume", []).append(
+            self.log_prior_volume()
         )
 
         for name in self.stopping_criteria:
@@ -1034,6 +1192,8 @@ class ImportanceNestedSampler(BaseNestedSampler):
             n = self.determine_threshold_entropy(samples, **kwargs)
         else:
             raise ValueError(method)
+        if getattr(self, "threshold_step_scale", 1.0) != 1.0:
+            n = self._scale_threshold_step(samples, n)
         logger.debug(f"Next iteration should remove {n} points")
         if n == 0:
             if self.min_remove < 1:
@@ -1066,6 +1226,128 @@ class ImportanceNestedSampler(BaseNestedSampler):
         threshold = samples[n]["logL"].copy()
         return threshold
 
+    def top_up_latest_level(self, n: int) -> None:
+        """``n`` more draws from the latest level: its count rises, so every
+        sample's meta-proposal (and weight) is recomputed; no new level."""
+        st = datetime.datetime.now()
+        it = max(self.sample_counts)
+        self.sample_counts[it] += n
+        n_total = sum(self.sample_counts.values())
+        self.proposal.update_proposal_weights(
+            {k: v / n_total for k, v in self.sample_counts.items()}
+        )
+        sets = [self.training_samples]
+        if self.draw_iid_live:
+            sets.append(self.iid_samples)
+        for ordered in sets:
+            if getattr(ordered, "log_likelihood_threshold", None) is None:
+                ordered.update_log_likelihood_threshold(
+                    self.log_likelihood_threshold
+                )
+            if it < 0:  # before the first level: the initial prior draws
+                new, log_q = self.proposal.draw_from_prior(n)
+                new["logL"] = self.model.batch_evaluate_log_likelihood(
+                    new, unit_hypercube=True
+                )
+            else:
+                new, log_q = self.draw_n_samples(n)
+            new["it"] = it
+            ordered.samples["logQ"] = (
+                self.proposal.compute_meta_proposal_from_log_q(ordered.log_q)
+            )
+            ordered.samples["logW"] = (
+                ordered.samples["logU"] - ordered.samples["logQ"]
+            )
+            ordered.add_samples(new, log_q)
+        self.history.setdefault("top_ups", []).append((self.iteration, n))
+        self.add_and_update_samples_time += datetime.datetime.now() - st
+        logger.debug(
+            f"Topped up level {it} with {n} draws: "
+            f"{self.live_points_unit.size} live points"
+        )
+
+    def training_ess(self, threshold: float) -> float:
+        """ESS of the live points at or above ``threshold``, the expected ESS
+        after subsampling with ``training_max_samples``."""
+        samples = self.training_samples.samples
+        if samples is None:
+            return 0.0
+        above = samples[samples["logL"] >= threshold]
+        if not len(above):
+            return 0.0
+        log_w = above["logW"]
+        n_max = getattr(self, "training_max_samples", None)
+        if n_max is not None and log_w.size > n_max:
+            # expected ESS once subsampled for training
+            log_p = self._training_keep_log_prob(log_w, n_max)
+            return float(
+                np.exp(2 * logsumexp(log_w) - logsumexp(2 * log_w - log_p))
+            )
+        return effective_sample_size(log_w)
+
+    def _choose_threshold(self) -> float:
+        """The next threshold, and with ``min_training_ess`` the latest
+        level topped up until the samples above it have that ESS."""
+        threshold = self.determine_log_likelihood_threshold(
+            self.live_points_unit,
+            method=self.threshold_method,
+            **self.threshold_kwargs,
+        )
+        target = getattr(self, "min_training_ess", None)
+        if not target:
+            return threshold
+        ess = self.training_ess(threshold)
+        k = 0
+        level = max(self.sample_counts)
+        st = datetime.datetime.now()
+        while ess < target and k < self.min_training_ess_max_batches:
+            self.top_up_latest_level(self.nlive)
+            self._thin_latest_level(threshold)
+            ess = self.training_ess(threshold)
+            k += 1
+            logger.info(
+                f"Level {level} top-up {k}: training ESS {ess:.0f} / "
+                f"{target:.0f}, {self.sample_counts[level]} draws, "
+                f"{(datetime.datetime.now() - st).total_seconds():.0f} s"
+            )
+        if k:
+            thinned = [
+                h for h in self.history.get("thinned", [])
+                if h[0] == self.iteration
+            ]
+            if thinned:
+                level = thinned[-1][1]
+                logger.info(
+                    f"Level {level} keeps {thinned[-1][3]} samples of "
+                    f"{self.sample_counts[level]} draws"
+                )
+            msg = (
+                f"Training ESS {ess:.0f} above logL {threshold:.3f} after "
+                f"{k} extra batch(es) of {self.nlive} (target {target:.0f})"
+            )
+            if ess < target:
+                logger.warning(msg + ": batch limit reached")
+            else:
+                logger.info(msg)
+        return threshold
+
+    def _scale_threshold_step(self, samples: np.ndarray, n: int) -> int:
+        """``n`` (points below the next threshold, ``samples`` sorted by
+        logL) moved so that the step in ln X is ``threshold_step_scale`` of
+        the method's: the weighted fraction kept above the threshold becomes
+        ``K**s`` instead of ``K``."""
+        s = getattr(self, "threshold_step_scale", 1.0)
+        if s == 1.0 or n <= 0:
+            return n
+        log_w = samples["logW"] - logsumexp(samples["logW"])
+        # log of the weighted fraction at or above each index
+        log_above = np.logaddexp.accumulate(log_w[::-1])[::-1]
+        target = s * log_above[n]
+        # the highest index still keeping at least the target fraction
+        m = int(np.flatnonzero(log_above >= target)[-1])
+        logger.debug(f"Threshold step x{s}: removing {m} instead of {n}")
+        return min(m, n)
+
     def update_log_likelihood_threshold(self, threshold: float) -> None:
         self.log_likelihood_threshold = threshold
         self.training_samples.update_log_likelihood_threshold(
@@ -1075,6 +1357,45 @@ class ImportanceNestedSampler(BaseNestedSampler):
             self.iid_samples.update_log_likelihood_threshold(
                 self.log_likelihood_threshold
             )
+
+    def _training_keep_log_prob(
+        self, log_w: np.ndarray, n: int
+    ) -> np.ndarray:
+        """log p_i = min(0, beta (log w_i - log c)), log c such that
+        sum(p_i) = n (bisection: the sum falls as c grows)."""
+        return _keep_log_prob(log_w, n, self.training_accept_power)
+
+    def _thin_latest_level(self, threshold: float) -> None:
+        """With ``level_max_samples``: thin the latest level's samples (in
+        the training set, and the iid set with ``draw_iid_live``) back to
+        that many in expectation."""
+        m = getattr(self, "level_max_samples", None)
+        if m is None:
+            return
+        level = max(self.sample_counts)
+        sets = [self.training_samples]
+        if self.draw_iid_live and self.iid_samples is not None:
+            sets.append(self.iid_samples)
+        for ordered in sets:
+            pool = ordered.samples["it"] == level
+            n_pool = int(pool.sum())
+            if n_pool <= m:
+                continue
+            s = ordered.samples["logW"][pool].copy()
+            if self.level_thin_score == "capped" and np.isfinite(threshold):
+                s += np.minimum(ordered.samples["logL"][pool], threshold)
+            log_p = np.zeros(ordered.samples.size)
+            log_p[pool] = _keep_log_prob(s, m, 1.0)
+            keep = np.log(np.random.rand(log_p.size)) < log_p
+            ordered.thin(log_p, keep)
+            logger.debug(
+                f"Thinned level {level} from {n_pool} to "
+                f"{int(keep[pool].sum())} samples"
+            )
+            if ordered is self.training_samples:
+                self.history.setdefault("thinned", []).append(
+                    (self.iteration, level, n_pool, int(keep[pool].sum()))
+                )
 
     def add_new_proposal(self):
         """Add a new proposal to the meta proposal"""
@@ -1097,6 +1418,28 @@ class ImportanceNestedSampler(BaseNestedSampler):
         self.current_training_log_q = self.training_samples.log_q[
             n_train:, :
         ].copy()
+
+        n_max = getattr(self, "training_max_samples", None)
+        if n_max is not None and len(self.current_training_samples) > n_max:
+            log_w = self.current_training_samples["logW"]
+            log_p = self._training_keep_log_prob(log_w, n_max)
+            keep = np.log(np.random.rand(log_w.size)) < log_p
+            ess_full = effective_sample_size(log_w)
+            # expected ESS of the w / p subsample: (sum w)^2 / sum(w^2 / p)
+            ess_exp = np.exp(
+                2 * logsumexp(log_w) - logsumexp(2 * log_w - log_p)
+            )
+            self.current_training_samples = self.current_training_samples[
+                keep
+            ].copy()
+            self.current_training_samples["logW"] -= log_p[keep]
+            self.current_training_log_q = self.current_training_log_q[keep]
+            logger.info(
+                f"Training set subsampled to {keep.sum()} of {keep.size} "
+                f"(power {self.training_accept_power}): ESS {ess_full:.0f} "
+                f"-> expected {ess_exp:.0f}, drawn "
+                f"{effective_sample_size(self.current_training_samples['logW']):.0f}"
+            )
 
         logger.info(
             "Training next proposal with "
@@ -1302,6 +1645,8 @@ class ImportanceNestedSampler(BaseNestedSampler):
 
     def adjust_final_samples(self, n_batches=5):
         """Adjust the final samples"""
+        if getattr(self.training_samples, "thinned", False) is True:
+            raise RuntimeError("adjust_final_samples needs an unthinned store")
         orig_n_total = len(self.samples_unit)
         its, counts = np.unique(self.samples_unit["it"], return_counts=True)
         assert counts.sum() == orig_n_total
@@ -1485,6 +1830,16 @@ class ImportanceNestedSampler(BaseNestedSampler):
             return -np.inf
         return float(logsumexp(samples["logW"][above]) - np.log(samples.size))
 
+    def log_progress(self):
+        """Log the -logX at which the run is expected to stop and the time
+        to get there (:func:`~nessai.samplers.progress.estimate_importance_progress`)."""
+        try:
+            logger.info(
+                format_importance_progress(estimate_importance_progress(self))
+            )
+        except Exception:
+            logger.debug("Progress estimate failed", exc_info=True)
+
     def log_state(self):
         """Log the state of the sampler"""
         logger.info(
@@ -1517,7 +1872,7 @@ class ImportanceNestedSampler(BaseNestedSampler):
 
         See also: code:`update_sample_counts`.
         """
-        n_total = len(self.samples_unit)
+        n_total = sum(self.sample_counts.values())
         new_weights = {k: v / n_total for k, v in self.sample_counts.items()}
         self.proposal.update_proposal_weights(new_weights)
 
@@ -1547,7 +1902,7 @@ class ImportanceNestedSampler(BaseNestedSampler):
             raise RuntimeError(
                 f"Samples already drawn from proposal {iteration}"
             )
-        n_total = len(self.samples_unit) + n_new
+        n_total = sum(self.sample_counts.values()) + n_new
         self.sample_counts[iteration] = n_new
         new_weights = {k: v / n_total for k, v in self.sample_counts.items()}
         self.proposal.update_proposal_weights(new_weights)
@@ -1567,11 +1922,7 @@ class ImportanceNestedSampler(BaseNestedSampler):
             self._compute_gradient()
 
             if self.n_update is None:
-                threshold = self.determine_log_likelihood_threshold(
-                    self.live_points_unit,
-                    method=self.threshold_method,
-                    **self.threshold_kwargs,
-                )
+                threshold = self._choose_threshold()
             else:
                 threshold = self.live_points_unit[self.n_update]["logL"].copy()
 
@@ -1591,6 +1942,8 @@ class ImportanceNestedSampler(BaseNestedSampler):
 
             self.add_and_update_points(n_add)
 
+            self._thin_latest_level(self.log_likelihood_threshold)
+
             self.update_evidence()
 
             self.importance = self.compute_importance(importance_ratio=0.5)
@@ -1600,6 +1953,7 @@ class ImportanceNestedSampler(BaseNestedSampler):
             self.log_state()
 
             self.update_history()
+            self.log_progress()
             self.iteration += 1
             if not self.iteration % self.plotting_frequency:
                 self.produce_plots()

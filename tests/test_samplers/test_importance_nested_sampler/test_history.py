@@ -11,6 +11,7 @@ def test_update_history(ins, history):
     ins.samples_entropy = 1.1
     ins.current_proposal_entropy = 0.8
     ins.live_points_ess = 300
+    ins.sample_counts = {-1: 100, 0: 50}
 
     ins.stopping_criteria = ["ess", "ratio"]
     ins.state = MagicMock()

@@ -482,11 +482,25 @@ class _INSIntegralState(_BaseNSIntegralState):
         self._weights_ns = None
         self._weights_lp = None
         self._weights = None
+        # log 1/p per sample (thinned stores): None means every p = 1
+        self._log_r = None
+        self._log_r_ns = None
+        self._log_r_lp = None
+
+    @staticmethod
+    def _log_count(weights, log_r):
+        """log of the number of draws the samples stand for: sum(1/p)."""
+        if log_r is None:
+            return np.log(weights.size)
+        return logsumexp(log_r)
 
     @property
     def logZ(self) -> float:
         """The current log-evidence."""
-        return self._logZ - np.log(self._n)
+        log_n = getattr(self, "_log_n_draws", None)
+        if log_n is None:
+            return self._logZ - np.log(self._n)
+        return self._logZ - log_n
 
     log_evidence = logZ
     """Alias for logZ"""
@@ -511,12 +525,16 @@ class _INSIntegralState(_BaseNSIntegralState):
         """Log-evidence in the live points."""
         if self._weights_lp is None:
             raise RuntimeError("Live points are not set")
-        return logsumexp(self._weights_lp) - np.log(self._weights_lp.size)
+        return logsumexp(self._weights_lp) - self._log_count(
+            self._weights_lp, getattr(self, "_log_r_lp", None)
+        )
 
     @property
     def log_evidence_nested_samples(self) -> float:
         """Log-evidence in the nested samples"""
-        return logsumexp(self._weights_ns) - np.log(self._weights_ns.size)
+        return logsumexp(self._weights_ns) - self._log_count(
+            self._weights_ns, getattr(self, "_log_r_ns", None)
+        )
 
     @property
     def fractional_error(self) -> float:
@@ -551,6 +569,9 @@ class _INSIntegralState(_BaseNSIntegralState):
         self,
         nested_samples: np.ndarray,
         live_points: Optional[np.ndarray] = None,
+        log_r_ns: Optional[np.ndarray] = None,
+        log_r_lp: Optional[np.ndarray] = None,
+        log_n_draws: Optional[float] = None,
     ) -> None:
         """Update the evidence.
 
@@ -578,6 +599,21 @@ class _INSIntegralState(_BaseNSIntegralState):
             self._weights_lp = None
         self._logZ = logsumexp(self._weights)
         self._n = self._weights.size
+        self._log_r_ns, self._log_r_lp = log_r_ns, log_r_lp
+        self._log_n_draws = log_n_draws
+        if log_r_ns is None and log_r_lp is None:
+            self._log_r = None
+        else:
+            parts = [
+                np.zeros(self._weights_ns.size) if log_r_ns is None
+                else np.asarray(log_r_ns, float)
+            ]
+            if self._weights_lp is not None:
+                parts.append(
+                    np.zeros(self._weights_lp.size) if log_r_lp is None
+                    else np.asarray(log_r_lp, float)
+                )
+            self._log_r = np.concatenate(parts)
 
     def compute_log_evidence_ratio(self, ns_only: bool = False) -> float:
         """
@@ -633,9 +669,22 @@ class _INSIntegralState(_BaseNSIntegralState):
         """
         n = self._n
         # Standard error sqrt(Var[Z] / n), relative to Z: computed on the
-        # weights divided by Z so that it cannot overflow at large ln L
+        # weights divided by Z so that it cannot overflow at large ln L.
+        # A thinned store (counts c = 1/p) uses the ratio estimator's
+        # sum((r - c)^2) / (sum c)^2, which is the same for c = 1.
         r = np.exp(np.asarray(self._weights, dtype=float) - self.logZ)
-        u_rel = np.sqrt(np.sum((r - 1) ** 2) / (n * (n - 1)))
+        log_r = getattr(self, "_log_r", None)
+        if log_r is None:
+            u_rel = np.sqrt(np.sum((r - 1) ** 2) / (n * (n - 1)))
+        else:
+            # thinned (sample i kept with p_i = 1/c_i, r_i includes c_i):
+            # the draws' scatter, estimated from the kept samples, plus the
+            # thinning's own variance sum(r_i^2 (1 - p_i)), over N draws
+            c = np.exp(log_r)
+            n_draws = np.exp(self._log_n_draws)
+            var = np.sum((r - c) ** 2 / c) * n_draws / (n_draws - 1)
+            var += np.sum(r**2 * (1 - 1 / c))
+            u_rel = np.sqrt(var) / n_draws
         if log_evidence:
             # sigma[ln Z] = |sigma[Z] / Z|
             return float(u_rel)
@@ -643,7 +692,9 @@ class _INSIntegralState(_BaseNSIntegralState):
             return u_rel * np.exp(self.logZ, dtype=np.longdouble)
 
 
-def log_evidence_from_ins_samples(samples: np.ndarray) -> float:
+def log_evidence_from_ins_samples(
+    samples: np.ndarray, log_r: Optional[np.ndarray] = None
+) -> float:
     """Compute the log-evidence for a given set of samples from the importance
     nested sampler.
 
@@ -658,4 +709,5 @@ def log_evidence_from_ins_samples(samples: np.ndarray) -> float:
     float
         The log-evidence
     """
-    return logsumexp(samples["logL"] + samples["logW"]) - np.log(len(samples))
+    log_n = np.log(len(samples)) if log_r is None else logsumexp(log_r)
+    return logsumexp(samples["logL"] + samples["logW"]) - log_n
