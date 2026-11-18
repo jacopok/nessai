@@ -1239,8 +1239,19 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         ``K`` copies.
         """
         k, b = self.group_size, x.shape[0]
-        fast = (getattr(self.prime_space_action, "preimages", None)
-                if self.uses_prime_space_action else None)
+        self._preimage_domain = (x, None)
+        action = self.prime_space_action if self.uses_prime_space_action else None
+        with_domain = getattr(action, "preimages_with_domain", None)
+        fast = getattr(action, "preimages", None)
+        if with_domain is not None:
+            # the action also gives each pre-image's domain membership, from
+            # its own encoding terms (see _branch_log_probs)
+            mapped, mask = with_domain(
+                {name: x[:, i] for i, name in enumerate(self.param_names)}, k
+            )
+            self._preimage_domain = (x, mask)
+            pre = torch.stack([mapped[name] for name in self.param_names], dim=-1)
+            return pre.view(k, b, -1), x.new_zeros(k * b).view(k, b)
         if fast is not None:
             out = fast({name: x[:, i] for i, name in enumerate(self.param_names)}, k)
             mapped, logdet = out if isinstance(out, tuple) else (out, None)
@@ -1268,7 +1279,10 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             self._branch_memo = None
         else:
             pre, _ = self._preimages(x)
+            dmemo = getattr(self, "_preimage_domain", (None, None))
             in_dom = None
+            if dmemo[0] is x and dmemo[1] is not None:
+                in_dom = dmemo[1].to(torch.bool).view(pre.shape[0], pre.shape[1])
         if self.in_fundamental_domain is None and not self.uses_prime_space_action:
             return (
                 torch.zeros(x.shape[0], dtype=torch.long, device=x.device),
@@ -1779,7 +1793,11 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             ).view(k, b)
             return base_lp + log_pi
 
-        in_dom = self._in_domain(flat_pre).view(k, b)
+        memo = getattr(self, "_preimage_domain", (None, None))
+        if memo[0] is x and memo[1] is not None:
+            in_dom = memo[1].to(torch.bool).view(k, b)
+        else:
+            in_dom = self._in_domain(flat_pre).view(k, b)
         self._branch_memo = (x, pre, in_dom)
         # Points no branch claims: evaluate all their branches (fallback).
         eval_mask = in_dom | (~in_dom.any(dim=0, keepdim=True))
