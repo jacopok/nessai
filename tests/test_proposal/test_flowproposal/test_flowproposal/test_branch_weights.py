@@ -130,3 +130,126 @@ def test_unclaimed_points_are_not_shifted():
     assert lev[1] == pytest.approx(0.0)
     assert lev[0] == pytest.approx(np.log(0.9 / 0.5))
     assert lev[2] == pytest.approx(np.log(0.1 / 0.5))
+
+
+# keep / refit (branch_weights_keep, branch_weights_refit)
+
+from functools import partial  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+from unittest.mock import MagicMock, create_autospec  # noqa: E402
+
+from nessai.proposal.flowproposal.base import BaseFlowProposal  # noqa: E402
+from nessai.proposal.flowproposal.flowproposal import FlowProposal  # noqa: E402
+
+
+def _proposal(wrapper, params=None, keep=True):
+    p = SimpleNamespace(
+        branch_weights=True,
+        branch_weights_keep=keep,
+        branch_weights_kwargs={},
+        branch_weights_params=params,
+        branch_weights_history=[],
+        flow=SimpleNamespace(model=wrapper),
+        training_count=3,
+        _truncation_scheme=None,
+        current_live_points=np.zeros(10),
+        training_data=None,
+    )
+    for name in ("_project_branch_weights", "_install_branch_weights",
+                 "_clear_branch_weights", "_update_branch_weights"):
+        setattr(p, name, partial(getattr(BaseFlowProposal, name), p))
+    if params is not None:
+        wrapper.set_branch_weights(params)
+    return p
+
+
+@pytest.fixture()
+def fit_stub(monkeypatch):
+    """fit_and_check returning ``stub.result`` and recording the weights in
+    place it was called with."""
+    stub = SimpleNamespace(result=None, seen=[])
+
+    def fake(proposal, x, quantile, **kwargs):
+        w0 = proposal.flow.model.proposal_weights.detach().numpy().copy()
+        stub.seen.append(w0)
+        if stub.result is None:
+            return None, dict(accepted=False, reason="decomposition error")
+        return stub.result[None, :], dict(accepted=True, weights_in_place=w0[None, :],
+                                          heldout_gain=1.0, heldout_excluded=0.0)
+
+    monkeypatch.setattr(BW, "fit_and_check", fake)
+    monkeypatch.setattr(BW, "supports_branch_weights", lambda model: True)
+    return stub
+
+
+def test_projection_follows_the_active_elements(wrapper):
+    wrapper.weights.copy_(torch.tensor([0.5, 0.5, 0.0, 0.0]))
+    p = _proposal(wrapper)
+    w = p._project_branch_weights(np.array([0.6, 0.0, 0.4, 0.0]))
+    # element 1 active only now: its live-point weight; element 2 inactive now
+    assert np.allclose(w, np.array([0.6, 0.5, 0.0, 0.0]) / 1.1)
+
+
+def test_projection_none_when_the_group_changed(wrapper):
+    p = _proposal(wrapper)
+    assert p._project_branch_weights(np.ones(3) / 3) is None
+
+
+def test_rejected_fit_after_training_keeps_the_previous_weights(wrapper, fit_stub):
+    wrapper.weights.copy_(torch.tensor([0.25, 0.25, 0.25, 0.25]))
+    previous = np.array([0.7, 0.1, 0.1, 0.1])
+    p = _proposal(wrapper)  # cleared by the training
+    p._update_branch_weights(previous=previous)
+    assert np.allclose(wrapper.fitted_branch_weights, previous)
+    assert p.branch_weights_history[-1]["kept_previous"]
+
+
+def test_rejected_fit_without_keep_leaves_none(wrapper, fit_stub):
+    p = _proposal(wrapper, keep=False)
+    p._update_branch_weights(previous=np.array([0.7, 0.1, 0.1, 0.1]))
+    assert wrapper.fitted_branch_weights is None
+    assert p.branch_weights_params is None
+
+
+def test_refit_starts_from_the_projected_weights_in_place(wrapper, fit_stub):
+    wrapper.weights.copy_(torch.tensor([0.5, 0.5, 0.0, 0.0]))
+    p = _proposal(wrapper, params=np.array([0.5, 0.5, 0.0, 0.0]))
+    # element 1 lost its live points since the last fit
+    wrapper.weights.copy_(torch.tensor([1.0, 0.0, 0.0, 0.0]))
+    p._update_branch_weights(refit=True)
+    assert np.allclose(fit_stub.seen[-1], [1.0, 0.0, 0.0, 0.0])
+    # a rejected refit keeps them
+    assert np.allclose(wrapper.fitted_branch_weights, [1.0, 0.0, 0.0, 0.0])
+    assert p.branch_weights_history[-1]["refit"]
+
+
+def test_accepted_refit_installs_the_new_weights(wrapper, fit_stub):
+    wrapper.weights.copy_(torch.tensor([0.25, 0.25, 0.25, 0.25]))
+    p = _proposal(wrapper, params=np.array([0.25, 0.25, 0.25, 0.25]))
+    fit_stub.result = np.array([0.4, 0.4, 0.1, 0.1])
+    p._update_branch_weights(refit=True)
+    assert np.allclose(wrapper.fitted_branch_weights, [0.4, 0.4, 0.1, 0.1])
+    assert np.allclose(p.branch_weights_params, [0.4, 0.4, 0.1, 0.1])
+
+
+class _Stop(Exception):
+    pass
+
+
+@pytest.mark.parametrize("refit, pilot, called", [
+    (True, False, True), (False, False, False), (True, True, False)])
+def test_populate_refits_before_the_pool(refit, pilot, called):
+    proposal = create_autospec(FlowProposal)
+    proposal.initialised = True
+    proposal.branch_weights = True
+    proposal.branch_weights_refit = refit
+    proposal.training_count = 2
+    proposal.current_live_points = np.zeros(5)
+    proposal._truncation_scheme = MagicMock()
+    proposal._truncation_scheme.prepare.side_effect = _Stop
+    with pytest.raises(_Stop):
+        FlowProposal.populate(proposal, None, n_samples=10, pilot=pilot)
+    if called:
+        proposal._update_branch_weights.assert_called_once_with(refit=True)
+    else:
+        proposal._update_branch_weights.assert_not_called()

@@ -227,6 +227,16 @@ class FlowProposal(BaseFlowProposal):
         in place. See :mod:`nessai.proposal.flowproposal.branch_weights`.
     branch_weights_kwargs : dict, optional
         Options of :func:`~nessai.proposal.flowproposal.branch_weights.fit_and_check`.
+    branch_weights_keep : bool
+        When the fit after a training fails its checks, keep the last
+        accepted weights (on the elements active now; an element active only
+        now at its live-point weight) instead of none: the importance or
+        live-point weights only until a first fit is accepted.
+    branch_weights_refit : bool
+        Refit the element weights before every populate, from the weights
+        in place, and not only after a training: the live points can leave
+        group elements (slowly dying modes) between trainings. A fit costs
+        about a second.
     **kwargs
         Additional keyword arguments to pass to the base class.
     """
@@ -265,6 +275,8 @@ class FlowProposal(BaseFlowProposal):
         latent_distortion_kwargs=None,
         branch_weights=False,
         branch_weights_kwargs=None,
+        branch_weights_keep=True,
+        branch_weights_refit=True,
         **kwargs,
     ):
         super().__init__(model, poolsize=poolsize, **kwargs)
@@ -276,6 +288,8 @@ class FlowProposal(BaseFlowProposal):
         )
         self.branch_weights = bool(branch_weights)
         self.branch_weights_kwargs = dict(branch_weights_kwargs or {})
+        self.branch_weights_keep = bool(branch_weights_keep)
+        self.branch_weights_refit = bool(branch_weights_refit)
         self.branch_weights_params = None
         self.branch_weights_history = []
         self.population_truncation_history = []
@@ -803,6 +817,17 @@ class FlowProposal(BaseFlowProposal):
                 "first."
             )
 
+        if (
+            not pilot
+            and getattr(self, "branch_weights", False) is True
+            and getattr(self, "branch_weights_refit", False) is True
+            and getattr(self, "training_count", 0) > 0
+            and getattr(self, "current_live_points", None) is not None
+            and len(self.current_live_points)
+        ):
+            # the element weights follow the live points between trainings
+            self._update_branch_weights(refit=True)
+
         self._truncation_scheme.prepare(self, worst_point, radius=r)
 
         if self.indices:
@@ -1263,5 +1288,7 @@ class FlowProposal(BaseFlowProposal):
         state.setdefault("branch_weights_kwargs", {})
         state.setdefault("branch_weights_params", None)
         state.setdefault("branch_weights_history", [])
+        state.setdefault("branch_weights_keep", True)
+        state.setdefault("branch_weights_refit", True)
         state.setdefault("population_truncation_history", [])
         self.__dict__.update(state)
