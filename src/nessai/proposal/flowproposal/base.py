@@ -1190,19 +1190,25 @@ class BaseFlowProposal(RejectionProposal):
             rule = scheme.get_rule("log_proposal_threshold") if scheme else None
             quantile = rule.quantile if rule is not None else 0.01
             kwargs = dict(getattr(self, "branch_weights_kwargs", {}) or {})
+            method = kwargs.pop("method", "fit")
             st = datetime.datetime.now()
             live = getattr(self, "current_live_points", None)
             x = live if live is not None and len(live) else self.training_data
-            w, fit_info = fit_and_check(self, x, quantile, **kwargs)
+            if method == "coverage":
+                from .branch_weights import coverage_weights
+
+                w, fit_info = coverage_weights(self, x, quantile)
+            else:
+                w, fit_info = fit_and_check(self, x, quantile, **kwargs)
             info.update(fit_info)
             info["time"] = (datetime.datetime.now() - st).total_seconds()
             if w is not None:
                 params = list(w) if hasattr(model, "experts") else w[0]
                 self._install_branch_weights(params)
                 w0 = info.pop("weights_in_place")
-                act = w0 > 0
+                act = (w0 > 0) & (w > 0)
                 ratio = np.abs(np.log(w[act] / w0[act]))
-                info.update(max_log_ratio=float(ratio.max()))
+                info.update(max_log_ratio=float(ratio.max()) if act.any() else 0.0)
             elif (
                 not refit
                 and previous is not None
@@ -1217,11 +1223,11 @@ class BaseFlowProposal(RejectionProposal):
         self.branch_weights_history.append(info)
         if info.get("accepted"):
             logger.debug(
-                "Branch weights%s: held-out threshold gain %.2f nats, excluded "
-                "%.3g; |log w / w_in_place| <= %.2f (%.1f s)",
+                "Branch weights%s (%s): held-out threshold gain %s, "
+                "|log w / w_in_place| <= %.2f (%.1f s)",
                 " (refit)" if refit else "",
-                info["heldout_gain"],
-                info["heldout_excluded"],
+                info.get("method", "fit"),
+                info.get("heldout_gain", "-"),
                 info["max_log_ratio"],
                 info["time"],
             )

@@ -237,3 +237,87 @@ def fit_and_check(proposal, x, quantile, **kwargs):
     info["accepted"] = True
     info["weights_in_place"] = w0
     return w, info
+
+
+def coverage_weights(proposal, x, quantile):
+    """Element weights that give every group element the same coverage of
+    its own live points by the clip cap (``method="coverage"``).
+
+    In element ``g`` the proposal is ``w_g b(x)`` with ``b`` the base flow
+    shared by every element, so the pool's region there (``c w_g b >= pi``,
+    ``c`` the clip cap) depends only on ``c w_g``: the cheapest pool that
+    covers each element's contour to the same standard puts the same
+    fraction ``quantile`` (the cap's quantile, alpha) of each element's live
+    points over the cap. With ``u = log b - log pi`` each live point's level
+    without its element's weight, that is ``log w_g = -Q_alpha(u in g)``,
+    normalised per expert. Nothing is truncated: the clip and its
+    compression correction are unchanged, only the weights.
+
+    An element with fewer than ``1 / alpha`` live points has no direct
+    alpha-quantile: the minimum of ``n`` points sits on average at the
+    ``1 / (n + 1)`` quantile, so its alpha-quantile is that minimum shifted
+    by the gap between the ``1 / (n + 1)`` and alpha quantiles of the pooled
+    within-element distribution of ``u`` (each well-populated element's
+    levels relative to its own alpha-quantile; all the expert's points
+    relative to their alpha-quantile when no element is well populated).
+    Elements without live points get zero weight.
+
+    Each live point counts for the (mirror copy, expert) term dominating its
+    density. Returns ``(weights [experts, group_size], info)``.
+    """
+    lp, a, w0 = branch_terms(proposal, x)
+    log_p = np.asarray(proposal.log_prior(x.copy()), dtype=float)
+    S, n, E = lp.shape
+    K = w0.shape[1]
+    log_w0 = np.where(w0 > 0, np.log(np.where(w0 > 0, w0, 1.0)), 0.0)
+    e_idx = np.arange(E)[None, None, :]
+    safe = np.where(a >= 0, a, 0)
+    with np.errstate(invalid="ignore"):
+        u = lp - log_w0[e_idx, safe] - log_p[None, :, None]
+    claimed = (a >= 0) & np.isfinite(lp) & np.isfinite(log_p)[None, :, None]
+    t = np.where(claimed, lp, -np.inf)
+    flat = np.moveaxis(t, 0, 1).reshape(n, S * E)
+    ok = np.isfinite(flat).any(axis=1)
+    best = np.argmax(np.where(np.isfinite(flat), flat, -np.inf), axis=1)
+    s_i, e_i = np.divmod(best, E)
+    rows = np.arange(n)
+    g_i = a[s_i, rows, e_i]
+    u_i = u[s_i, rows, e_i]
+    ok &= np.isfinite(u_i)
+    live_w = np.stack(
+        [e.weights.detach().cpu().numpy() for e in _experts(proposal.flow.model)]
+    ).astype(float)
+    n_min = int(np.ceil(1.0 / quantile))
+    log_w = np.full((E, K), -np.inf)
+    counts = np.zeros((E, K), dtype=int)
+    n_small = 0
+    for j in range(E):
+        mj = ok & (e_i == j)
+        if not mj.any():
+            continue
+        groups = {g: u_i[mj & (g_i == g)] for g in np.unique(g_i[mj])}
+        big = [v for v in groups.values() if len(v) >= n_min]
+        if big:
+            ref = np.concatenate([v - np.quantile(v, quantile) for v in big])
+        else:
+            ref = u_i[mj] - np.quantile(u_i[mj], quantile)
+        for g, v in groups.items():
+            counts[j, g] = len(v)
+            if live_w[j, g] <= 0:  # not an active element of the flow
+                continue
+            if len(v) >= n_min:
+                q_g = np.quantile(v, quantile)
+            else:
+                q_g = v.min() - np.quantile(ref, 1.0 / (len(v) + 1))
+                n_small += 1
+            log_w[j, g] = -q_g
+    info = dict(accepted=False, method="coverage", n_used=int(ok.sum()),
+                n_small_elements=int(n_small),
+                n_elements=int((counts > 0).sum()))
+    if not np.isfinite(log_w).any(axis=1).all():
+        info["reason"] = "an expert without live points"
+        return None, info
+    w = np.exp(log_w - log_w.max(axis=1, keepdims=True))
+    w /= w.sum(axis=1, keepdims=True)
+    info.update(accepted=True, weights_in_place=w0, live_counts=counts)
+    return w, info

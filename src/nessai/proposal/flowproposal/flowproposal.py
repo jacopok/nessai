@@ -226,7 +226,10 @@ class FlowProposal(BaseFlowProposal):
         fit that fails the held-out or exactness checks leaves the weights
         in place. See :mod:`nessai.proposal.flowproposal.branch_weights`.
     branch_weights_kwargs : dict, optional
-        Options of :func:`~nessai.proposal.flowproposal.branch_weights.fit_and_check`.
+        Options of :func:`~nessai.proposal.flowproposal.branch_weights.fit_and_check`;
+        ``method="coverage"`` sets the weights in closed form instead
+        (:func:`~nessai.proposal.flowproposal.branch_weights.coverage_weights`:
+        every element's live points equally covered by the clip cap).
     branch_weights_keep : bool
         When the fit after a training fails its checks, keep the last
         accepted weights (on the elements active now; an element active only

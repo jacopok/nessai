@@ -253,3 +253,68 @@ def test_populate_refits_before_the_pool(refit, pilot, called):
         proposal._update_branch_weights.assert_called_once_with(refit=True)
     else:
         proposal._update_branch_weights.assert_not_called()
+
+
+# coverage weights (method="coverage")
+
+
+def _coverage_setup(monkeypatch, u_by_element, live_w, w0=None):
+    """One expert, no mirror copies: points with base levels ``u`` (log b -
+    log pi) in the given elements, the weights in place ``w0``."""
+    k = len(live_w)
+    w0 = np.full(k, 1.0 / k) if w0 is None else np.asarray(w0, float)
+    g = np.concatenate([np.full(len(v), e) for e, v in u_by_element.items()])
+    u = np.concatenate(list(u_by_element.values()))
+    lp = (u + np.log(w0[g]))[None, :, None]  # log p = 0
+    a = g[None, :, None]
+    monkeypatch.setattr(BW, "branch_terms", lambda p, x: (lp, a, w0[None, :]))
+    wrapper = SimpleNamespace(weights=torch.tensor(live_w, dtype=torch.float64))
+    model = SimpleNamespace(experts=None)
+    prop = SimpleNamespace(
+        flow=SimpleNamespace(model=wrapper),
+        log_prior=lambda x: np.zeros(len(u)),
+    )
+    monkeypatch.setattr(BW, "_experts", lambda m: [wrapper])
+    return prop, np.zeros(len(u))
+
+
+def test_coverage_equalises_the_alpha_quantile(monkeypatch):
+    rng = np.random.default_rng(0)
+    u = {0: rng.normal(0.0, 1.0, 4000), 1: rng.normal(2.0, 1.0, 4000)}
+    prop, x = _coverage_setup(monkeypatch, u, [0.5, 0.5, 0.0, 0.0])
+    w, info = BW.coverage_weights(prop, x, 0.01)
+    assert info["accepted"]
+    q = {e: np.quantile(v, 0.01) for e, v in u.items()}
+    # the level log w + u has the same 1% quantile in both elements
+    assert np.log(w[0, 0]) + q[0] == pytest.approx(np.log(w[0, 1]) + q[1])
+    assert w[0, 2] == 0 and w[0, 3] == 0
+
+
+def test_coverage_does_not_depend_on_the_weights_in_place(monkeypatch):
+    rng = np.random.default_rng(1)
+    u = {0: rng.normal(0.0, 1.0, 1000), 1: rng.normal(1.0, 1.0, 1000)}
+    prop, x = _coverage_setup(monkeypatch, u, [0.5, 0.5, 0, 0])
+    w_a, _ = BW.coverage_weights(prop, x, 0.01)
+    prop, x = _coverage_setup(monkeypatch, u, [0.5, 0.5, 0, 0], w0=[0.9, 0.05, 0.03, 0.02])
+    w_b, _ = BW.coverage_weights(prop, x, 0.01)
+    assert np.allclose(w_a, w_b)
+
+
+def test_coverage_small_element_from_its_minimum(monkeypatch):
+    rng = np.random.default_rng(2)
+    big = rng.normal(0.0, 1.0, 5000)
+    small = np.array([3.0, 3.5, 4.0])  # 3 points: minimum at the 1/4 quantile
+    prop, x = _coverage_setup(monkeypatch, {0: big, 1: small}, [0.5, 0.5, 0, 0])
+    w, info = BW.coverage_weights(prop, x, 0.01)
+    ref = big - np.quantile(big, 0.01)
+    q_small = small.min() - np.quantile(ref, 0.25)
+    assert info["n_small_elements"] == 1
+    assert np.log(w[0, 0] / w[0, 1]) == pytest.approx(q_small - np.quantile(big, 0.01))
+
+
+def test_coverage_skips_inactive_elements(monkeypatch):
+    rng = np.random.default_rng(3)
+    u = {0: rng.normal(0.0, 1.0, 500), 1: rng.normal(0.0, 1.0, 500)}
+    prop, x = _coverage_setup(monkeypatch, u, [1.0, 0.0, 0.0, 0.0])
+    w, _ = BW.coverage_weights(prop, x, 0.01)
+    assert w[0, 1] == 0 and w[0, 0] == pytest.approx(1.0)
