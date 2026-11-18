@@ -54,6 +54,11 @@ logger = logging.getLogger(__name__)
 _CHUNK = 20_000
 #: the fewest pilot draws inside a level's prime box for the box to be kept
 _MIN_BOX_SUPPORT = 100
+#: Key of a deep-copy memo asking objects that are shared on a deep copy
+#: (one instance per proposal) for copies of their own: set when a level is
+#: copied, so that levels share no fitted state (an object that honours it
+#: copies itself and registers the copy in the memo).
+INDEPENDENT_COPY = "nessai.independent_copy"
 
 
 def _ess(weights):
@@ -293,8 +298,15 @@ class LevelFlowProposal(Proposal):
         The proposal and its flow model leave the model, the flow, the torch
         module and the optimiser out of their pickled state (and so out of
         a deepcopy): those are copied (or rebuilt) here.
+
+        Objects a proposal shares on a deep copy (fits read by both its
+        reparameterisations and its flow, e.g. nessai-gw's polarisation
+        ellipse and group actions) are copied too, once per level
+        (:data:`INDEPENDENT_COPY` in the memo): a fit shared between levels
+        and refitted by a later one would change every earlier level's
+        density after its samples were scored.
         """
-        memo = {id(self.model): self.model}
+        memo = {id(self.model): self.model, INDEPENDENT_COPY: True}
         flow = source.flow
         prop = copy.deepcopy(source, memo)
         new_flow = copy.deepcopy(flow, memo)

@@ -498,3 +498,42 @@ def test_level_proposal_thinned_levels(tmp_path, seed, score, caplog):
     err = max(fs.log_evidence_error, 0.02)
     assert abs(fs.log_evidence - model.log_evidence()) < 4 * err
 
+
+class _SharedFit:
+    """Shared on a plain deep copy (one per proposal, like nessai-gw's
+    polarisation ellipse), copied when the memo asks for independent
+    copies."""
+
+    def __init__(self, value=0.0):
+        self.value = value
+
+    def __deepcopy__(self, memo):
+        from nessai.proposal.importance_levels import INDEPENDENT_COPY
+
+        if not memo.get(INDEPENDENT_COPY):
+            return self
+        new = _SharedFit(self.value)
+        memo[id(self)] = new
+        return new
+
+
+@pytest.mark.slow_integration_test
+def test_level_proposal_levels_share_no_fit(tmp_path):
+    """A level copied from another gets its own instance of an object the
+    proposal shares on a deep copy, held by the proposal and its flow model
+    alike: refitting it changes no other level."""
+    import copy
+
+    model = UniformGaussian([1.0, -2.0])
+    fs = _run(tmp_path, model, {"x0": "z-score", "x1": "z-score"})
+    P = fs.ns.proposal
+    src = P.levels[-1]
+    fit = _SharedFit(1.0)
+    src.shared_fit = fit
+    src.flow.model.shared_fit = fit
+    assert copy.deepcopy(fit) is fit
+    new = P._copy(src, str(tmp_path / "copy"))
+    assert new.shared_fit is not fit
+    assert new.flow.model.shared_fit is new.shared_fit
+    new.shared_fit.value = 2.0
+    assert src.shared_fit.value == 1.0
