@@ -984,6 +984,7 @@ class BaseFlowProposal(RejectionProposal):
         if not self.initialised:
             raise RuntimeError(f"{self.__name__} is not initialised.")
         # the flow trains (and the mixture weights are set) undistorted
+        previous_branch_weights = getattr(self, "branch_weights_params", None)
         self._clear_latent_distortion()
         self._clear_branch_weights()
 
@@ -1045,7 +1046,7 @@ class BaseFlowProposal(RejectionProposal):
         self.populated = False
         self.training_count += 1
         self._update_latent_distortion()
-        self._update_branch_weights()
+        self._update_branch_weights(previous=previous_branch_weights)
 
     def _clear_latent_distortion(self):
         """Remove the latent distortion from the flow (see
@@ -1130,19 +1131,61 @@ class BaseFlowProposal(RejectionProposal):
             model.set_branch_weights(None)
         self.branch_weights_params = None
 
-    def _update_branch_weights(self):
+    def _project_branch_weights(self, params):
+        """Fitted element weights ``params`` of an earlier fit on the elements
+        active now (the live-point weights): zero where those are, an element
+        active now but not then at its live-point weight, renormalised.
+        ``None`` when the experts or the group changed."""
+        from .branch_weights import _experts
+
+        model = self.flow.model
+        experts = _experts(model)
+        multi = hasattr(model, "experts")
+        rows = list(params) if multi else [params]
+        if len(rows) != len(experts):
+            return None
+        out = []
+        for e, w_old in zip(experts, rows):
+            live = e.weights.detach().cpu().numpy().astype(float)
+            w_old = np.asarray(w_old, dtype=float)
+            if w_old.shape != live.shape:
+                return None
+            w = np.where(live > 0, np.where(w_old > 0, w_old, live), 0.0)
+            if not w.sum() > 0:
+                return None
+            out.append(w / w.sum())
+        return out if multi else out[0]
+
+    def _install_branch_weights(self, params):
+        self.flow.model.set_branch_weights(params)
+        self.branch_weights_params = params
+
+    def _update_branch_weights(self, previous=None, refit=False):
         """Fit the group-mixture element weights to the live points and
         install them in the flow if they pass the checks (``branch_weights``
-        option of :class:`FlowProposal`), after the latent distortion."""
+        option of :class:`FlowProposal`), after the latent distortion.
+
+        After a training (``refit`` false) a failed fit falls back to
+        ``previous``, the weights before the training, with
+        ``branch_weights_keep``. Before a populate (``refit``, with
+        ``branch_weights_refit``) the fit starts from the weights in place,
+        restricted to the elements active now, and a failed fit keeps them.
+        """
         if not getattr(self, "branch_weights", False):
             return
         from .branch_weights import fit_and_check, supports_branch_weights
 
         model = self.flow.model
-        info = dict(training_count=int(self.training_count))
+        info = dict(training_count=int(self.training_count), refit=bool(refit))
         if not supports_branch_weights(model):
             info.update(accepted=False, reason="flow model not supported")
         else:
+            if refit and getattr(self, "branch_weights_params", None) is not None:
+                in_place = self._project_branch_weights(self.branch_weights_params)
+                if in_place is None:
+                    self._clear_branch_weights()
+                else:
+                    self._install_branch_weights(in_place)
             scheme = getattr(self, "_truncation_scheme", None)
             rule = scheme.get_rule("log_proposal_threshold") if scheme else None
             quantile = rule.quantile if rule is not None else 0.01
@@ -1155,26 +1198,40 @@ class BaseFlowProposal(RejectionProposal):
             info["time"] = (datetime.datetime.now() - st).total_seconds()
             if w is not None:
                 params = list(w) if hasattr(model, "experts") else w[0]
-                model.set_branch_weights(params)
-                self.branch_weights_params = params
+                self._install_branch_weights(params)
                 w0 = info.pop("weights_in_place")
                 act = w0 > 0
                 ratio = np.abs(np.log(w[act] / w0[act]))
                 info.update(max_log_ratio=float(ratio.max()))
+            elif (
+                not refit
+                and previous is not None
+                and getattr(self, "branch_weights_keep", False)
+            ):
+                kept = self._project_branch_weights(previous)
+                if kept is not None:
+                    self._install_branch_weights(kept)
+                    info["kept_previous"] = True
         if not hasattr(self, "branch_weights_history"):
             self.branch_weights_history = []
         self.branch_weights_history.append(info)
         if info.get("accepted"):
             logger.debug(
-                "Branch weights: held-out threshold gain %.2f nats, excluded "
+                "Branch weights%s: held-out threshold gain %.2f nats, excluded "
                 "%.3g; |log w / w_in_place| <= %.2f (%.1f s)",
+                " (refit)" if refit else "",
                 info["heldout_gain"],
                 info["heldout_excluded"],
                 info["max_log_ratio"],
                 info["time"],
             )
         else:
-            logger.debug("Branch weights not fitted: %s", info.get("reason"))
+            logger.debug(
+                "Branch weights%s not fitted: %s%s",
+                " (refit)" if refit else "",
+                info.get("reason"),
+                "; the previous ones kept" if info.get("kept_previous") else "",
+            )
 
     def _post_train_diagnostics(self):
         """Hook called immediately after :meth:`FlowModel.train` completes.

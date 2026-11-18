@@ -28,7 +28,11 @@ for the distortion:
   ``max_excess_factor * quantile``;
 * the decomposition must reproduce the flow's own density under the fitted
   weights on a subset of the live points (``exactness_tolerance``): it is
-  exact only where one element claims each point.
+  exact only where one element claims each point. It checks the fit's own
+  objective, not the sampling (the pool is drawn and scored with the flow's
+  density): 1e-2 nats, as the ET triangle's group action decomposes to
+  1-3e-3 (stages HF, where 1e-3 rejected most fits while the live points
+  left the sky images).
 """
 
 from __future__ import annotations
@@ -52,7 +56,7 @@ DEFAULT_KWARGS = dict(
     lr=0.05,
     min_gain=0.0,
     max_excess_factor=1.0,
-    exactness_tolerance=1e-3,
+    exactness_tolerance=1e-2,
     n_exactness=500,
     seed=4321,
 )
