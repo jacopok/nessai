@@ -394,6 +394,20 @@ class ImportanceNestedSampler(BaseNestedSampler):
         extra draws count with their level in the meta-proposal.
     min_training_ess_max_batches
         See ``min_training_ess``.
+    min_training_ess_retrain_after
+        If set (with ``min_training_ess``): after this many top-up batches
+        of the latest level without reaching the target, the level counts
+        as stalled -- its flow does not fit the region above the threshold,
+        likely because its own training set missed part of it -- and the
+        threshold does not advance: the next iteration trains a new level
+        (warm-started from the stalled one) on the samples above the same
+        threshold, which now include all of the stalled level's draws, and
+        draws from it; the threshold is then chosen again and the new level
+        topped up. Nothing is discarded (the stalled level stays in the
+        meta-proposal). At most ``min_training_ess_max_retrains`` new levels
+        per threshold, then the top-ups continue as without it.
+    min_training_ess_max_retrains
+        See ``min_training_ess_retrain_after``.
     training_max_samples
         If set, a training set larger than this is subsampled: sample i is
         kept with probability p_i = min(1, (w_i / c) ** training_accept_power),
@@ -504,6 +518,8 @@ class ImportanceNestedSampler(BaseNestedSampler):
         threshold_step_scale: float = 1.0,
         min_training_ess: Optional[float] = None,
         min_training_ess_max_batches: int = 10,
+        min_training_ess_retrain_after: Optional[int] = None,
+        min_training_ess_max_retrains: int = 3,
         training_max_samples: Optional[int] = None,
         training_accept_power: float = 1.0,
         level_max_samples: Optional[int] = None,
@@ -575,6 +591,16 @@ class ImportanceNestedSampler(BaseNestedSampler):
             None if min_training_ess is None else float(min_training_ess)
         )
         self.min_training_ess_max_batches = int(min_training_ess_max_batches)
+        if min_training_ess_retrain_after is not None and (
+            int(min_training_ess_retrain_after) < 1
+        ):
+            raise ValueError("min_training_ess_retrain_after must be >= 1")
+        self.min_training_ess_retrain_after = (
+            None
+            if min_training_ess_retrain_after is None
+            else int(min_training_ess_retrain_after)
+        )
+        self.min_training_ess_max_retrains = int(min_training_ess_max_retrains)
         if not 0 < training_accept_power <= 1:
             raise ValueError("training_accept_power must be in (0, 1]")
         self.training_max_samples = (
@@ -1300,7 +1326,30 @@ class ImportanceNestedSampler(BaseNestedSampler):
         k = 0
         level = max(self.sample_counts)
         st = datetime.datetime.now()
+        retrain_after = getattr(self, "min_training_ess_retrain_after", None)
+        current = self.log_likelihood_threshold
+        if getattr(self, "_retrain_threshold", None) != current:
+            self._retrain_threshold, self._retrain_count = current, 0
         while ess < target and k < self.min_training_ess_max_batches:
+            if (
+                retrain_after is not None
+                and k >= retrain_after
+                and level >= 0
+                and self._retrain_count
+                < getattr(self, "min_training_ess_max_retrains", 3)
+            ):
+                self._retrain_count += 1
+                self.history.setdefault("retrains", []).append(
+                    (self.iteration, level, float(current), float(ess), k)
+                )
+                logger.info(
+                    f"Level {level} stalled (training ESS {ess:.0f} / "
+                    f"{target:.0f} above logL {threshold:.3f} after {k} "
+                    f"top-up(s)): a new level at the same threshold logL "
+                    f"{current:.3f} (retrain {self._retrain_count} / "
+                    f"{self.min_training_ess_max_retrains})"
+                )
+                return current
             self.top_up_latest_level(self.nlive)
             self._thin_latest_level(threshold)
             ess = self.training_ess(threshold)

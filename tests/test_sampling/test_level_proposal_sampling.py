@@ -537,3 +537,54 @@ def test_level_proposal_levels_share_no_fit(tmp_path):
     assert new.flow.model.shared_fit is new.shared_fit
     new.shared_fit.value = 2.0
     assert src.shared_fit.value == 1.0
+
+
+@pytest.mark.slow_integration_test
+def test_level_proposal_retrain_on_stall(tmp_path, caplog):
+    """With min_training_ess_retrain_after, a level that needs more top-ups
+    than that is followed by a new level at the same threshold (no draw
+    discarded) at most max_retrains times per threshold; the evidence stays
+    unbiased."""
+    import logging
+
+    caplog.set_level(logging.INFO)
+    model = UniformGaussian([1.0, -2.0])
+    fs = FlowSampler(
+        model,
+        output=str(tmp_path),
+        importance_nested_sampler=True,
+        nlive=1000,
+        min_samples=200,
+        seed=1234,
+        plot=False,
+        checkpointing=False,
+        strict_threshold=True,
+        min_training_ess=1500,
+        min_training_ess_retrain_after=1,
+        min_training_ess_max_retrains=2,
+        proposal_class="levels",
+        proposal_kwargs=dict(
+            flow_proposal_class="flowproposal",
+            flow_config=FLOW,
+            training_config=TRAINING,
+            flow_proposal_kwargs=dict(
+                reparameterisations={"x0": "z-score", "x1": "z-score"},
+                sum_mirror_density=True,
+            ),
+            n_pilot=5000,
+        ),
+    )
+    fs.run(plot=False, save=False)
+    ns = fs.ns
+    retrains = ns.history.get("retrains")
+    assert retrains and "stalled" in caplog.text
+    # each retrain repeats the threshold it was made at, at most twice each
+    thresholds = ns.history["logL_threshold"]
+    for it, _, t, _, _ in retrains:
+        assert thresholds[it] == t
+    _, counts = np.unique([r[2] for r in retrains], return_counts=True)
+    assert counts.max() <= 2
+    assert len(ns.proposal.levels) == ns.iteration
+    assert sum(ns.sample_counts.values()) == len(ns.samples_unit)
+    err = max(fs.log_evidence_error, 0.02)
+    assert abs(fs.log_evidence - model.log_evidence()) < 4 * err
