@@ -1045,8 +1045,68 @@ class BaseFlowProposal(RejectionProposal):
 
         self.populated = False
         self.training_count += 1
+        self._clear_element_latent()
         self._update_latent_distortion()
+        self._update_element_latent()
         self._update_branch_weights(previous=previous_branch_weights)
+
+    def _clear_element_latent(self):
+        """Remove the element latents from the flow (see
+        :meth:`_update_element_latent`)."""
+        if not getattr(self, "element_latent", False):
+            return
+        model = getattr(getattr(self, "flow", None), "model", None)
+        if hasattr(model, "set_element_latent"):
+            model.set_element_latent(None)
+        self.element_latent_params = None
+
+    def _install_element_latent(self, params):
+        """Install element latents ``params`` (one ``(mu, chol)`` or ``None``
+        per expert) and re-measure each expert's in-domain base mass, which
+        they change (the domain-truncated density's normaliser is
+        ``sum_g w_g Z_g``, ``Z_g`` element ``g``'s in-domain share)."""
+        model = self.flow.model
+        if hasattr(model, "experts"):
+            model.set_element_latent(params)
+        else:
+            model.set_element_latent(*(params[0] or (None, None)))
+        self.element_latent_params = params
+        from .branch_weights import _experts
+
+        with torch.no_grad():
+            for e in _experts(model):
+                if getattr(e, "_truncate", False) and hasattr(
+                    e, "measure_domain_mass"
+                ):
+                    e.measure_domain_mass(n=50_000)
+
+    def _update_element_latent(self):
+        """Fit a latent Gaussian to the live points of each secondary group
+        element and install them (``element_latent`` option of
+        :class:`FlowProposal`); see
+        :mod:`~nessai.proposal.flowproposal.element_latent`."""
+        if not getattr(self, "element_latent", False):
+            return
+        from .element_latent import fit, supports_element_latent
+
+        model = self.flow.model
+        info = dict(training_count=int(self.training_count))
+        if not supports_element_latent(model):
+            info.update(accepted=False, reason="flow model not supported")
+        else:
+            self._clear_element_latent()
+            live = getattr(self, "current_live_points", None)
+            x = live if live is not None and len(live) else self.training_data
+            st = datetime.datetime.now()
+            params, fit_info = fit(self, x, **(self.element_latent_kwargs or {}))
+            info.update(fit_info)
+            info["time"] = (datetime.datetime.now() - st).total_seconds()
+            if fit_info["accepted"]:
+                self._install_element_latent(params)
+        if not hasattr(self, "element_latent_history"):
+            self.element_latent_history = []
+        self.element_latent_history.append(info)
+        logger.debug("Element latents: %s", info)
 
     def _clear_latent_distortion(self):
         """Remove the latent distortion from the flow (see
@@ -1197,7 +1257,7 @@ class BaseFlowProposal(RejectionProposal):
             if method == "coverage":
                 from .branch_weights import coverage_weights
 
-                w, fit_info = coverage_weights(self, x, quantile)
+                w, fit_info = coverage_weights(self, x, quantile, **kwargs)
             else:
                 w, fit_info = fit_and_check(self, x, quantile, **kwargs)
             info.update(fit_info)
@@ -1506,6 +1566,7 @@ class BaseFlowProposal(RejectionProposal):
         # new sample is drawn randomly from proposed points
         # popping from right end is faster
         index = self.indices.pop()
+        self.last_draw_index = index
         new_sample = self.samples[index]
         # the drawn point's log acceptance probability before the weight cap
         # (clip mode; above 0 where the cap under-proposes the prior), for
@@ -1613,6 +1674,11 @@ class BaseFlowProposal(RejectionProposal):
             model = getattr(getattr(self, "flow", None), "model", None)
             if hasattr(model, "set_latent_distortion"):
                 model.set_latent_distortion(*params)
+        params = getattr(self, "element_latent_params", None)
+        if params is not None:
+            model = getattr(getattr(self, "flow", None), "model", None)
+            if hasattr(model, "set_element_latent"):
+                self._install_element_latent(params)
         params = getattr(self, "branch_weights_params", None)
         if params is not None:
             model = getattr(getattr(self, "flow", None), "model", None)

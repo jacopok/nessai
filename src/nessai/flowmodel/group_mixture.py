@@ -1143,8 +1143,9 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 None if context is None
                 else context.repeat(len(images), 1)
             )
+            m_all = None if modes is None else modes.repeat(len(images))
             lp = (
-                self._base_flow_log_prob(u_all, context=ctx)
+                self._base_flow_log_prob(u_all, context=ctx, modes=m_all)
                 + self._circular_log_det(t_all)
             ).view(len(images), n)
             return torch.logsumexp(lp, dim=0) + log_j
@@ -1152,12 +1153,18 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         # reflect dims are never circular: the sign patterns leave this alone
         log_j = log_j + self._circular_log_det(t, modes)
         if self._sign_patterns is None:
-            return self._base_flow_log_prob(u, context=context) + log_j
+            return (
+                self._base_flow_log_prob(u, context=context, modes=modes)
+                + log_j
+            )
         p = self._sign_patterns.shape[0]
         n, f = u.shape
         signs = self._sign_patterns.to(u.dtype)
         u_rep = (u.unsqueeze(0) * signs.unsqueeze(1)).reshape(p * n, f)
-        lp = self._base_flow_log_prob(u_rep, context=context).view(p, n)
+        m_rep = None if modes is None else modes.repeat(p)
+        lp = self._base_flow_log_prob(
+            u_rep, context=context, modes=m_rep
+        ).view(p, n)
         return torch.logsumexp(lp, dim=0) + log_j
 
     def _apply_group_action(self, z_flat, modes_flat, inverse):
@@ -1823,8 +1830,9 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         chunk = 20_000
         while drawn < n:
             m = min(chunk, n - drawn)
+            modes = Categorical(probs=self.proposal_weights).sample((m,))
             try:
-                u = self._base_flow_sample(m)
+                u = self._base_flow_sample(m, modes=modes)
             except AssertionError:
                 # a spline inverse's float round-off on a rare extreme
                 # latent: redraw the chunk (a few in a run at most)
@@ -1832,7 +1840,6 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                 if failed > 10:
                     raise
                 continue
-            modes = Categorical(probs=self.proposal_weights).sample((m,))
             t = self._fold_symmetry(
                 self._fold_reflect(self._destandardise(u, modes))
             )
@@ -1898,46 +1905,139 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     #: (set by i-nessai levels; None: the base flow alone)
     heavy_kernel = None
 
-    def _base_flow_sample(self, n, context=None):
-        """``base_flow.sample`` with the latent distortion applied (and the
-        heavy-sample kernel's share of the draws)."""
-        if self._latent_mu is None:
+    # Element latents (``set_element_latent``): group element ``g`` draws
+    # the base-flow noise as ``n = m_g + L_g y``, ``y`` the (distorted)
+    # latent, and scores with ``log N(L_g^-1 (n - m_g)) - log|L_g|``: an
+    # affine layer per element between the base flow and the latent
+    # distortion, so the density stays exact (the distortion's
+    # decomposition ``log q = log q_undistorted + Delta(z)`` included, ``z``
+    # the element-standardised latent). Elements without one have
+    # ``m_g = 0``, ``L_g = I``. Plain attributes, as the distortion.
+    _element_mu = None
+    _element_chol = None
+    _element_set = None
+
+    def set_element_latent(self, mu=None, chol=None):
+        """Set (``mu`` ``[K, dims]``, ``chol`` ``[K, dims, dims]`` lower
+        triangular, the identity for an element without one) or clear
+        (``None``) the element latents."""
+        if mu is None:
+            self._element_mu = self._element_chol = self._element_set = None
+            return
+        p = next(self.base_flow.parameters())
+        mu = torch.as_tensor(np.asarray(mu), dtype=p.dtype, device=p.device)
+        chol = torch.as_tensor(np.asarray(chol), dtype=p.dtype, device=p.device)
+        eye = torch.eye(mu.shape[1], dtype=p.dtype, device=p.device)
+        self._element_set = (mu.abs().sum(1) > 0) | (
+            (chol - eye).abs().sum((1, 2)) > 0
+        )
+        self._element_mu, self._element_chol = mu, chol
+
+    @property
+    def element_latent(self):
+        """``(mu, chol)`` as numpy arrays, or ``None``."""
+        if self._element_mu is None:
+            return None
+        return (
+            self._element_mu.detach().cpu().numpy(),
+            self._element_chol.detach().cpu().numpy(),
+        )
+
+    def _element_latent_forward(self, y, modes):
+        """``n = m_g + L_g y`` per row (element ``modes``)."""
+        if self._element_mu is None or modes is None:
+            return y
+        n = y.clone()
+        for g in torch.unique(modes).tolist():
+            if not bool(self._element_set[g]):
+                continue
+            s = modes == g
+            n[s] = self._element_mu[g] + y[s] @ self._element_chol[g].T
+        return n
+
+    def _element_latent_inverse(self, n, modes):
+        """``(L_g^-1 (n - m_g), log|L_g|)`` per row (element ``modes``)."""
+        log_det = n.new_zeros(n.shape[0])
+        if self._element_mu is None or modes is None:
+            return n, log_det
+        y = n.clone()
+        for g in torch.unique(modes).tolist():
+            if not bool(self._element_set[g]):
+                continue
+            s = modes == g
+            chol = self._element_chol[g]
+            y[s] = torch.linalg.solve_triangular(
+                chol, (n[s] - self._element_mu[g]).T, upper=False
+            ).T
+            log_det[s] = torch.log(torch.diagonal(chol)).sum()
+        return y, log_det
+
+    def _base_flow_sample(self, n, context=None, modes=None):
+        """``base_flow.sample`` with the element latents of ``modes`` and the
+        latent distortion applied (and the heavy-sample kernel's share of the
+        draws)."""
+        if self._latent_mu is None and (
+            self._element_mu is None or modes is None
+        ):
             u = self.base_flow.sample(n, context=context)
         else:
+            p = next(self.base_flow.parameters())
             z = torch.as_tensor(
                 np.asarray(self.base_flow.sample_latent_distribution(n)),
-                dtype=self._latent_mu.dtype,
-                device=self._latent_mu.device,
+                dtype=p.dtype,
+                device=p.device,
             )
             u, _ = self.base_flow.inverse(
-                self._distort_latent(z), context=context
+                self._element_latent_forward(self._distort_latent(z), modes),
+                context=context,
             )
         if self.heavy_kernel is not None:
             u = self.heavy_kernel.replace_rows(u)
         return u
 
-    def _base_flow_log_prob(self, u, context=None):
-        """``base_flow.log_prob`` with the latent distortion applied (and
-        the heavy-sample kernel blended in)."""
-        lp = self._undistorted_or_distorted_log_prob(u, context=context)
+    def _base_flow_log_prob(self, u, context=None, modes=None):
+        """``base_flow.log_prob`` with the element latents of ``modes`` and
+        the latent distortion applied (and the heavy-sample kernel blended
+        in)."""
+        lp = self._undistorted_or_distorted_log_prob(
+            u, context=context, modes=modes
+        )
         if self.heavy_kernel is not None:
             lp = self.heavy_kernel.mix_log_prob(u, lp)
         return lp
 
-    def _undistorted_or_distorted_log_prob(self, u, context=None):
-        if self._latent_mu is None:
+    def _undistorted_or_distorted_log_prob(self, u, context=None, modes=None):
+        element = self._element_mu is not None and modes is not None
+        if self._latent_mu is None and not element:
             return self.base_flow.log_prob(u, context=context)
         if context is not None:
             raise NotImplementedError(
                 "latent distortion with a conditional flow"
             )
         noise, logabsdet = self.base_flow._transform(u)
+        if element:
+            noise, log_det = self._element_latent_inverse(noise, modes)
+            logabsdet = logabsdet - log_det
+        if self._latent_mu is None:
+            return self.base_flow._distribution.log_prob(noise) + logabsdet
         std = (noise - self._latent_mu) / torch.exp(self._latent_log_sigma)
         return (
             self.base_flow._distribution.log_prob(std)
             - self._latent_log_sigma.sum()
             + logabsdet
         )
+
+    @torch.no_grad()
+    def latent_noise(self, x):
+        """``(n, element)``: the base-flow noise of prime points ``x``
+        without element latents or distortion, and the element whose inverse
+        maps each into the fundamental domain (for fitting element
+        latents)."""
+        assigned, pre, _ = self._assign_branch(x)
+        canon = pre[assigned, torch.arange(x.shape[0], device=x.device)]
+        t, _ = self._canon_to_base(canon)
+        n, _ = self.base_flow.forward(self._standardise(t, assigned))
+        return n, assigned
 
     @property
     def supports_latent_components(self):
@@ -2063,10 +2163,10 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
     def sample_and_log_prob(self, num_samples, context=None):
         if self._truncate:
             return self._sample_and_log_prob_truncated(num_samples, context)
-        u = self._base_flow_sample(num_samples, context=context)
         modes = Categorical(probs=self.proposal_weights).sample(
             (num_samples,)
         )
+        u = self._base_flow_sample(num_samples, context=context, modes=modes)
         t = self._fold_symmetry(
             self._fold_reflect(self._destandardise(u, modes))
         )
@@ -2103,8 +2203,8 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
                     torch.exp(self._log_domain_mass).clamp(min=1e-3)
                 )
             n_draw = int(math.ceil(need / z_guess * 1.3)) + 32
-            u = self._base_flow_sample(n_draw, context=context)
             modes = Categorical(probs=self.proposal_weights).sample((n_draw,))
+            u = self._base_flow_sample(n_draw, context=context, modes=modes)
             t = self._fold_symmetry(
                 self._fold_reflect(self._destandardise(u, modes))
             )
@@ -2164,6 +2264,9 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         z, log_j = self.base_flow.forward(
             self._standardise(t, assigned), context=context
         )
+        if self._element_mu is not None:
+            z, log_det = self._element_latent_inverse(z, assigned)
+            log_j = log_j - log_det
         if self._latent_mu is not None:
             # the latent the (distorted) draws are generated from
             z = (z - self._latent_mu) / torch.exp(self._latent_log_sigma)
@@ -2181,7 +2284,10 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
             (z.shape[0],)
         )
 
-        u, _ = self.base_flow.inverse(self._distort_latent(z), context=context)
+        u, _ = self.base_flow.inverse(
+            self._element_latent_forward(self._distort_latent(z), modes),
+            context=context,
+        )
         if self.heavy_kernel is not None:
             # the kernel's share of the draws (their latent is unused: the
             # returned log_j gives log q(x) whatever z was)
@@ -3188,6 +3294,17 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
             else:
                 e.set_latent_distortion(mu[j], log_sigma[j])
 
+    def set_element_latent(self, params=None):
+        """Per active expert element latents (``params``: a sequence of
+        ``(mu, chol)`` or ``None`` entries), or ``None`` to clear them on
+        every expert (see
+        :meth:`DiscreteGroupMixtureFlowWrapper.set_element_latent`)."""
+        for j, e in enumerate(self.experts):
+            if params is None or j >= len(params) or params[j] is None:
+                e.set_element_latent(None)
+            else:
+                e.set_element_latent(*params[j])
+
     def set_branch_weights(self, weights=None):
         """Per active expert fitted element weights (``weights``: a sequence
         of ``[group_size]`` arrays), or ``None`` to clear them on every expert
@@ -3214,6 +3331,18 @@ class ClusteredGroupMixtureFlowWrapper(BaseFlow):
         mu = np.stack([np.zeros(dims) if x is None else x[0] for x in d])
         ls = np.stack([np.zeros(dims) if x is None else x[1] for x in d])
         return mu, ls
+
+    @torch.no_grad()
+    def latent_noise(self, x):
+        """``(n, element)``: the base-flow noise of prime points ``x``
+        without element latents or distortion, and the element whose inverse
+        maps each into the fundamental domain (for fitting element
+        latents)."""
+        assigned, pre, _ = self._assign_branch(x)
+        canon = pre[assigned, torch.arange(x.shape[0], device=x.device)]
+        t, _ = self._canon_to_base(canon)
+        n, _ = self.base_flow.forward(self._standardise(t, assigned))
+        return n, assigned
 
     @property
     def supports_latent_components(self):
@@ -4506,8 +4635,143 @@ class GroupFlowProposalMixin:
             arr, dtype=model.weights.dtype, device=model.weights.device
         )
 
+    # -- per-branch diagnostics ------------------------------------------
+    #
+    # Every evaluated draw is counted in the branch (group element) it fell
+    # in, with whether it was inserted and whether it was over the clip cap;
+    # at every training the counts since the previous one are summarised
+    # against the branches' live-point shares (:meth:`_branch_summary`),
+    # logged, and appended to ``branch_diagnostics_history``.
+
+    def _branch_elements(self, x):
+        """The branch of each point of ``x`` (-1 where no element claims
+        it), from the geometric assignment (no flow evaluation)."""
+        model = getattr(self.flow, "model", None)
+        if (model is None or not hasattr(model, "_assign_branch")
+                or x is None or not len(x)):
+            return None
+        try:
+            with torch.no_grad():
+                xp = self._training_data_as_prime_tensor(x)[: len(x)]
+                assigned, _, claimed = model._assign_branch(xp)
+        except Exception as e:  # a diagnostic must never stop the run
+            logger.debug("Branch diagnostics: no assignment (%s)", e)
+            return None
+        out = assigned.detach().cpu().numpy().astype(int)
+        out[~claimed.detach().cpu().numpy()] = -1
+        return out
+
+    def draw(self, worst_point):
+        new = super().draw(worst_point)
+        elements = getattr(self, "_pool_elements", None)
+        index = getattr(self, "last_draw_index", None)
+        self.last_draw_element = (
+            int(elements[index])
+            if elements is not None and index is not None and index < len(elements)
+            else -1
+        )
+        return new
+
+    def record_draw_outcome(self, accepted):
+        """Count the last draw (evaluated by the sampler) in its branch."""
+        g = getattr(self, "last_draw_element", -1)
+        model = getattr(self.flow, "model", None)
+        k = getattr(model, "group_size", None)
+        if g is None or g < 0 or k is None or g >= k:
+            return
+        counts = getattr(self, "_branch_counts", None)
+        if counts is None or counts.shape[1] != k:
+            counts = self._branch_counts = np.zeros((3, k))
+        counts[0, g] += 1
+        if accepted:
+            counts[1, g] += 1
+            if getattr(self, "last_draw_log_excess", -np.inf) > 0:
+                counts[2, g] += 1
+
+    def _branch_summary(self, x):
+        """Summarise the draws counted since the last call against the
+        live points ``x``; returns the record (or ``None``) and resets."""
+        counts = getattr(self, "_branch_counts", None)
+        self._branch_counts = None
+        elements = self._branch_elements(x)
+        if counts is None or elements is None or counts[0].sum() == 0:
+            self._branch_live_previous = None
+            return None
+        k = counts.shape[1]
+        live = np.bincount(elements[elements >= 0], minlength=k)[:k].astype(float)
+        prev = getattr(self, "_branch_live_previous", None)
+        self._branch_live_previous = live
+        # the live share over the window: the mean of its two ends
+        share = live / max(live.sum(), 1)
+        if prev is not None and len(prev) == k and prev.sum() > 0:
+            share = 0.5 * (share + prev / prev.sum())
+        evaluated, inserted, over = counts
+        n_ins = inserted.sum()
+        acceptance = n_ins / evaluated.sum()
+        # reference: the branches holding at least 10% of the live points
+        # (the best-populated one if none does)
+        ref = share >= 0.1
+        if not (ref & (evaluated > 0)).any():
+            ref = share == share.max()
+        a_ref = inserted[ref].sum() / max(evaluated[ref].sum(), 1)
+        rel = np.where(evaluated > 0, inserted / np.maximum(evaluated, 1), np.nan)
+        rel = rel / a_ref if a_ref > 0 else rel * np.nan
+        poor = np.isfinite(rel) & (rel < 0.1)
+        # insertion share over live share, where >= 20 insertions expected
+        expected = share * n_ins
+        meas = expected >= 20
+        ratio = np.where(meas, inserted / np.where(meas, expected, 1), np.nan)
+        cov = inserted >= 200
+        alpha_g = np.where(cov, over / np.maximum(inserted, 1), np.nan)
+        record = dict(
+            training_count=int(getattr(self, "training_count", 0)),
+            logL_threshold=float(np.min(x["logL"])) if "logL" in x.dtype.names else None,
+            evaluated=evaluated.tolist(), inserted=inserted.tolist(),
+            over_cap=over.tolist(), live=live.tolist(),
+            acceptance=float(acceptance), reference_acceptance=float(a_ref),
+            excess=float(1 - acceptance / a_ref) if a_ref > 0 else None,
+            poor_evaluated=float(evaluated[poor].sum() / evaluated.sum()),
+            poor_inserted=float(inserted[poor].sum() / max(n_ins, 1)),
+            n_poor=int(poor.sum()), n_active=int((live > 0).sum()),
+            over_cap_rate=float(over.sum() / max(n_ins, 1)),
+            worst_over_cap=(float(np.nanmax(alpha_g)) if cov.any() else None),
+            worst_over_cap_branch=(int(np.nanargmax(alpha_g)) if cov.any() else None),
+            worst_insertion_ratio=(float(np.nanmin(ratio)) if meas.any() else None),
+            worst_insertion_branch=(int(np.nanargmin(ratio)) if meas.any() else None),
+        )
+        hist = getattr(self, "branch_diagnostics_history", None)
+        if hist is None:
+            hist = self.branch_diagnostics_history = []
+        hist.append(record)
+        msg = (
+            f"Branch diagnostics: {int(evaluated.sum())} draws evaluated, "
+            f"{record['n_active']} branches with live points; acceptance "
+            f"{acceptance:.4g}, {a_ref:.4g} in the best-populated branches"
+        )
+        if record["excess"] is not None:
+            msg += f" ({record['excess']:.0%} of the calls in excess of that)"
+        msg += (
+            f"; {record['poor_evaluated']:.0%} of the calls in "
+            f"{record['n_poor']} branches below 0.1 of it, giving "
+            f"{record['poor_inserted']:.1%} of the insertions; over cap "
+            f"{record['over_cap_rate']:.2%}"
+        )
+        if record["worst_over_cap"] is not None:
+            msg += (f", worst branch {record['worst_over_cap']:.2%} "
+                    f"(element {record['worst_over_cap_branch']})")
+        if record["worst_insertion_ratio"] is not None:
+            msg += (f"; insertion / live share: worst "
+                    f"{record['worst_insertion_ratio']:.2f} "
+                    f"(element {record['worst_insertion_branch']})")
+        logger.info(msg)
+        return record
+
     def populate(self, worst_point, *args, **kwargs):
         super().populate(worst_point, *args, **kwargs)
+        samples = getattr(self, "samples", None)
+        self._pool_elements = (
+            self._branch_elements(samples) if samples is not None else None
+        )
         model = getattr(self.flow, "model", None)
         # per-batch sampling caches: not state, keep them out of checkpoints
         if model is not None:
@@ -4526,6 +4790,10 @@ class GroupFlowProposalMixin:
     def check_state(self, x):
         super().check_state(x)
         self._refresh_group_coordinate_bridge()
+        try:
+            self._branch_summary(x)
+        except Exception as e:  # a diagnostic must never stop the run
+            logger.warning("Branch diagnostics failed: %s", e)
         model = getattr(self.flow, "model", None)
         if model is None or not hasattr(model, "update_mixture_weights"):
             return

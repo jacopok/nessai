@@ -239,7 +239,7 @@ def fit_and_check(proposal, x, quantile, **kwargs):
     return w, info
 
 
-def coverage_weights(proposal, x, quantile):
+def coverage_weights(proposal, x, quantile, estimator="quantile"):
     """Element weights that give every group element the same coverage of
     its own live points by the clip cap (``method="coverage"``).
 
@@ -261,6 +261,19 @@ def coverage_weights(proposal, x, quantile):
     levels relative to its own alpha-quantile; all the expert's points
     relative to their alpha-quantile when no element is well populated).
     Elements without live points get zero weight.
+
+    That per-element tail quantile needs ``1 / alpha`` points in every
+    element, more than most hold when the live points are spread over many
+    elements. ``estimator="pooled"`` borrows strength across
+    them: the elements' distributions of ``u`` are taken to differ mainly in
+    location, so each element's alpha-quantile is its own median plus the
+    alpha-quantile of the pooled residuals about the medians (elements with
+    at least 3 points), lowered by the median's standard error
+    (``1.25 sigma / sqrt(n_g)``, ``sigma`` the pooled residuals' robust
+    scale), so that a poorly measured element errs towards more weight
+    (an under-weighted element loses coverage, an over-weighted one only
+    costs draws). ``estimator="quantile"`` (the default) is the per-element
+    rule above.
 
     Each live point counts for the (mirror copy, expert) term dominating its
     density. Returns ``(weights [experts, group_size], info)``.
@@ -296,6 +309,18 @@ def coverage_weights(proposal, x, quantile):
         if not mj.any():
             continue
         groups = {g: u_i[mj & (g_i == g)] for g in np.unique(g_i[mj])}
+        if estimator == "pooled":
+            res = [v - np.median(v) for v in groups.values() if len(v) >= 3]
+            res = np.concatenate(res) if res else u_i[mj] - np.median(u_i[mj])
+            tail = np.quantile(res, quantile)
+            sigma = 1.4826 * np.median(np.abs(res - np.median(res)))
+            for g, v in groups.items():
+                counts[j, g] = len(v)
+                if live_w[j, g] <= 0:
+                    continue
+                n_small += len(v) < n_min
+                log_w[j, g] = -(np.median(v) + tail - 1.25 * sigma / np.sqrt(len(v)))
+            continue
         big = [v for v in groups.values() if len(v) >= n_min]
         if big:
             ref = np.concatenate([v - np.quantile(v, quantile) for v in big])
@@ -311,7 +336,7 @@ def coverage_weights(proposal, x, quantile):
                 q_g = v.min() - np.quantile(ref, 1.0 / (len(v) + 1))
                 n_small += 1
             log_w[j, g] = -q_g
-    info = dict(accepted=False, method="coverage", n_used=int(ok.sum()),
+    info = dict(accepted=False, method="coverage", estimator=estimator, n_used=int(ok.sum()),
                 n_small_elements=int(n_small),
                 n_elements=int((counts > 0).sum()))
     if not np.isfinite(log_w).any(axis=1).all():

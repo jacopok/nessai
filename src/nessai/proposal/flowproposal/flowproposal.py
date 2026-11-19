@@ -235,6 +235,13 @@ class FlowProposal(BaseFlowProposal):
         accepted weights (on the elements active now; an element active only
         now at its live-point weight) instead of none: the importance or
         live-point weights only until a first fit is accepted.
+    element_latent : bool
+        Give each group element under ``max_share`` of an expert's live
+        points its own latent Gaussian, fitted to them after each training
+        and before each populate. See
+        :mod:`nessai.proposal.flowproposal.element_latent`.
+    element_latent_kwargs : dict, optional
+        Options of :func:`~nessai.proposal.flowproposal.element_latent.fit`.
     branch_weights_refit : bool
         Refit the element weights before every populate, from the weights
         in place, and not only after a training: the live points can leave
@@ -280,6 +287,8 @@ class FlowProposal(BaseFlowProposal):
         branch_weights_kwargs=None,
         branch_weights_keep=True,
         branch_weights_refit=True,
+        element_latent=False,
+        element_latent_kwargs=None,
         **kwargs,
     ):
         super().__init__(model, poolsize=poolsize, **kwargs)
@@ -295,6 +304,10 @@ class FlowProposal(BaseFlowProposal):
         self.branch_weights_refit = bool(branch_weights_refit)
         self.branch_weights_params = None
         self.branch_weights_history = []
+        self.element_latent = bool(element_latent)
+        self.element_latent_kwargs = dict(element_latent_kwargs or {})
+        self.element_latent_params = None
+        self.element_latent_history = []
         self.population_truncation_history = []
         logger.debug("Initialising FlowProposal")
         self._warn_for_deprecated_latent_prior(latent_prior)
@@ -822,6 +835,16 @@ class FlowProposal(BaseFlowProposal):
 
         if (
             not pilot
+            and getattr(self, "element_latent", False) is True
+            and getattr(self, "training_count", 0) > 0
+            and getattr(self, "current_live_points", None) is not None
+            and len(self.current_live_points)
+        ):
+            # the element shapes follow the live points between trainings
+            self._update_element_latent()
+
+        if (
+            not pilot
             and getattr(self, "branch_weights", False) is True
             and getattr(self, "branch_weights_refit", False) is True
             and getattr(self, "training_count", 0) > 0
@@ -1284,6 +1307,10 @@ class FlowProposal(BaseFlowProposal):
         state.setdefault("threshold_from_live_points", False)
         state.setdefault("current_live_points", None)
         state.setdefault("latent_distortion", None)
+        state.setdefault("element_latent", False)
+        state.setdefault("element_latent_kwargs", {})
+        state.setdefault("element_latent_params", None)
+        state.setdefault("element_latent_history", [])
         state.setdefault("latent_distortion_kwargs", {})
         state.setdefault("latent_distortion_params", None)
         state.setdefault("latent_distortion_history", [])

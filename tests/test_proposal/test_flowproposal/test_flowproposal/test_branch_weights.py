@@ -282,7 +282,7 @@ def test_coverage_equalises_the_alpha_quantile(monkeypatch):
     rng = np.random.default_rng(0)
     u = {0: rng.normal(0.0, 1.0, 4000), 1: rng.normal(2.0, 1.0, 4000)}
     prop, x = _coverage_setup(monkeypatch, u, [0.5, 0.5, 0.0, 0.0])
-    w, info = BW.coverage_weights(prop, x, 0.01)
+    w, info = BW.coverage_weights(prop, x, 0.01, estimator="quantile")
     assert info["accepted"]
     q = {e: np.quantile(v, 0.01) for e, v in u.items()}
     # the level log w + u has the same 1% quantile in both elements
@@ -305,7 +305,7 @@ def test_coverage_small_element_from_its_minimum(monkeypatch):
     big = rng.normal(0.0, 1.0, 5000)
     small = np.array([3.0, 3.5, 4.0])  # 3 points: minimum at the 1/4 quantile
     prop, x = _coverage_setup(monkeypatch, {0: big, 1: small}, [0.5, 0.5, 0, 0])
-    w, info = BW.coverage_weights(prop, x, 0.01)
+    w, info = BW.coverage_weights(prop, x, 0.01, estimator="quantile")
     ref = big - np.quantile(big, 0.01)
     q_small = small.min() - np.quantile(ref, 0.25)
     assert info["n_small_elements"] == 1
@@ -318,3 +318,39 @@ def test_coverage_skips_inactive_elements(monkeypatch):
     prop, x = _coverage_setup(monkeypatch, u, [1.0, 0.0, 0.0, 0.0])
     w, _ = BW.coverage_weights(prop, x, 0.01)
     assert w[0, 1] == 0 and w[0, 0] == pytest.approx(1.0)
+
+
+def test_pooled_coverage_shifts_by_the_medians(monkeypatch):
+    """Elements that differ only in location get weights in the ratio of
+    their medians' shift, up to the median's standard error."""
+    rng = np.random.default_rng(4)
+    u = {0: rng.normal(0.0, 1.0, 60), 1: rng.normal(2.0, 1.0, 60)}
+    prop, x = _coverage_setup(monkeypatch, u, [0.5, 0.5, 0, 0])
+    w, info = BW.coverage_weights(prop, x, 0.01, estimator="pooled")
+    assert info["estimator"] == "pooled" and info["accepted"]
+    assert np.log(w[0, 0] / w[0, 1]) == pytest.approx(np.median(u[1]) - np.median(u[0]))
+
+
+def test_pooled_coverage_favours_the_poorly_measured(monkeypatch):
+    """At equal medians, an element with few points gets more weight than a
+    well-measured one (its median's standard error is larger)."""
+    rng = np.random.default_rng(5)
+    big = rng.normal(0.0, 1.0, 2000)
+    small = np.array([-0.1, 0.0, 0.1])
+    prop, x = _coverage_setup(monkeypatch, {0: big - np.median(big), 1: small}, [0.5, 0.5, 0, 0])
+    w, _ = BW.coverage_weights(prop, x, 0.01, estimator="pooled")
+    sigma_term = lambda n: 1.25 / np.sqrt(n)
+    assert w[0, 1] > w[0, 0]
+    assert np.log(w[0, 1] / w[0, 0]) == pytest.approx(
+        sigma_term(3) - sigma_term(2000), rel=0.15)
+
+
+def test_pooled_coverage_tail_from_the_pooled_residuals(monkeypatch):
+    """The pooled alpha-quantile sets the level: with one large element it
+    reduces to that element's own quantile (up to the standard error)."""
+    rng = np.random.default_rng(6)
+    u = {0: rng.normal(0.0, 1.0, 20000), 1: rng.normal(0.0, 1.0, 20000)}
+    prop, x = _coverage_setup(monkeypatch, u, [0.5, 0.5, 0, 0])
+    w_p, _ = BW.coverage_weights(prop, x, 0.01, estimator="pooled")
+    w_q, _ = BW.coverage_weights(prop, x, 0.01, estimator="quantile")
+    assert np.allclose(w_p, w_q, atol=0.02)

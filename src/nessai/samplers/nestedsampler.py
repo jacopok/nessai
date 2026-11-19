@@ -76,6 +76,15 @@ def clip_compression_stretches(terms, window):
 logger = logging.getLogger(__name__)
 
 
+
+def _record_draw_outcome(proposal, accepted):
+    """Tell a proposal that records per-draw outcomes (the group-mixture
+    proposal's per-branch diagnostics) whether its last evaluated draw was
+    accepted."""
+    record = getattr(proposal, "record_draw_outcome", None)
+    if callable(record):
+        record(bool(accepted))
+
 class NestedSampler(BaseNestedSampler):
     """
     Nested Sampler class.
@@ -914,6 +923,9 @@ class NestedSampler(BaseNestedSampler):
                         newparam["logL"] = self.model.evaluate_log_likelihood(
                             newparam
                         )
+                    _record_draw_outcome(
+                        self.proposal, newparam["logL"] > self.logLmin
+                    )
                     if newparam["logL"] > self.logLmin:
                         self.logLmax = max(self.logLmax, newparam["logL"])
                         oldparam = newparam.copy()
@@ -1676,6 +1688,9 @@ class NestedSampler(BaseNestedSampler):
                         newparam["logL"] = self.model.evaluate_log_likelihood(
                             newparam
                         )
+                    _record_draw_outcome(
+                        proposal, newparam["logL"] > self.logLmin
+                    )
                     if newparam["logL"] > self.logLmin:
                         self.logLmax = max(self.logLmax, newparam["logL"])
                         region.empty_pools = 0
