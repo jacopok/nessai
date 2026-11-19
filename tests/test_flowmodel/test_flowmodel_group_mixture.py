@@ -3022,3 +3022,34 @@ def test_heavy_kernel_in_base_frame_is_exact(wrapper):
         wrapper.measure_domain_mass(400_000)
         lp_without = wrapper.log_prob(torch.tensor([[0.3, 0.5], [3.3, 0.5]]))
         assert (lp_with > lp_without + 0.5).all()
+
+
+def test_frozen_domain_mass_is_not_updated_by_draws(base_flow):
+    """An i-nessai level freezes its measured domain mass: later rejection
+    draws (which otherwise move the moving average) leave it, and so the
+    level's density, unchanged."""
+    w = DiscreteGroupMixtureFlowWrapper(
+        base_flow=base_flow,
+        num_features=2,
+        group_action_fn=shift_group_action,
+        group_size=GROUP_SIZE,
+        param_names=PARAM_NAMES,
+        in_fundamental_domain=in_fundamental_domain,
+        truncate_base_to_domain=True,
+    )
+    w.eval()
+    torch.manual_seed(0)
+    w.measure_domain_mass(50_000)
+    w._domain_mass_frozen = True
+    frozen = w._log_domain_mass.item()
+    x, _ = w.sample_and_log_prob(500)
+    lp = w.log_prob(x)
+    torch.manual_seed(5)
+    w.sample_and_log_prob(3000)
+    assert w._log_domain_mass.item() == frozen
+    assert torch.equal(w.log_prob(x), lp)
+    # unfrozen, the draws move it again
+    w._domain_mass_frozen = False
+    w._log_domain_mass.fill_(frozen + 0.5)
+    w.sample_and_log_prob(3000)
+    assert w._log_domain_mass.item() != frozen + 0.5

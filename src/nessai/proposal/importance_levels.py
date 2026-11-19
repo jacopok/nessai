@@ -207,6 +207,8 @@ class LevelFlowProposal(Proposal):
         self.template = None
         self.levels = []
         self.log_mass = []
+        #: per level, the frozen log domain mass of each group-mixture expert
+        self.domain_log_masses = []
         self.level_history = []
         self.scoring_time = datetime.timedelta()
 
@@ -319,6 +321,8 @@ class LevelFlowProposal(Proposal):
         prop._flow_config = copy.deepcopy(source._flow_config, memo)
         prop.initialised = True
         prop.rng = self._child_rng()
+        for e in self._domain_experts(new_flow.model):
+            e._domain_mass_frozen = False
         os.makedirs(output, exist_ok=True)
         prop.output = output
         return prop
@@ -372,6 +376,7 @@ class LevelFlowProposal(Proposal):
             kwargs.get("log_likelihood_threshold"),
         )
         self._attach_kernel(prop, kernel)
+        domain_masses = self._freeze_domain_masses(prop)
         box = self._prime_box(prop, x, weights)
         log_mass, n_support = self._log_support_mass(prop, box, strict=box is None)
         if box is not None and n_support < _MIN_BOX_SUPPORT:
@@ -394,6 +399,10 @@ class LevelFlowProposal(Proposal):
             self.kernels.append(None)
         self.kernels.append(kernel)
         self.log_mass.append(log_mass)
+        self.domain_log_masses = list(getattr(self, "domain_log_masses", []))
+        while len(self.domain_log_masses) < len(self.levels) - 1:
+            self.domain_log_masses.append(None)
+        self.domain_log_masses.append(domain_masses)
         ess = len(x) if weights is None else _ess(weights)
         if weights is None:
             ess_full = ess
@@ -443,6 +452,51 @@ class LevelFlowProposal(Proposal):
     # weights, sign patterns and domain), else in the flow's prime space.
     # The level's density stays exact; the kernel's draws train the next
     # levels.
+
+    # Domain mass: a group-mixture expert truncated to the fundamental domain
+    # divides its density by its base mass inside the domain, which plain
+    # nessai tracks as a moving average of its rejection-loop acceptance,
+    # updated at every draw. A level's density must stay what scored its
+    # samples, so each level measures it once (fresh base draws) and freezes
+    # it, and a resume restores the frozen values (the weights file has the
+    # value at the end of training).
+
+    @staticmethod
+    def _domain_experts(module):
+        """The modules of a flow that carry a domain mass (a model-level
+        heavy kernel wraps the flow: look inside)."""
+        if hasattr(module, "heavy_kernel") and hasattr(module, "flow"):
+            module = module.flow
+        experts = getattr(module, "experts", None)
+        if experts is not None:
+            return [e for e in experts if hasattr(e, "_log_domain_mass")]
+        return [module] if hasattr(module, "_log_domain_mass") else []
+
+    def _freeze_domain_masses(self, prop):
+        """Measure and freeze the domain mass of each of ``prop``'s experts;
+        returns them (None without a group mixture)."""
+        experts = self._domain_experts(prop.flow.model)
+        if not experts:
+            return None
+        masses = []
+        for e in experts:
+            e._domain_mass_frozen = False
+            masses.append(float(e.measure_domain_mass()))
+            e._domain_mass_frozen = True
+        return masses
+
+    def _restore_domain_masses(self, prop, masses):
+        if masses is None:
+            return
+        experts = self._domain_experts(prop.flow.model)
+        if len(experts) != len(masses):
+            raise RuntimeError(
+                f"{len(masses)} stored domain masses for {len(experts)} experts"
+            )
+        for e, m in zip(experts, masses):
+            e._log_domain_mass.fill_(m)
+            e._domain_mass_seen = True
+            e._domain_mass_frozen = True
 
     @staticmethod
     def _group_experts(module):
@@ -1095,7 +1149,16 @@ class LevelFlowProposal(Proposal):
             if prop is None:
                 continue
             prop.resume(model, copy.deepcopy(self._level_flow_config))
+        masses = list(getattr(self, "domain_log_masses", []))
         for k, prop in enumerate(self.levels):
+            # a level's flow model rebuilt by the resume can hold objects
+            # its proposal class shares among all its instances (nessai-gw's
+            # group action): the level gets its own, wired to its fits
+            own = getattr(prop, "own_group_action", None)
+            if own is not None:
+                own()
             self._detach_kernel(prop)
             self._attach_kernel(prop, self._kernel(k))
+            if k < len(masses):
+                self._restore_domain_masses(prop, masses[k])
         self.initialised = self.template is not None

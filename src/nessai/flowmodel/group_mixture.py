@@ -1862,8 +1862,10 @@ class DiscreteGroupMixtureFlowWrapper(BaseFlow):
         return float(self._log_domain_mass)
 
     def _update_domain_mass(self, n_kept, n_drawn):
-        """EMA-update ``log Z`` from a rejection-loop acceptance rate."""
-        if n_drawn == 0:
+        """EMA-update ``log Z`` from a rejection-loop acceptance rate (not
+        once frozen: an i-nessai level's density must not change after its
+        samples are scored)."""
+        if n_drawn == 0 or getattr(self, "_domain_mass_frozen", False):
             return
         z = max(n_kept / n_drawn, 1.0 / (n_drawn + 1.0))
         log_z = math.log(z)
