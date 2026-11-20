@@ -186,6 +186,7 @@ class FlowSampler:
                     checkpoint_callback=kwargs.get("checkpoint_callback"),
                     **resume_options,
                 )
+            self._apply_resume_overrides(kwargs)
         else:
             logger.debug("Not resuming sampler")
             self.ns = SamplerClass(
@@ -208,6 +209,22 @@ class FlowSampler:
                 "Signal handling is disabled. nessai will not automatically "
                 "checkpoint when exited."
             )
+
+    #: sampler options this call sets on a resumed sampler: they only steer
+    #: what the sampler does next, never what it has already done
+    RESUME_OVERRIDES = {"min_training_ess_top_up": ("latest", "ess_gain")}
+
+    def _apply_resume_overrides(self, kwargs):
+        for key, allowed in self.RESUME_OVERRIDES.items():
+            value = kwargs.get(key)
+            if value is None or not hasattr(self.ns, "min_training_ess"):
+                continue
+            if value not in allowed:
+                raise ValueError(f"{key} must be one of {allowed}")
+            old = getattr(self.ns, key, None)
+            if old != value:
+                logger.info(f"Resumed sampler: {key} {old} -> {value}")
+            setattr(self.ns, key, value)
 
     def check_resume(self, resume_file, resume_data):
         """Check if it is possible to resume the sampler"""

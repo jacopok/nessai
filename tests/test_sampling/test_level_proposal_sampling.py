@@ -588,3 +588,249 @@ def test_level_proposal_retrain_on_stall(tmp_path, caplog):
     assert sum(ns.sample_counts.values()) == len(ns.samples_unit)
     err = max(fs.log_evidence_error, 0.02)
     assert abs(fs.log_evidence - model.log_evidence()) < 4 * err
+
+
+class _MixtureStub:
+    """compute_meta_proposal_from_log_q of a count-weighted mixture."""
+
+    def __init__(self, weights):
+        self.weights_array = np.asarray(weights, float)
+
+    def compute_meta_proposal_from_log_q(self, log_q):
+        return logsumexp(log_q, b=self.weights_array, axis=1)
+
+
+def _top_up_state(log_q1_in_b):
+    """A sampler state with the prior and two levels (1000 draws each):
+    region A, where both levels have density 1, and region B, where level 0
+    has density 1 and level 1 ``exp(log_q1_in_b)``; 100 samples of level 1
+    in A, 5 of level 0 in B, all above the threshold, U = 1."""
+    from nessai.samplers.importancesampler import (
+        ImportanceNestedSampler,
+        OrderedSamples,
+    )
+
+    ns = ImportanceNestedSampler.__new__(ImportanceNestedSampler)
+    ns.sample_counts = {-1: 1000, 0: 1000, 1: 1000}
+    ns.min_training_ess_top_up = "ess_gain"
+    ns.proposal = _MixtureStub([1 / 3, 1 / 3, 1 / 3])
+    n_a, n_b = 100, 5
+    samples = np.zeros(
+        n_a + n_b,
+        dtype=[("logL", "f8"), ("logW", "f8"), ("logU", "f8"), ("it", "i4")],
+    )
+    samples["logL"] = 1.0
+    samples["it"][:n_a] = 1
+    samples["it"][n_a:] = 0
+    log_q = np.full((n_a + n_b, 3), np.log(1e-6))  # the prior: negligible
+    log_q[:n_a, 1:] = 0.0
+    log_q[n_a:, 1] = 0.0
+    log_q[n_a:, 2] = log_q1_in_b
+    samples["logU"] = 0.0
+    samples["logW"] = -ns.proposal.compute_meta_proposal_from_log_q(log_q)
+    ts = OrderedSamples()
+    ts.samples, ts.log_q = samples, log_q
+    ns.training_samples = ts
+    return ns
+
+
+def test_top_up_level_goes_to_the_level_covering_the_heaviest_samples():
+    """``ess_gain``: the batch goes to the level that alone covers the
+    samples with the largest weights; when the latest level covers them as
+    well, to the latest; ``latest`` ignores the scores."""
+    ns = _top_up_state(log_q1_in_b=np.log(1e-4))
+    scores = ns.top_up_level_scores(0.0)
+    assert scores[0] > scores[1]
+    assert ns._choose_top_up_level(0.0) == 0
+    # the region also covered by the latest level: its draws win
+    ns = _top_up_state(log_q1_in_b=np.log(2.0))
+    assert ns._choose_top_up_level(0.0) == 1
+    ns = _top_up_state(log_q1_in_b=np.log(1e-4))
+    ns.min_training_ess_top_up = "latest"
+    assert ns._choose_top_up_level(0.0) == 1
+    # nothing above the threshold: the latest
+    ns.min_training_ess_top_up = "ess_gain"
+    assert ns._choose_top_up_level(2.0) == 1
+
+
+def test_top_up_level_score_matches_the_change_of_sum_w2():
+    """The score's ranking is the first-order change of sum w^2 per draw:
+    the deterministic part (the count raised, Q recomputed) by finite
+    difference, plus the expected squared weight of a new draw as the pool
+    estimates it."""
+    ns = _top_up_state(log_q1_in_b=np.log(0.05))
+    ts = ns.training_samples
+    counts = np.array([1000.0, 1000.0, 1000.0])
+
+    def sum_w2(c):
+        lq = logsumexp(ts.log_q, b=c / c.sum(), axis=1)
+        return np.exp(logsumexp(2 * (ts.samples["logU"] - lq)))
+
+    s2 = sum_w2(counts)
+    change = {}
+    for j in (0, 1):
+        c = counts.copy()
+        c[j + 1] += 1.0
+        # expected w^2 of one draw from level j (as the pool estimates it)
+        lQ = logsumexp(ts.log_q, b=counts / counts.sum(), axis=1)
+        e_new = np.exp(
+            logsumexp(
+                2 * (ts.samples["logU"] - lQ) + ts.log_q[:, j + 1] - lQ
+            )
+        ) / counts.sum()
+        change[j] = sum_w2(c) - s2 + e_new
+    scores = ns.top_up_level_scores(0.0)
+    assert (change[0] < change[1]) == (scores[0] > scores[1])
+    # and the formula: change_j = (2 S2 - exp(score_j)) / N
+    for j in (0, 1):
+        pred = (2 * s2 - np.exp(scores[j])) / counts.sum()
+        assert np.isclose(change[j], pred, rtol=1e-2), (j, change[j], pred)
+
+
+def _ess_gain_sampler(tmp_path, **kwargs):
+    options = dict(
+        min_training_ess=600,
+        min_training_ess_max_batches=20,
+        min_training_ess_top_up="ess_gain",
+        level_max_samples=1500,
+        level_thin_score="capped",
+        checkpointing=False,
+    )
+    options.update(kwargs)
+    return FlowSampler(
+        UniformGaussian([1.0, -2.0]),
+        output=str(tmp_path),
+        importance_nested_sampler=True,
+        nlive=1000,
+        min_samples=200,
+        seed=1234,
+        plot=False,
+        strict_threshold=True,
+        proposal_class="levels",
+        proposal_kwargs=dict(
+            flow_proposal_class="flowproposal",
+            flow_config=FLOW,
+            training_config=TRAINING,
+            flow_proposal_kwargs=dict(
+                reparameterisations={"x0": "z-score", "x1": "z-score"},
+                sum_mirror_density=True,
+            ),
+            n_pilot=5000,
+        ),
+        **options,
+    )
+
+
+def test_top_ups_from_earlier_levels_keep_the_evidence(
+    tmp_path, monkeypatch, caplog
+):
+    """Top-ups drawn from an earlier level (forced: every other batch from
+    the level before the latest) count with that level, are thinned like
+    it, and leave the evidence unbiased."""
+    import logging
+
+    from nessai.samplers.importancesampler import ImportanceNestedSampler
+
+    caplog.set_level(logging.INFO)
+    calls = {"n": 0}
+
+    def alternate(self, threshold):
+        latest = max(self.sample_counts)
+        calls["n"] += 1
+        if latest >= 1 and calls["n"] % 2:
+            return latest - 1
+        return latest
+
+    monkeypatch.setattr(
+        ImportanceNestedSampler, "_choose_top_up_level", alternate
+    )
+    # a target the levels reach only after several batches each
+    fs = _ess_gain_sampler(tmp_path, min_training_ess=1500,
+                           level_max_samples=3000)
+    fs.run(plot=False, save=False)
+    ns = fs.ns
+    tops = ns.history["top_ups"]
+    assert "drawn from level" in caplog.text
+    # some batches went to a level other than the latest at the time
+    latest = {}
+    for it, _, level in tops:
+        latest[it] = max(latest.get(it, level), level)
+    assert any(level < latest[it] for it, _, level in tops)
+    # every sample's count: draws per level match the bookkeeping
+    ts = ns.training_samples
+    assert sum(ns.sample_counts.values()) == ts.samples.size + getattr(
+        ts, "n_dropped", 0
+    )
+    err = max(fs.log_evidence_error, 0.02)
+    model = UniformGaussian([1.0, -2.0])
+    assert abs(fs.log_evidence - model.log_evidence()) < 4 * err
+
+
+def test_ess_gain_top_ups_run(tmp_path):
+    """``ess_gain`` end to end: the evidence stays unbiased."""
+    fs = _ess_gain_sampler(tmp_path)
+    fs.run(plot=False, save=False)
+    assert all(len(t) == 3 for t in fs.ns.history.get("top_ups", []))
+    err = max(fs.log_evidence_error, 0.02)
+    model = UniformGaussian([1.0, -2.0])
+    assert abs(fs.log_evidence - model.log_evidence()) < 4 * err
+
+
+def test_min_training_ess_top_up_is_validated(tmp_path):
+    with pytest.raises(ValueError, match="min_training_ess_top_up"):
+        _ess_gain_sampler(tmp_path, min_training_ess_top_up="heaviest")
+
+
+def test_resume_takes_the_top_up_rule(tmp_path, caplog):
+    """A resumed sampler takes ``min_training_ess_top_up`` from the call (it
+    only steers the next top-ups) and carries on."""
+    import logging
+
+    caplog.set_level(logging.INFO)
+    kwargs = dict(
+        min_training_ess_top_up="latest",
+        checkpointing=True,
+        checkpoint_on_iteration=True,
+        checkpoint_interval=1,
+        max_iteration=2,
+    )
+    fs = _ess_gain_sampler(tmp_path, **kwargs)
+    fs.run(plot=False, save=False)
+    assert (tmp_path / "nested_sampler_resume.pkl").exists()
+    kwargs.update(min_training_ess_top_up="ess_gain", max_iteration=4)
+    resumed = _ess_gain_sampler(tmp_path, resume=True, **kwargs)
+    assert resumed.ns.iteration >= 2
+    assert resumed.ns.min_training_ess_top_up == "ess_gain"
+    assert "min_training_ess_top_up latest -> ess_gain" in caplog.text
+    resumed.run(plot=False, save=False)
+    with pytest.raises(ValueError, match="min_training_ess_top_up"):
+        kwargs.update(min_training_ess_top_up="heaviest")
+        _ess_gain_sampler(tmp_path, resume=True, **kwargs)
+
+
+def test_resume_of_a_checkpoint_without_top_up_levels_saves(tmp_path):
+    """A checkpoint written before the top-ups recorded their level (entries
+    ``(iteration, n)``) resumes with the level filled in (the latest then,
+    ``iteration - 1``), so the run's history still saves to HDF5."""
+    kwargs = dict(
+        min_training_ess=1500,
+        level_max_samples=3000,
+        min_training_ess_top_up="latest",
+        checkpointing=True,
+        checkpoint_on_iteration=True,
+        checkpoint_interval=1,
+        max_iteration=3,
+    )
+    fs = _ess_gain_sampler(tmp_path, **kwargs)
+    fs.run(plot=False, save=False)
+    tops = list(fs.ns.history["top_ups"])
+    assert tops and all(t[2] == t[0] - 1 for t in tops)
+    # the checkpoint as the earlier code wrote it
+    fs.ns.history["top_ups"] = [(t[0], t[1]) for t in tops]
+    fs.ns.checkpoint(periodic=True, force=True)
+    kwargs.update(min_training_ess_top_up="ess_gain", max_iteration=5)
+    resumed = _ess_gain_sampler(tmp_path, resume=True, **kwargs)
+    assert resumed.ns.history["top_ups"][: len(tops)] == [tuple(t) for t in tops]
+    resumed.run(plot=False, save=True)
+    assert (tmp_path / "result.hdf5").exists()
+    assert all(len(t) == 3 for t in resumed.ns.history["top_ups"])

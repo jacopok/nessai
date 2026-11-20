@@ -408,6 +408,21 @@ class ImportanceNestedSampler(BaseNestedSampler):
         per threshold, then the top-ups continue as without it.
     min_training_ess_max_retrains
         See ``min_training_ess_retrain_after``.
+    min_training_ess_top_up
+        Which level each top-up batch of ``min_training_ess`` draws from.
+        ``"latest"`` (default): the latest level. ``"ess_gain"``: the level
+        whose draws are expected to raise the ESS above the threshold the
+        most. Each draw from level j raises n_j, and so the meta-proposal Q
+        where q_j is large, lowering the weights there; to first order in one
+        draw the change of sum w is the same for every level and that of
+        sum w^2 is (2 S2 - sum_i w_i^2 rho_ij (2 - 1/r_i)) / N, sums over the
+        samples above the threshold, rho_ij = q_j(x_i) / Q(x_i), r_i the
+        samples' thinning counts (1/p). The batch goes to the level with the
+        largest sum_i w_i^2 rho_ij (2 - 1/r_i): usually the latest, but an
+        earlier level when samples only it covers hold the largest weights
+        (a region the later levels miss, whose weights would otherwise grow
+        with every draw of the latest level). The level drawn from is the one
+        thinned (``level_max_samples``).
     training_max_samples
         If set, a training set larger than this is subsampled: sample i is
         kept with probability p_i = min(1, (w_i / c) ** training_accept_power),
@@ -425,7 +440,9 @@ class ImportanceNestedSampler(BaseNestedSampler):
         and from then on stands for 1/p_i draws in the evidence, the
         posterior and the stopping criterion (Horvitz-Thompson), so the
         estimates stay unbiased; a sample thinned again multiplies its
-        1/p. Earlier levels are never touched. The level counts in the
+        1/p. Other levels are not touched (an earlier level topped up with
+        ``min_training_ess_top_up = "ess_gain"`` is thinned in the same way
+        after its batch). The level counts in the
         meta-proposal remain the numbers drawn, and the evidence divides by
         the exact number of draws.
     level_thin_score
@@ -520,6 +537,7 @@ class ImportanceNestedSampler(BaseNestedSampler):
         min_training_ess_max_batches: int = 10,
         min_training_ess_retrain_after: Optional[int] = None,
         min_training_ess_max_retrains: int = 3,
+        min_training_ess_top_up: str = "latest",
         training_max_samples: Optional[int] = None,
         training_accept_power: float = 1.0,
         level_max_samples: Optional[int] = None,
@@ -601,6 +619,11 @@ class ImportanceNestedSampler(BaseNestedSampler):
             else int(min_training_ess_retrain_after)
         )
         self.min_training_ess_max_retrains = int(min_training_ess_max_retrains)
+        if min_training_ess_top_up not in ("latest", "ess_gain"):
+            raise ValueError(
+                "min_training_ess_top_up must be 'latest' or 'ess_gain'"
+            )
+        self.min_training_ess_top_up = min_training_ess_top_up
         if not 0 < training_accept_power <= 1:
             raise ValueError("training_accept_power must be in (0, 1]")
         self.training_max_samples = (
@@ -1253,10 +1276,18 @@ class ImportanceNestedSampler(BaseNestedSampler):
         return threshold
 
     def top_up_latest_level(self, n: int) -> None:
-        """``n`` more draws from the latest level: its count rises, so every
-        sample's meta-proposal (and weight) is recomputed; no new level."""
+        """``n`` more draws from the latest level (see :meth:`top_up_level`)."""
+        self.top_up_level(n)
+
+    def top_up_level(self, n: int, level: Optional[int] = None) -> None:
+        """``n`` more draws from ``level`` (default the latest): its count
+        rises, so every sample's meta-proposal (and weight) is recomputed;
+        no new level."""
         st = datetime.datetime.now()
-        it = max(self.sample_counts)
+        latest = max(self.sample_counts)
+        it = latest if level is None else int(level)
+        if it not in self.sample_counts or (it < 0 and it != latest):
+            raise ValueError(f"No level {it} to top up")
         self.sample_counts[it] += n
         n_total = sum(self.sample_counts.values())
         self.proposal.update_proposal_weights(
@@ -1275,8 +1306,10 @@ class ImportanceNestedSampler(BaseNestedSampler):
                 new["logL"] = self.model.batch_evaluate_log_likelihood(
                     new, unit_hypercube=True
                 )
-            else:
+            elif it == latest:
                 new, log_q = self.draw_n_samples(n)
+            else:
+                new, log_q = self.draw_n_samples(n, flow_number=it)
             new["it"] = it
             ordered.samples["logQ"] = (
                 self.proposal.compute_meta_proposal_from_log_q(ordered.log_q)
@@ -1285,12 +1318,64 @@ class ImportanceNestedSampler(BaseNestedSampler):
                 ordered.samples["logU"] - ordered.samples["logQ"]
             )
             ordered.add_samples(new, log_q)
-        self.history.setdefault("top_ups", []).append((self.iteration, n))
+        self.history.setdefault("top_ups", []).append((self.iteration, n, it))
         self.add_and_update_samples_time += datetime.datetime.now() - st
         logger.debug(
             f"Topped up level {it} with {n} draws: "
             f"{self.live_points_unit.size} live points"
         )
+
+    def _upgrade_top_up_history(self) -> None:
+        """``top_ups`` entries of a checkpoint from before the level was
+        recorded, ``(iteration, n)``, as ``(iteration, n, iteration - 1)``:
+        those top-ups all drew from the latest level, the one before the
+        iteration's (a mixed list does not save to HDF5)."""
+        tops = self.history.get("top_ups") if self.history else None
+        if tops and any(len(t) == 2 for t in tops):
+            self.history["top_ups"] = [
+                (t[0], t[1], t[0] - 1) if len(t) == 2 else tuple(t)
+                for t in tops
+            ]
+
+    def top_up_level_scores(self, threshold: float) -> dict:
+        """log of each level's ESS-gain score for a top-up draw (see
+        ``min_training_ess_top_up``): log sum_i w_i^2 rho_ij (2 - 1/r_i)
+        over the training samples at or above ``threshold``; the largest
+        lowers sum w^2, and so raises the ESS, the most."""
+        ts = self.training_samples
+        levels = sorted(k for k in self.sample_counts if k >= 0)
+        if not levels or ts.samples is None or ts.log_q is None:
+            return {}
+        above = ts.samples["logL"] >= threshold
+        if not above.any():
+            return {}
+        log_q = ts.log_q[above]
+        log_Q = self.proposal.compute_meta_proposal_from_log_q(log_q)
+        log_w = ts.samples["logW"][above]
+        log_r = getattr(ts, "log_r", None)
+        log_r = np.zeros(log_w.size) if log_r is None else log_r[above]
+        base = 2 * log_w + np.log(2 - np.exp(-log_r))
+        # column k + 1 holds level k (column 0 the prior)
+        cols = log_q[:, [k + 1 for k in levels]]
+        cols = np.where(np.isnan(cols), -np.inf, cols)
+        scores = logsumexp(base[:, None] + cols - log_Q[:, None], axis=0)
+        return dict(zip(levels, scores.tolist()))
+
+    def _choose_top_up_level(self, threshold: float) -> int:
+        """The level the next top-up batch draws from."""
+        latest = max(self.sample_counts)
+        if getattr(self, "min_training_ess_top_up", "latest") != "ess_gain":
+            return latest
+        scores = self.top_up_level_scores(threshold)
+        if not scores:
+            return latest
+        best = max(scores, key=scores.get)
+        # ties (and non-finite scores) go to the latest level
+        if not np.isfinite(scores[best]) or scores.get(latest, -np.inf) >= (
+            scores[best]
+        ):
+            return latest
+        return best
 
     def training_ess(self, threshold: float) -> float:
         """ESS of the live points at or above ``threshold``, the expected ESS
@@ -1350,13 +1435,20 @@ class ImportanceNestedSampler(BaseNestedSampler):
                     f"{self.min_training_ess_max_retrains})"
                 )
                 return current
-            self.top_up_latest_level(self.nlive)
-            self._thin_latest_level(threshold)
+            source = self._choose_top_up_level(threshold)
+            self.top_up_level(self.nlive, source)
+            self._thin_level(threshold, source)
             ess = self.training_ess(threshold)
             k += 1
+            src = (
+                ""
+                if source == level
+                else f" (drawn from level {source}, now "
+                f"{self.sample_counts[source]} draws)"
+            )
             logger.info(
                 f"Level {level} top-up {k}: training ESS {ess:.0f} / "
-                f"{target:.0f}, {self.sample_counts[level]} draws, "
+                f"{target:.0f}, {self.sample_counts[level]} draws{src}, "
                 f"{(datetime.datetime.now() - st).total_seconds():.0f} s"
             )
         if k:
@@ -1415,13 +1507,18 @@ class ImportanceNestedSampler(BaseNestedSampler):
         return _keep_log_prob(log_w, n, self.training_accept_power)
 
     def _thin_latest_level(self, threshold: float) -> None:
-        """With ``level_max_samples``: thin the latest level's samples (in
-        the training set, and the iid set with ``draw_iid_live``) back to
-        that many in expectation."""
+        """:meth:`_thin_level` on the latest level."""
+        self._thin_level(threshold)
+
+    def _thin_level(self, threshold: float, level: Optional[int] = None) -> None:
+        """With ``level_max_samples``: thin ``level``'s samples (default the
+        latest; in the training set, and the iid set with ``draw_iid_live``)
+        back to that many in expectation."""
         m = getattr(self, "level_max_samples", None)
         if m is None:
             return
-        level = max(self.sample_counts)
+        if level is None:
+            level = max(self.sample_counts)
         sets = [self.training_samples]
         if self.draw_iid_live and self.iid_samples is not None:
             sets.append(self.iid_samples)
@@ -2774,6 +2871,7 @@ class ImportanceNestedSampler(BaseNestedSampler):
             f"Current log-evidence: {obj.log_evidence:3f} "
             f"+/- {obj.log_evidence_error:.3f}"
         )
+        obj._upgrade_top_up_history()
         if flow_config is None:
             flow_config = {}
         obj.proposal.resume(model, flow_config, weights_path=weights_path)
